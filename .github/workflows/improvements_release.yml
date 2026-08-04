@@ -81,7 +81,15 @@ jobs:
       - name: Create release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # upload-artifact keeps paths relative to the uploaded files' common
+        # ancestor, so the tarball arrives under release/ — collect by name
+        # instead of assuming locations.
         run: |
+          mkdir -p /tmp/assets
+          for name in zed-linux-x86_64.tar.gz zed-remote-server-linux-x86_64.gz zed-windows-x86_64.zip; do
+            find . -name "$name" -exec mv {} /tmp/assets/ \;
+            test -f "/tmp/assets/$name"
+          done
           gh release create "$ZED_FORK_RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --title "Zed with improvements — $ZED_FORK_RELEASE_TAG" \
@@ -94,6 +102,6 @@ jobs:
           - \`zed-remote-server-linux-x86_64.gz\` — matching remote server; the client downloads it from here automatically for SSH/WSL projects.
 
           Dev channel: settings and data are shared with regular Zed — don't run both at once." \
-            zed-linux-x86_64.tar.gz \
-            zed-remote-server-linux-x86_64.gz \
-            zed-windows-x86_64.zip
+            /tmp/assets/zed-linux-x86_64.tar.gz \
+            /tmp/assets/zed-remote-server-linux-x86_64.gz \
+            /tmp/assets/zed-windows-x86_64.zip
