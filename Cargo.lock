@@ -2446,6 +2446,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "breadcrumb_picker"
+version = "0.1.0"
+dependencies = [
+ "collections",
+ "editor",
+ "file_icons",
+ "fuzzy",
+ "git",
+ "gpui",
+ "language",
+ "menu",
+ "picker",
+ "project",
+ "serde_json",
+ "settings",
+ "text",
+ "theme",
+ "theme_settings",
+ "ui",
+ "util",
+ "workspace",
+ "zed_actions",
+]
+
+[[package]]
 name = "breadcrumbs"
 version = "0.1.0"
 dependencies = [
@@ -23271,6 +23296,7 @@ dependencies = [
  "audio",
  "auto_update",
  "auto_update_ui",
+ "breadcrumb_picker",
  "breadcrumbs",
  "call",
  "channel",

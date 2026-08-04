@@ -3,7 +3,7 @@ use std::ops::Range;
 use collections::HashMap;
 use futures::FutureExt;
 use futures::future::join_all;
-use gpui::{App, Context, HighlightStyle, Task};
+use gpui::{App, Context, HighlightStyle, Task, Window};
 use itertools::Itertools as _;
 use language::language_settings::LanguageSettings;
 use language::{Buffer, OutlineItem};
@@ -17,7 +17,16 @@ use unicode_segmentation::UnicodeSegmentation as _;
 use util::maybe;
 
 use crate::display_map::DisplaySnapshot;
-use crate::{Editor, LSP_REQUEST_DEBOUNCE_TIMEOUT};
+use crate::scroll::Autoscroll;
+use crate::{Editor, LSP_REQUEST_DEBOUNCE_TIMEOUT, SelectionEffects};
+
+/// The outline behind the breadcrumb symbol dropdowns, kept with the buffer version it came from
+/// so a prefetch can tell an up-to-date cache from one worth refreshing.
+pub(crate) struct BreadcrumbOutline {
+    buffer_id: BufferId,
+    version: clock::Global,
+    items: Vec<OutlineItem<text::Anchor>>,
+}
 
 impl Editor {
     /// Returns all document outline items for a buffer, using LSP or
@@ -50,8 +59,16 @@ impl Editor {
         } else {
             let buffer_snapshot = buffer.read(cx).snapshot();
             let syntax = cx.theme().syntax().clone();
-            cx.background_executor()
-                .spawn(async move { buffer_snapshot.outline(Some(&syntax)).items })
+            cx.background_executor().spawn(async move {
+                // Not `snapshot.outline(..)`: that wraps the items in an `Outline`, which builds a
+                // fuzzy-match candidate string per item for the outline picker's search. Every
+                // caller here drops those immediately.
+                buffer_snapshot.outline_items_containing(
+                    0..buffer_snapshot.len(),
+                    true,
+                    Some(&syntax),
+                )
+            })
         }
     }
 
@@ -93,37 +110,7 @@ impl Editor {
                 item.range.start.cmp(&cursor_text_anchor, buffer).is_le()
                     && item.range.end.cmp(&cursor_text_anchor, buffer).is_ge()
             })
-            .filter_map(|item| {
-                let range_start = multi_buffer_snapshot.anchor_in_buffer(item.range.start)?;
-                let range_end = multi_buffer_snapshot.anchor_in_buffer(item.range.end)?;
-                let source_range_for_text_start =
-                    multi_buffer_snapshot.anchor_in_buffer(item.source_range_for_text.start)?;
-                let source_range_for_text_end =
-                    multi_buffer_snapshot.anchor_in_buffer(item.source_range_for_text.end)?;
-                Some(OutlineItem {
-                    depth: item.depth,
-                    range: range_start..range_end,
-                    selection_range: multi_buffer_snapshot
-                        .anchor_in_buffer(item.selection_range.start)?
-                        ..multi_buffer_snapshot.anchor_in_buffer(item.selection_range.end)?,
-                    source_range_for_text: source_range_for_text_start..source_range_for_text_end,
-                    text: item.text.clone(),
-                    highlight_ranges: item.highlight_ranges.clone(),
-                    name_ranges: item.name_ranges.clone(),
-                    body_range: item.body_range.as_ref().and_then(|r| {
-                        Some(
-                            multi_buffer_snapshot.anchor_in_buffer(r.start)?
-                                ..multi_buffer_snapshot.anchor_in_buffer(r.end)?,
-                        )
-                    }),
-                    annotation_range: item.annotation_range.as_ref().and_then(|r| {
-                        Some(
-                            multi_buffer_snapshot.anchor_in_buffer(r.start)?
-                                ..multi_buffer_snapshot.anchor_in_buffer(r.end)?,
-                        )
-                    }),
-                })
-            })
+            .filter_map(|item| text_outline_item_to_multibuffer(item, multi_buffer_snapshot))
             .collect::<Vec<_>>();
 
         let mut prev_depth = None;
@@ -134,6 +121,109 @@ impl Editor {
         });
 
         Some((buffer.remote_id(), symbols))
+    }
+
+    /// Starts fetching the outline backing the breadcrumb dropdowns, unless the cached one was
+    /// already computed from this exact buffer version. Called when the pointer reaches the
+    /// breadcrumb bar, so opening a dropdown reads a cache instead of walking the whole file.
+    pub(crate) fn prefetch_breadcrumb_outline(
+        &mut self,
+        buffer_id: BufferId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(buffer) = self.buffer.read(cx).buffer(buffer_id) else {
+            return;
+        };
+        let version = buffer.read(cx).version();
+        if self
+            .breadcrumb_outline
+            .as_ref()
+            .is_some_and(|outline| outline.buffer_id == buffer_id && outline.version == version)
+        {
+            return;
+        }
+
+        let items = self.buffer_outline_items(buffer_id, cx);
+        self.breadcrumb_outline_task = cx.spawn(async move |editor, cx| {
+            let items = items.await;
+            editor
+                .update(cx, |editor, _| {
+                    editor.breadcrumb_outline = Some(BreadcrumbOutline {
+                        buffer_id,
+                        version,
+                        items,
+                    });
+                })
+                .ok();
+        });
+    }
+
+    /// A segment's dropdown rows in document order: `target`'s children, or its siblings when it
+    /// has none, so the deepest segment isn't a dead end. `target: None` lists top-level symbols.
+    ///
+    /// Reads what [`Self::prefetch_breadcrumb_outline`] fetched. A stale outline is used as is,
+    /// since the items are anchors; an absent one yields nothing.
+    pub fn breadcrumb_symbol_menu_items(
+        &self,
+        buffer_id: BufferId,
+        target: Option<&OutlineItem<Anchor>>,
+        cx: &App,
+    ) -> Vec<OutlineItem<Anchor>> {
+        let Some(outline) = self
+            .breadcrumb_outline
+            .as_ref()
+            .filter(|outline| outline.buffer_id == buffer_id)
+        else {
+            return Vec::new();
+        };
+
+        let multi_buffer_snapshot = self.buffer().read(cx).snapshot(cx);
+        let items = outline
+            .items
+            .iter()
+            .filter_map(|item| text_outline_item_to_multibuffer(item, &multi_buffer_snapshot))
+            .collect::<Vec<_>>();
+        let depths = items.iter().map(|item| item.depth).collect::<Vec<_>>();
+
+        let indices = if let Some(target) = target {
+            let Some(target_index) = items.iter().position(|item| item.range == target.range)
+            else {
+                return vec![target.clone()];
+            };
+
+            let children = crate::element::child_outline_indices(&depths, target_index);
+            if children.is_empty() {
+                crate::element::sibling_outline_indices(&depths, target_index)
+            } else {
+                children
+            }
+        } else {
+            crate::element::top_level_outline_indices(&depths)
+        };
+
+        indices
+            .into_iter()
+            .filter_map(|index| items.get(index).cloned())
+            .collect()
+    }
+
+    /// Moves the cursor to `item` and scrolls it into view, the way confirming an entry in the
+    /// outline picker does.
+    pub fn navigate_to_outline_item(
+        &mut self,
+        item: &OutlineItem<Anchor>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.change_selections(
+            SelectionEffects::scroll(Autoscroll::center()),
+            window,
+            cx,
+            |s| {
+                s.select_ranges([item.selection_range.start..item.selection_range.start]);
+            },
+        );
+        window.focus(&self.focus_handle, cx);
     }
 
     /// Fetches document symbols from the LSP for buffers that have the setting
@@ -241,6 +331,42 @@ fn lsp_symbols_enabled(buffer: &Buffer, cx: &App) -> bool {
     LanguageSettings::for_buffer(buffer, cx)
         .document_symbols
         .lsp_enabled()
+}
+
+/// Lifts a buffer-local outline item's anchors into the multibuffer's anchor space, dropping
+/// the item if any of its anchors don't resolve (e.g. the buffer has no excerpts anymore).
+fn text_outline_item_to_multibuffer(
+    item: &OutlineItem<text::Anchor>,
+    multi_buffer_snapshot: &MultiBufferSnapshot,
+) -> Option<OutlineItem<Anchor>> {
+    let range_start = multi_buffer_snapshot.anchor_in_buffer(item.range.start)?;
+    let range_end = multi_buffer_snapshot.anchor_in_buffer(item.range.end)?;
+    let source_range_for_text_start =
+        multi_buffer_snapshot.anchor_in_buffer(item.source_range_for_text.start)?;
+    let source_range_for_text_end =
+        multi_buffer_snapshot.anchor_in_buffer(item.source_range_for_text.end)?;
+    Some(OutlineItem {
+        depth: item.depth,
+        range: range_start..range_end,
+        selection_range: multi_buffer_snapshot.anchor_in_buffer(item.selection_range.start)?
+            ..multi_buffer_snapshot.anchor_in_buffer(item.selection_range.end)?,
+        source_range_for_text: source_range_for_text_start..source_range_for_text_end,
+        text: item.text.clone(),
+        highlight_ranges: item.highlight_ranges.clone(),
+        name_ranges: item.name_ranges.clone(),
+        body_range: item.body_range.as_ref().and_then(|r| {
+            Some(
+                multi_buffer_snapshot.anchor_in_buffer(r.start)?
+                    ..multi_buffer_snapshot.anchor_in_buffer(r.end)?,
+            )
+        }),
+        annotation_range: item.annotation_range.as_ref().and_then(|r| {
+            Some(
+                multi_buffer_snapshot.anchor_in_buffer(r.start)?
+                    ..multi_buffer_snapshot.anchor_in_buffer(r.end)?,
+            )
+        }),
+    })
 }
 
 /// Finds where the symbol name appears in the buffer and returns combined
@@ -669,6 +795,124 @@ mod tests {
 
         cx.update_editor(|editor, _window, _cx| {
             assert_eq!(outline_symbol_names(editor), vec!["main"]);
+        });
+    }
+
+    /// A generated file with hundreds of flat top-level symbols lists all of them: the dropdown
+    /// filters by the query typed into it rather than cutting the listing short.
+    #[gpui::test]
+    async fn test_breadcrumb_symbol_menu_items_lists_every_top_level_symbol(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx, |_| {});
+
+        update_test_language_settings(cx, &|settings| {
+            settings.defaults.document_symbols = Some(DocumentSymbols::On);
+        });
+
+        let mut cx = EditorLspTestContext::new_rust(
+            lsp::ServerCapabilities {
+                document_symbol_provider: Some(lsp::OneOf::Left(true)),
+                ..lsp::ServerCapabilities::default()
+            },
+            cx,
+        )
+        .await;
+
+        const SYMBOL_COUNT: usize = 250;
+
+        let source = (0..SYMBOL_COUNT)
+            .map(|i| format!("fn f{i}() {{}}\n"))
+            .collect::<String>();
+
+        let mut symbol_request = cx
+            .set_request_handler::<lsp::request::DocumentSymbolRequest, _, _>(
+                move |_, _, _| async move {
+                    #[allow(deprecated)]
+                    let symbols = (0..SYMBOL_COUNT)
+                        .map(|i| lsp::SymbolInformation {
+                            name: format!("f{i}"),
+                            kind: lsp::SymbolKind::FUNCTION,
+                            tags: None,
+                            deprecated: None,
+                            location: lsp::Location {
+                                uri: lsp::Uri::from_file_path(path!("/a/main.rs")).unwrap(),
+                                range: lsp_range(i as u32, 0, i as u32, 5),
+                            },
+                            container_name: None,
+                        })
+                        .collect();
+                    Ok(Some(lsp::DocumentSymbolResponse::Flat(symbols)))
+                },
+            );
+
+        cx.set_state(&format!("ˇ{source}"));
+        assert!(symbol_request.next().await.is_some());
+        cx.run_until_parked();
+
+        let buffer_id = cx.update_editor(|editor, _window, cx| {
+            let buffer_id = editor
+                .buffer()
+                .read(cx)
+                .as_singleton()
+                .unwrap()
+                .read(cx)
+                .remote_id();
+            editor.prefetch_breadcrumb_outline(buffer_id, cx);
+            buffer_id
+        });
+        cx.run_until_parked();
+
+        cx.update_editor(|editor, _window, cx| {
+            let menu_items = editor.breadcrumb_symbol_menu_items(buffer_id, None, cx);
+            assert_eq!(menu_items.len(), SYMBOL_COUNT);
+        });
+    }
+
+    /// Opening a segment's dropdown must not walk the file's syntax tree itself: the entries come
+    /// from the outline prefetched when the pointer reaches the bar, and are empty until it lands.
+    #[gpui::test]
+    async fn test_breadcrumb_symbol_menu_items_come_from_the_prefetched_outline(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx, |_| {});
+
+        let mut cx = EditorLspTestContext::new_rust(lsp::ServerCapabilities::default(), cx).await;
+        cx.set_state("fn maˇin() {\n    let x = 1;\n}\n");
+        cx.run_until_parked();
+
+        let buffer_id = cx.update_editor(|editor, _window, cx| {
+            editor
+                .buffer()
+                .read(cx)
+                .as_singleton()
+                .unwrap()
+                .read(cx)
+                .remote_id()
+        });
+
+        cx.update_editor(|editor, _window, cx| {
+            let menu_items = editor.breadcrumb_symbol_menu_items(buffer_id, None, cx);
+            assert!(
+                menu_items.is_empty(),
+                "Without a prefetched outline the dropdown must stay empty rather than computing one"
+            );
+        });
+
+        cx.update_editor(|editor, _window, cx| {
+            editor.prefetch_breadcrumb_outline(buffer_id, cx);
+        });
+        cx.run_until_parked();
+
+        cx.update_editor(|editor, _window, cx| {
+            let menu_items = editor.breadcrumb_symbol_menu_items(buffer_id, None, cx);
+            assert_eq!(
+                menu_items
+                    .iter()
+                    .map(|item| item.text.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["fn main"]
+            );
         });
     }
 
