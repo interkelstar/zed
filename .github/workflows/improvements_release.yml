@@ -1,0 +1,93 @@
+name: improvements_release
+
+on:
+  push:
+    tags: ["improvements-*"]
+
+permissions:
+  contents: write
+
+env:
+  ZED_FORK_RELEASE_TAG: ${{ github.ref_name }}
+  CARGO_INCREMENTAL: "0"
+  # No debug symbols in shared artifacts: halves build time and shrinks
+  # zed.exe from ~435 MB to ~90 MB. Nothing consumes them (no sentry).
+  CARGO_PROFILE_RELEASE_DEBUG: "false"
+
+jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free up disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools clang mold cmake
+          ./script/linux
+
+      - name: Build bundle
+        run: ./script/bundle-linux
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: |
+            target/release/zed-linux-x86_64.tar.gz
+            target/zed-remote-server-linux-x86_64.gz
+          if-no-files-found: error
+
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 180
+    steps:
+      - name: Enable long paths in git
+        run: git config --system core.longpaths true
+
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: cargo build --release --package zed
+
+      - name: Package
+        run: Compress-Archive -Path target\release\zed.exe -DestinationPath zed-windows-x86_64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: zed-windows-x86_64.zip
+          if-no-files-found: error
+
+  release:
+    needs: [linux, windows]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$ZED_FORK_RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Zed with improvements — $ZED_FORK_RELEASE_TAG" \
+            --notes "Personal flavor of Zed built from \`personal/kelstar-daily\` at \`${GITHUB_SHA:0:7}\`.
+
+          Upstream main plus the open PRs zed-industries/zed#62138, #62135, #62050, #61659, #61319, a Windows DirectWrite ligature fix, and remote-server delivery from this repository's releases.
+
+          - \`zed-linux-x86_64.tar.gz\` — Linux (glibc). Unpack and run \`zed-dev.app/bin/zed\`. Works in ChromeOS Crostini.
+          - \`zed-windows-x86_64.zip\` — Windows, unsigned (SmartScreen will warn once).
+          - \`zed-remote-server-linux-x86_64.gz\` — matching remote server; the client downloads it from here automatically for SSH/WSL projects.
+
+          Dev channel: settings and data are shared with regular Zed — don't run both at once." \
+            zed-linux-x86_64.tar.gz \
+            zed-remote-server-linux-x86_64.gz \
+            zed-windows-x86_64.zip
