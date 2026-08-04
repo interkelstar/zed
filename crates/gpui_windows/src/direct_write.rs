@@ -1765,12 +1765,12 @@ fn apply_font_features(
     features: &FontFeatures,
 ) -> Result<()> {
     let tag_values = features.tag_value_list();
-    if tag_values.is_empty() {
-        return Ok(());
-    }
 
-    // All of these features are enabled by default by DirectWrite.
-    // If you want to (and can) peek into the source of DirectWrite
+    // These features are enabled by default by DirectWrite, but applying an
+    // IDWriteTypography via SetTypography *replaces* the defaults with exactly
+    // the features it contains. An empty typography therefore disables
+    // ligatures entirely, so re-add the defaults even when no features are
+    // configured.
     let mut feature_liga = make_direct_write_feature("liga", 1);
     let mut feature_clig = make_direct_write_feature("clig", 1);
     let mut feature_calt = make_direct_write_feature("calt", 1);
