@@ -569,6 +569,10 @@ impl AutoUpdater {
         set_status: impl Fn(&str, &mut AsyncApp) + Send + 'static,
         cx: &mut AsyncApp,
     ) -> Result<PathBuf> {
+        if release_channel == ReleaseChannel::Dev {
+            return Self::download_remote_server_from_fork(os, arch, set_status, cx).await;
+        }
+
         let this = cx.update(|cx| {
             cx.default_global::<GlobalAutoUpdate>()
                 .0
@@ -618,6 +622,70 @@ impl AutoUpdater {
         Ok(version_path)
     }
 
+    // Dev-channel builds of this fork ship their remote server on the fork's GitHub
+    // Releases (zed.dev rejects the dev channel with "invalid channel"). Builds made by
+    // the release workflow know their exact tag via ZED_FORK_RELEASE_TAG; local builds
+    // fall back to the latest fork release, which may trail the local commit.
+    async fn download_remote_server_from_fork(
+        os: &str,
+        arch: &str,
+        set_status: impl Fn(&str, &mut AsyncApp) + Send + 'static,
+        cx: &mut AsyncApp,
+    ) -> Result<PathBuf> {
+        const FORK_REPO: &str = "interkelstar/zed";
+        let this = cx.update(|cx| {
+            cx.default_global::<GlobalAutoUpdate>()
+                .0
+                .clone()
+                .context("auto-update not initialized")
+        })?;
+
+        let release = match option_env!("ZED_FORK_RELEASE_TAG") {
+            Some(tag) => ReleaseAsset {
+                version: tag.to_string(),
+                url: format!(
+                    "https://github.com/{FORK_REPO}/releases/download/{tag}/zed-remote-server-{os}-{arch}.gz"
+                ),
+            },
+            None => ReleaseAsset {
+                version: "latest".to_string(),
+                url: format!(
+                    "https://github.com/{FORK_REPO}/releases/latest/download/zed-remote-server-{os}-{arch}.gz"
+                ),
+            },
+        };
+
+        let platform_dir = remote_servers_dir()
+            .join("fork")
+            .join(format!("{}-{}", os, arch));
+        let version_path = platform_dir.join(format!("{}.gz", release.version));
+        smol::fs::create_dir_all(&platform_dir).await.ok();
+
+        let client = this.read_with(cx, |this, _| this.client.http_client());
+
+        // "latest" is a moving target, so a cached copy can go stale — always refetch it.
+        if release.version == "latest" || smol::fs::metadata(&version_path).await.is_err() {
+            log::info!(
+                "downloading zed-remote-server {os} {arch} from fork release {}",
+                release.version
+            );
+            set_status("Downloading remote server from fork releases", cx);
+            download_remote_server_binary(&version_path, release, client).await?;
+        }
+
+        if let Err(error) =
+            cleanup_remote_server_cache(&platform_dir, &version_path, REMOTE_SERVER_CACHE_LIMIT)
+                .await
+        {
+            log::warn!(
+                "Failed to clean up remote server cache in {:?}: {error:#}",
+                platform_dir
+            );
+        }
+
+        Ok(version_path)
+    }
+
     pub async fn get_remote_server_release_url(
         channel: ReleaseChannel,
         version: Option<Version>,
@@ -625,6 +693,10 @@ impl AutoUpdater {
         arch: &str,
         cx: &mut AsyncApp,
     ) -> Result<Option<String>> {
+        if channel == ReleaseChannel::Dev {
+            return Ok(None);
+        }
+
         let this = cx.update(|cx| {
             cx.default_global::<GlobalAutoUpdate>()
                 .0
