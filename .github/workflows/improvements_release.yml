@@ -16,8 +16,14 @@ env:
 
 jobs:
   linux:
+    # 22.04 on purpose: its glibc 2.35 keeps the bundle runnable on Debian 12
+    # (ChromeOS Crostini, glibc 2.36). Newer runners would raise the baseline.
     runs-on: ubuntu-22.04
     timeout-minutes: 180
+    env:
+      # bundle-linux exports CC=clang but leaves CXX to the system g++, which
+      # is too old on this runner to compile webrtc-sys.
+      CXX: clang++
     steps:
       - uses: actions/checkout@v4
 
