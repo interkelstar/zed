@@ -211,6 +211,7 @@ mod tests {
         let symbol_segments = vec![Some(BreadcrumbSegmentTarget::Symbol {
             buffer_id: BufferId::new(1).unwrap(),
             item: None,
+            is_active_segment: false,
         })];
 
         let symbol_segments = align_symbol_segments(&segments, symbol_segments);
@@ -260,6 +261,7 @@ mod tests {
         let symbol_segments = vec![Some(BreadcrumbSegmentTarget::Symbol {
             buffer_id: BufferId::new(1).unwrap(),
             item: None,
+            is_active_segment: false,
         })];
         let symbol_segments = align_symbol_segments(&segments, symbol_segments);
         assert_eq!(symbol_segments.len(), segments.len());

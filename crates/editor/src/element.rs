@@ -4,6 +4,7 @@ mod mouse;
 
 #[cfg(test)]
 pub(crate) use breadcrumbs::breadcrumb_path_segments;
+pub(crate) use breadcrumbs::outline_parents;
 pub use breadcrumbs::render_breadcrumb_text;
 pub use breadcrumbs::{
     BREADCRUMB_PICKER_RENDERERS, BreadcrumbDirectoryEntry, BreadcrumbDirectoryListingSettings,

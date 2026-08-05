@@ -1,7 +1,8 @@
 use std::ops::Range;
+use std::rc::Rc;
 use std::sync::Arc;
 
-use editor::{Anchor, Editor, flatten_text_for_single_line_display};
+use editor::{Anchor, Editor, ErasedBreadcrumbPopoverHandle, flatten_text_for_single_line_display};
 use fuzzy::{StringMatch, StringMatchCandidate};
 use gpui::{
     AnyElement, App, Context, DismissEvent, Entity, ParentElement, Styled, StyledText, Task,
@@ -13,22 +14,39 @@ use project::WorktreeId;
 use text::BufferId;
 use ui::{
     ButtonLike, ButtonStyle, Color, Icon, IconName, IconSize, ListItem, ListItemSpacing,
-    PopoverMenu, prelude::*,
+    PopoverMenu, PopoverMenuHandle, prelude::*,
 };
 use util::rel_path::RelPath;
 use workspace::ItemHandle;
 
 use crate::MAX_BREADCRUMB_MENU_ENTRIES;
 
+/// Newtype avoiding an orphan-rule conflict for `ErasedBreadcrumbPopoverHandle`.
+pub(crate) struct SymbolPopoverHandle(pub PopoverMenuHandle<BreadcrumbSymbolPicker>);
+
+impl ErasedBreadcrumbPopoverHandle for SymbolPopoverHandle {
+    fn hide(&self, cx: &mut App) {
+        self.0.hide(cx);
+    }
+
+    fn show(&self, window: &mut Window, cx: &mut App) {
+        self.0.show(window, cx);
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
 pub struct BreadcrumbSymbolDelegate {
     editor: WeakEntity<Editor>,
     buffer_id: BufferId,
+    /// The segment this popover is anchored under; `None` is the file segment.
+    target: Option<OutlineItem<Anchor>>,
     items: Vec<OutlineItem<Anchor>>,
     matches: Vec<StringMatch>,
     selected_index: usize,
     current_range: Option<Range<Anchor>>,
-    /// Levels drilled through with the right arrow, restored by the left arrow.
-    level_stack: Vec<(Vec<OutlineItem<Anchor>>, usize)>,
     parent_dir: Option<(WorktreeId, Arc<RelPath>)>,
 }
 
@@ -38,6 +56,7 @@ impl BreadcrumbSymbolDelegate {
     fn picker(
         editor: WeakEntity<Editor>,
         buffer_id: BufferId,
+        target: Option<OutlineItem<Anchor>>,
         items: Vec<OutlineItem<Anchor>>,
         current_range: Option<Range<Anchor>>,
         parent_dir: Option<(WorktreeId, Arc<RelPath>)>,
@@ -52,11 +71,11 @@ impl BreadcrumbSymbolDelegate {
             let delegate = Self {
                 editor,
                 buffer_id,
+                target,
                 items,
                 matches: Vec::new(),
                 selected_index,
                 current_range,
-                level_stack: Vec::new(),
                 parent_dir,
             };
             Picker::uniform_list(delegate, window, cx)
@@ -74,30 +93,6 @@ impl BreadcrumbSymbolDelegate {
 
     fn item_at(&self, index: usize) -> Option<&OutlineItem<Anchor>> {
         self.items.get(self.matches.get(index)?.candidate_id)
-    }
-
-    /// Rebuilds `matches` after `items` changed in place; `set_query("")` alone won't
-    /// refresh them when the query is already empty.
-    fn rebuild_matches_for_level(&mut self, preferred_index: Option<usize>) {
-        self.matches = self
-            .items
-            .iter()
-            .enumerate()
-            .map(|(index, item)| StringMatch {
-                candidate_id: index,
-                string: flatten_text_for_single_line_display(&item.text),
-                positions: Vec::new(),
-                score: 0.,
-            })
-            .collect();
-        self.selected_index = preferred_index
-            .filter(|&index| index < self.matches.len())
-            .or_else(|| {
-                self.current_range
-                    .as_ref()
-                    .and_then(|range| self.items.iter().position(|item| &item.range == range))
-            })
-            .unwrap_or(0);
     }
 }
 
@@ -211,7 +206,7 @@ impl PickerDelegate for BreadcrumbSymbolDelegate {
 
     fn select_child(
         &mut self,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<BreadcrumbSymbolPicker>,
     ) -> Option<String> {
         let selected = self.item_at(self.selected_index)?.clone();
@@ -224,10 +219,9 @@ impl PickerDelegate for BreadcrumbSymbolDelegate {
         if children.is_empty() || children.iter().any(|item| item.range == selected.range) {
             return None;
         }
-        let parent_items = std::mem::replace(&mut self.items, children);
-        self.level_stack.push((parent_items, self.selected_index));
-        self.rebuild_matches_for_level(Some(0));
-        cx.notify();
+        editor.update(cx, |editor, cx| {
+            editor.navigate_breadcrumb_symbol_to(self.buffer_id, Some(selected), window, cx);
+        });
         Some(String::new())
     }
 
@@ -236,18 +230,20 @@ impl PickerDelegate for BreadcrumbSymbolDelegate {
         window: &mut Window,
         cx: &mut Context<BreadcrumbSymbolPicker>,
     ) -> Option<String> {
-        if let Some((items, index)) = self.level_stack.pop() {
-            self.items = items;
-            self.rebuild_matches_for_level(Some(index));
-            cx.notify();
+        let editor = self.editor.upgrade()?;
+        if let Some(target) = self.target.clone() {
+            let parent = editor
+                .read(cx)
+                .breadcrumb_symbol_parent(self.buffer_id, &target, cx);
+            editor.update(cx, |editor, cx| {
+                editor.navigate_breadcrumb_symbol_to(self.buffer_id, parent, window, cx);
+            });
             return Some(String::new());
         }
         let (worktree_id, parent_path) = self.parent_dir.clone()?;
-        let editor = self.editor.upgrade()?;
         editor.update(cx, |editor, cx| {
             editor.navigate_breadcrumb_to(worktree_id, parent_path, window, cx);
         });
-        cx.emit(DismissEvent);
         Some(String::new())
     }
 
@@ -300,6 +296,8 @@ pub(crate) fn render_breadcrumb_symbol_segment(
     buffer_id: BufferId,
     target: Option<OutlineItem<Anchor>>,
     parent_dir: Option<(WorktreeId, Arc<RelPath>)>,
+    is_active_segment: bool,
+    shared_popover_handle: Rc<dyn ErasedBreadcrumbPopoverHandle>,
     label: gpui::AnyElement,
     index: usize,
 ) -> gpui::AnyElement {
@@ -310,7 +308,18 @@ pub(crate) fn render_breadcrumb_symbol_segment(
         .height(rems_from_px(22.).into())
         .child(label);
 
-    let menu = PopoverMenu::new(("breadcrumb-symbol-menu", index));
+    // Only the active segment carries the handle `Editor::navigate_breadcrumb_symbol_to` reopens through.
+    let popover_handle = if is_active_segment {
+        shared_popover_handle
+            .as_any()
+            .downcast_ref::<SymbolPopoverHandle>()
+            .map(|handle| handle.0.clone())
+            .unwrap_or_default()
+    } else {
+        PopoverMenuHandle::default()
+    };
+
+    let menu = PopoverMenu::new(("breadcrumb-symbol-menu", index)).with_handle(popover_handle);
     let menu = if target.is_none() {
         menu.trigger_with_tooltip(trigger, ui::Tooltip::text("Right-Click to Copy Path"))
     } else {
@@ -329,15 +338,25 @@ pub(crate) fn render_breadcrumb_symbol_segment(
             }
             return None;
         }
-        Some(BreadcrumbSymbolDelegate::picker(
+
+        editor_entity.update(cx, |editor, cx| {
+            editor.open_breadcrumb_symbol_navigation(buffer_id, target.clone(), cx);
+        });
+
+        let picker = BreadcrumbSymbolDelegate::picker(
             editor.clone(),
             buffer_id,
+            target.clone(),
             menu_items,
             target.as_ref().map(|item| item.range.clone()),
             parent_dir.clone(),
             window,
             cx,
-        ))
+        );
+        editor_entity.update(cx, |editor, cx| {
+            editor.watch_breadcrumb_symbol_dismissal(&picker, buffer_id, target.clone(), cx);
+        });
+        Some(picker)
     })
     .into_any_element()
 }
@@ -351,7 +370,6 @@ mod tests {
     use editor::test::build_editor;
     use gpui::{Focusable, Render, TestAppContext, VisualTestContext};
     use std::cell::Cell;
-    use std::rc::Rc;
     use text::Point;
 
     fn init_test(cx: &mut TestAppContext) {
@@ -408,6 +426,7 @@ mod tests {
                 BreadcrumbSymbolDelegate::picker(
                     editor.downgrade(),
                     BufferId::new(1).unwrap(),
+                    None,
                     items,
                     Some(current_range),
                     None,
@@ -459,6 +478,7 @@ mod tests {
                 BreadcrumbSymbolDelegate::picker(
                     editor.downgrade(),
                     BufferId::new(1).unwrap(),
+                    None,
                     items,
                     None,
                     None,
@@ -512,6 +532,7 @@ mod tests {
                 BreadcrumbSymbolDelegate::picker(
                     editor.downgrade(),
                     BufferId::new(1).unwrap(),
+                    None,
                     items,
                     None,
                     None,
@@ -576,6 +597,7 @@ mod tests {
             let picker = BreadcrumbSymbolDelegate::picker(
                 editor.downgrade(),
                 BufferId::new(1).unwrap(),
+                None,
                 items,
                 None,
                 None,
@@ -619,6 +641,83 @@ mod tests {
                 Point::new(1, 0),
                 "confirming the selected row navigates the cursor there"
             );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_breadcrumb_symbol_select_parent_with_a_target_navigates_the_editor(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let (editor_window, editor) = build_test_editor(cx);
+        let cx = &mut VisualTestContext::from_window(*editor_window, cx);
+
+        let snapshot = editor.read_with(cx, |editor, cx| editor.buffer().read(cx).snapshot(cx));
+        let target = test_item(&snapshot, 0, "alpha");
+        let buffer_id = BufferId::new(1).unwrap();
+
+        let picker = editor_window
+            .update(cx, |_, window, cx| {
+                BreadcrumbSymbolDelegate::picker(
+                    editor.downgrade(),
+                    buffer_id,
+                    Some(target),
+                    vec![test_item(&snapshot, 0, "alpha")],
+                    None,
+                    None,
+                    window,
+                    cx,
+                )
+            })
+            .unwrap();
+
+        picker.update_in(cx, |picker, window, cx| {
+            picker.delegate.select_parent(window, cx);
+        });
+        cx.run_until_parked();
+
+        editor.read_with(cx, |editor, _| {
+            assert!(
+                editor.breadcrumb_symbol_navigation().is_some(),
+                "select_parent with a target segment navigates the editor's symbol state"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_breadcrumb_symbol_select_parent_without_a_target_or_parent_dir_is_a_noop(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let (editor_window, editor) = build_test_editor(cx);
+        let cx = &mut VisualTestContext::from_window(*editor_window, cx);
+
+        let picker = editor_window
+            .update(cx, |_, window, cx| {
+                BreadcrumbSymbolDelegate::picker(
+                    editor.downgrade(),
+                    BufferId::new(1).unwrap(),
+                    None,
+                    Vec::new(),
+                    None,
+                    None,
+                    window,
+                    cx,
+                )
+            })
+            .unwrap();
+
+        let result = picker.update_in(cx, |picker, window, cx| {
+            picker.delegate.select_parent(window, cx)
+        });
+        assert!(
+            result.is_none(),
+            "the file segment with no parent directory has nowhere to go"
+        );
+        editor.read_with(cx, |editor, _| {
+            assert!(editor.breadcrumb_symbol_navigation().is_none());
         });
     }
 }
