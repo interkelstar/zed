@@ -10,9 +10,6 @@ permissions:
 env:
   ZED_FORK_RELEASE_TAG: ${{ github.ref_name }}
   CARGO_INCREMENTAL: "0"
-  # No debug symbols in shared artifacts: halves build time and shrinks
-  # zed.exe from ~435 MB to ~90 MB. Nothing consumes them (no sentry).
-  CARGO_PROFILE_RELEASE_DEBUG: "false"
 
 jobs:
   linux:
@@ -24,6 +21,9 @@ jobs:
       # bundle-linux exports CC=clang but leaves CXX to the system g++, which
       # is too old on this runner to compile webrtc-sys.
       CXX: clang++
+      # No debug symbols in the shared tarball; nothing consumes them (no
+      # sentry). Windows keeps the default: bundle-windows.ps1 zips the pdbs.
+      CARGO_PROFILE_RELEASE_DEBUG: "false"
     steps:
       - uses: actions/checkout@v4
 
@@ -50,22 +50,39 @@ jobs:
   windows:
     runs-on: windows-2022
     timeout-minutes: 180
+    env:
+      ZED_WORKSPACE: ${{ github.workspace }}
     steps:
       - name: Enable long paths in git
         run: git config --system core.longpaths true
 
       - uses: actions/checkout@v4
 
-      - name: Build
-        run: cargo build --release --package zed
+      - name: Set release version
+        shell: bash
+        run: echo "RELEASE_VERSION=$(script/get-crate-version zed)" >> "$GITHUB_ENV"
 
-      - name: Package
-        run: Compress-Archive -Path target\release\zed.exe -DestinationPath zed-windows-x86_64.zip
+      # Builds zed, cli, auto_update_helper, explorer_command_injector and
+      # remote_server, then wraps them in the Inno Setup installer. Unsigned:
+      # the script skips code signing when the secrets are absent.
+      - name: Build installer
+        shell: pwsh
+        run: script/bundle-windows.ps1 -Architecture x86_64
+
+      - name: Collect assets
+        shell: pwsh
+        run: |
+          Copy-Item (Get-ChildItem target\Zed-x86_64*.exe | Select-Object -First 1).FullName zed-windows-x86_64-setup.exe
+          Compress-Archive -Path target\x86_64-pc-windows-msvc\release\zed.exe -DestinationPath zed-windows-x86_64.zip
+          Copy-Item target\zed-remote-server-windows-x86_64.zip zed-remote-server-windows-x86_64.zip
 
       - uses: actions/upload-artifact@v4
         with:
           name: windows
-          path: zed-windows-x86_64.zip
+          path: |
+            zed-windows-x86_64-setup.exe
+            zed-windows-x86_64.zip
+            zed-remote-server-windows-x86_64.zip
           if-no-files-found: error
 
   release:
@@ -86,7 +103,7 @@ jobs:
         # instead of assuming locations.
         run: |
           mkdir -p /tmp/assets
-          for name in zed-linux-x86_64.tar.gz zed-remote-server-linux-x86_64.gz zed-windows-x86_64.zip; do
+          for name in zed-linux-x86_64.tar.gz zed-remote-server-linux-x86_64.gz zed-windows-x86_64-setup.exe zed-windows-x86_64.zip zed-remote-server-windows-x86_64.zip; do
             find . -name "$name" -exec mv {} /tmp/assets/ \;
             test -f "/tmp/assets/$name"
           done
@@ -95,13 +112,16 @@ jobs:
             --title "Zed with improvements — $ZED_FORK_RELEASE_TAG" \
             --notes "Personal flavor of Zed built from \`personal/kelstar-daily\` at \`${GITHUB_SHA:0:7}\`.
 
-          Upstream main plus the open PRs zed-industries/zed#62138, #62135, #62050, #61659, #61319, a Windows DirectWrite ligature fix, and remote-server delivery from this repository's releases.
+          Upstream main plus the open PRs zed-industries/zed#62138, #62135, #62050, #61659, #61319, a Windows DirectWrite ligature fix, remote-server delivery from this repository's releases, and in-app auto-update against these releases.
 
-          - \`zed-linux-x86_64.tar.gz\` — Linux (glibc). Unpack and run \`zed-dev.app/bin/zed\`. Works in ChromeOS Crostini.
-          - \`zed-windows-x86_64.zip\` — Windows, unsigned (SmartScreen will warn once).
-          - \`zed-remote-server-linux-x86_64.gz\` — matching remote server; the client downloads it from here automatically for SSH/WSL projects.
+          - \`zed-windows-x86_64-setup.exe\` — Windows installer (recommended: enables in-app auto-update). Unsigned, SmartScreen will warn once.
+          - \`zed-windows-x86_64.zip\` — portable Windows binary, no auto-update.
+          - \`zed-linux-x86_64.tar.gz\` — Linux x86_64, glibc ≥ 2.35 (works on Debian 12 / ChromeOS Crostini). Unpack and run \`zed-dev.app/bin/zed\`; auto-updates in place (needs \`rsync\`).
+          - \`zed-remote-server-*\` — matching remote servers; clients fetch them from this release automatically.
 
           Dev channel: settings and data are shared with regular Zed — don't run both at once." \
+            /tmp/assets/zed-windows-x86_64-setup.exe \
+            /tmp/assets/zed-windows-x86_64.zip \
             /tmp/assets/zed-linux-x86_64.tar.gz \
             /tmp/assets/zed-remote-server-linux-x86_64.gz \
-            /tmp/assets/zed-windows-x86_64.zip
+            /tmp/assets/zed-remote-server-windows-x86_64.zip
