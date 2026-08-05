@@ -1486,6 +1486,12 @@ pub enum OpenMode {
 }
 
 impl Workspace {
+    /// Pixels below which the center column is treated as having nowhere
+    /// usable to render: a bottom-dock panel sharing the row with a center
+    /// this narrow would be squeezed into an unusable sliver. See
+    /// [`Self::full_width_side_dock`].
+    const FULL_WIDTH_SIDE_DOCK_CENTER_THRESHOLD: Pixels = px(32.);
+
     pub fn new(
         workspace_id: Option<WorkspaceId>,
         project: Entity<Project>,
@@ -2556,6 +2562,62 @@ impl Workspace {
             size_state.flex_when_center_empty.or(size_state.flex)
         } else {
             size_state.flex
+        }
+    }
+
+    /// Returns the open side dock, if any, that is effectively spanning the
+    /// full window width: the center is empty and the dock's effective flex
+    /// leaves less than [`Self::FULL_WIDTH_SIDE_DOCK_CENTER_THRESHOLD`] for
+    /// the center column. In that state the center has nowhere usable to
+    /// render a bottom-dock panel alongside it.
+    fn full_width_side_dock(&self, window: &Window, cx: &App) -> Option<DockPosition> {
+        if !self.center_is_empty(cx) {
+            return None;
+        }
+        let workspace_width = self.bounds.size.width;
+        if workspace_width <= Pixels::ZERO {
+            return None;
+        }
+        for (position, dock) in [
+            (DockPosition::Left, &self.left_dock),
+            (DockPosition::Right, &self.right_dock),
+        ] {
+            let dock = dock.read(cx);
+            if !dock.is_open() {
+                continue;
+            }
+            let is_flexible = dock
+                .active_panel()
+                .is_some_and(|panel| panel.has_flexible_size(window, cx));
+            if !is_flexible {
+                continue;
+            }
+            if let Some(dock_width) = self.dock_size(dock, window, cx)
+                && workspace_width - dock_width < Self::FULL_WIDTH_SIDE_DOCK_CENTER_THRESHOLD
+            {
+                return Some(position);
+            }
+        }
+        None
+    }
+
+    /// The [`BottomDockLayout`] to actually render with. Ordinarily this is
+    /// just the configured setting, but when a side dock is effectively
+    /// spanning the full window width (see [`Self::full_width_side_dock`])
+    /// and a bottom-dock panel is open, `Contained`/`LeftAligned`/
+    /// `RightAligned` would squeeze the bottom panel into the sliver left for
+    /// the center. Falling back to `Full` in that case gives the bottom
+    /// panel the entire window width, below the stretched side dock, the
+    /// same way it already behaves when the center holds an item.
+    fn effective_bottom_dock_layout(&self, window: &Window, cx: &App) -> BottomDockLayout {
+        let configured = WorkspaceSettings::get_global(cx).bottom_dock_layout;
+        if configured != BottomDockLayout::Full
+            && self.bottom_dock.read(cx).is_open()
+            && self.full_width_side_dock(window, cx).is_some()
+        {
+            BottomDockLayout::Full
+        } else {
+            configured
         }
     }
 
@@ -9057,7 +9119,7 @@ impl Render for Workspace {
             .iter()
             .map(|(_, notification)| notification.entity_id())
             .collect::<Vec<_>>();
-        let bottom_dock_layout = WorkspaceSettings::get_global(cx).bottom_dock_layout;
+        let bottom_dock_layout = self.effective_bottom_dock_layout(window, cx);
 
         let pane_render_context = PaneRenderContext {
             follower_states: &self.follower_states,
@@ -14930,6 +14992,103 @@ mod tests {
             cx,
             800.,
             "emptying the center should restore the empty-center width",
+        );
+    }
+
+    #[gpui::test]
+    async fn test_bottom_dock_spans_full_width_under_full_width_side_dock(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+
+        let project = Project::test(fs, [], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+        workspace.update(cx, |workspace, _cx| {
+            workspace.bounds.size.width = px(900.);
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let left_panel = cx.new(|cx| TestPanel::new_flexible(DockPosition::Left, 100, cx));
+            workspace.add_panel(left_panel, window, cx);
+            workspace.toggle_dock(DockPosition::Left, window, cx);
+
+            let bottom_panel = cx.new(|cx| TestPanel::new(DockPosition::Bottom, 100, cx));
+            workspace.add_panel(bottom_panel, window, cx);
+            workspace.toggle_dock(DockPosition::Bottom, window, cx);
+        });
+
+        let effective_layout = |cx: &mut VisualTestContext| {
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.bounds.size.width = px(900.);
+                workspace.effective_bottom_dock_layout(window, cx)
+            })
+        };
+
+        // An even split leaves the center plenty of room, so the configured layout
+        // (Contained, the default) is used unchanged.
+        assert_eq!(
+            effective_layout(cx),
+            BottomDockLayout::Contained,
+            "an even split should not trigger the full-width override"
+        );
+
+        // Widening the left dock until only a sliver is left for the (empty) center
+        // should switch to Full, so the bottom panel gets the whole window width
+        // below the stretched dock instead of being squeezed into that sliver.
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.bounds.size.width = px(900.);
+            workspace.resize_left_dock(px(890.), window, cx);
+        });
+        assert_eq!(
+            effective_layout(cx),
+            BottomDockLayout::Full,
+            "a side dock leaving only a sliver for an empty center should trigger the override"
+        );
+
+        // Opening an item in the center falls back to the ordinary (non-empty-center)
+        // width, which was never widened, so the center has its usual share again and
+        // the override no longer applies.
+        let item = workspace.update_in(cx, |workspace, window, cx| {
+            let item = cx.new(|cx| {
+                TestItem::new(cx).with_project_items(&[TestProjectItem::new(1, "one.txt", cx)])
+            });
+            workspace.add_item_to_active_pane(Box::new(item.clone()), None, true, window, cx);
+            item
+        });
+        assert_eq!(
+            effective_layout(cx),
+            BottomDockLayout::Contained,
+            "a non-empty center should never trigger the full-width override"
+        );
+
+        // Closing the item returns to the stretched empty-center width, but closing
+        // the bottom dock as well means there is no bottom panel that needs the
+        // space, so the override must not apply.
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.active_pane().update(cx, |pane, cx| {
+                pane.remove_item(item.item_id(), false, false, window, cx);
+            });
+            workspace.toggle_dock(DockPosition::Bottom, window, cx);
+        });
+        assert_eq!(
+            effective_layout(cx),
+            BottomDockLayout::Contained,
+            "a closed bottom dock should never trigger the full-width override"
+        );
+
+        // Reopening the bottom dock with the center still empty and the left dock
+        // still stretched restores the override.
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.toggle_dock(DockPosition::Bottom, window, cx);
+        });
+        assert_eq!(
+            effective_layout(cx),
+            BottomDockLayout::Full,
+            "reopening the bottom dock should restore the full-width override"
         );
     }
 
