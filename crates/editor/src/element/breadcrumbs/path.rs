@@ -14,8 +14,6 @@ fn breadcrumb_path_prefixes(path: &RelPath) -> Vec<&RelPath> {
     prefixes
 }
 
-/// Builds the leading path segments, root first. The root is included so top-level directories
-/// stay reachable, since no other segment lists them.
 pub(crate) fn breadcrumb_path_segments(
     worktree_id: WorktreeId,
     root_name: &str,
@@ -65,11 +63,7 @@ pub(crate) fn breadcrumb_path_segments(
     (labels, targets)
 }
 
-/// Mirrors `project_panel`'s ordering, visibility and icon settings so the dropdown agrees with
-/// the panel. Read from `SettingsContent` independently rather than through `project_panel`'s
-/// resolved settings, since `project_panel` depends on `editor` and the reverse would be
-/// circular. Deliberately exposes no breadcrumb-specific overrides yet; the bar always follows
-/// the panel.
+/// Deliberately exposes no breadcrumb-specific overrides yet; the bar always follows the panel.
 #[derive(Clone, Copy, settings::RegisterSetting)]
 pub struct BreadcrumbDirectoryListingSettings {
     pub sort_mode: settings::ProjectPanelSortMode,
@@ -105,8 +99,7 @@ impl settings::Settings for BreadcrumbDirectoryListingSettings {
     }
 }
 
-/// The project panel's severity filtering. Reads the aggregated per-path summary rather than
-/// walking diagnostics, since this runs on every render.
+/// Reads the aggregated per-path summary rather than walking diagnostics, since this runs on every render.
 pub fn breadcrumb_diagnostic_severity(
     project: &Project,
     project_path: &ProjectPath,
@@ -126,22 +119,16 @@ pub fn breadcrumb_diagnostic_severity(
     }
 }
 
-/// A single row in a breadcrumb directory dropdown: one of `path`'s direct children, sorted the
-/// way the project panel orders siblings (see [`BreadcrumbDirectoryListingSettings`]).
 pub struct BreadcrumbDirectoryEntry {
     pub name: SharedString,
     pub path: Arc<RelPath>,
     pub is_dir: bool,
     pub is_ignored: bool,
     pub git_summary: GitSummary,
-    /// Only ever set for files: mirroring the panel's ancestor-propagated severity for
-    /// directories would mean scanning every diagnostic summary per row, which this listing's
-    /// render path can't afford.
+    /// Only ever set for files: computing the panel's ancestor-propagated severity per directory row is too costly here.
     pub diagnostic_severity: Option<DiagnosticSeverity>,
 }
 
-/// Lists `path`'s direct children, filtered the way the project panel filters gitignored and
-/// hidden entries.
 pub fn breadcrumb_directory_entries(
     project: &Entity<Project>,
     worktree: &Entity<project::Worktree>,
@@ -200,8 +187,7 @@ pub fn breadcrumb_directory_entries(
         .collect()
 }
 
-/// Whether the leading segment offers navigation at all: `false` for a buffer with no project
-/// path, and for a single-file worktree, which has no tree to browse.
+/// `false` for a buffer with no project path, or a single-file worktree, which has no tree to browse.
 pub(crate) fn breadcrumb_path_is_navigable(
     has_project_path: bool,
     worktree_is_single_file: Option<bool>,
@@ -216,18 +202,14 @@ mod tests {
 
     #[test]
     fn test_breadcrumb_path_is_navigable() {
-        // Untitled/unsaved buffer: no project path at all.
         assert!(!breadcrumb_path_is_navigable(false, None));
         assert!(!breadcrumb_path_is_navigable(false, Some(false)));
 
-        // File opened outside any real worktree — Zed represents it as a single-file worktree.
+        // A file opened outside any real worktree is represented as a single-file worktree.
         assert!(!breadcrumb_path_is_navigable(true, Some(true)));
 
-        // Ordinary file inside a real worktree.
         assert!(breadcrumb_path_is_navigable(true, Some(false)));
 
-        // Worktree couldn't be resolved (e.g. removed mid-session): preserves the prior
-        // fallback-to-symbols behavior rather than assuming non-navigable.
         assert!(breadcrumb_path_is_navigable(true, None));
     }
 
@@ -376,8 +358,6 @@ mod tests {
             vec!["ihavenever", "src", "main"]
         );
 
-        // The terminal segment is a directory target — not a `Symbol` target — because a
-        // navigated bar's last segment is a directory the user browsed to, not the open file.
         let active_flags: Vec<bool> = targets
             .iter()
             .map(|target| match target.as_ref().unwrap() {
@@ -408,15 +388,11 @@ mod tests {
             None,
         );
 
-        // The leading project-root segment is present — it's the only way to reach top-level
-        // siblings in this mode.
         assert_eq!(
             labels.iter().map(|l| l.text.as_ref()).collect::<Vec<_>>(),
             vec!["my-project", "src", "main", "Foo.kt"]
         );
 
-        // Clicking a segment lists its own children: `src`'s dropdown target is `src` itself,
-        // `src/main`'s is `src/main` itself.
         let list_paths: Vec<String> = targets
             .iter()
             .map(|target| match target.as_ref().unwrap() {
@@ -451,7 +427,6 @@ mod tests {
         let worktree = project.update(cx, |project, cx| project.worktrees(cx).next().unwrap());
         cx.run_until_parked();
 
-        // Default settings match the project panel's own default sort.
         let entries =
             cx.update(|cx| breadcrumb_directory_entries(&project, &worktree, RelPath::empty(), cx));
         assert_eq!(
@@ -459,8 +434,7 @@ mod tests {
             vec!["Apple", "banana.txt", "Cherry.txt"],
         );
 
-        // Reusing `compare_rel_paths_by` means our ordering tracks `project_panel.sort_mode`/
-        // `sort_order` the same way the panel's does.
+        // Reuses `compare_rel_paths_by`, so ordering tracks `project_panel.sort_mode`/`sort_order`.
         cx.update(|cx| {
             cx.update_global::<SettingsStore, _>(|store, cx| {
                 store.update_user_settings(cx, |settings| {
@@ -504,7 +478,6 @@ mod tests {
         let worktree = project.update(cx, |project, cx| project.worktrees(cx).next().unwrap());
         cx.run_until_parked();
 
-        // `hide_gitignore` defaults to `false`: shown dimmed rather than hidden, like the panel.
         let entries =
             cx.update(|cx| breadcrumb_directory_entries(&project, &worktree, RelPath::empty(), cx));
         let ignored_entry = entries
@@ -513,7 +486,6 @@ mod tests {
             .expect("gitignored entry is shown, not hidden, by default");
         assert!(ignored_entry.is_ignored);
 
-        // Same setting the project panel reads — keeps the two views in agreement.
         cx.update(|cx| {
             cx.update_global::<SettingsStore, _>(|store, cx| {
                 store.update_user_settings(cx, |settings| {
@@ -563,7 +535,6 @@ mod tests {
         let worktree = project.update(cx, |project, cx| project.worktrees(cx).next().unwrap());
         cx.run_until_parked();
 
-        // `hide_hidden` defaults to `false`, matching the project panel.
         let entries =
             cx.update(|cx| breadcrumb_directory_entries(&project, &worktree, RelPath::empty(), cx));
         assert!(
@@ -571,7 +542,6 @@ mod tests {
             "hidden entry is shown by default"
         );
 
-        // Same setting the project panel reads — keeps the two views in agreement.
         cx.update(|cx| {
             cx.update_global::<SettingsStore, _>(|store, cx| {
                 store.update_user_settings(cx, |settings| {
@@ -657,7 +627,6 @@ mod tests {
         });
         cx.run_until_parked();
 
-        // Default (`all`, matching the project panel's own default): both severities surface.
         let entries =
             cx.update(|cx| breadcrumb_directory_entries(&project, &worktree, RelPath::empty(), cx));
         assert_eq!(
@@ -675,8 +644,6 @@ mod tests {
             Some(DiagnosticSeverity::WARNING),
         );
 
-        // `errors`: warnings drop out, errors still surface — same filtering the panel applies
-        // in `ProjectPanel::update_diagnostics`.
         cx.update(|cx| {
             cx.update_global::<SettingsStore, _>(|store, cx| {
                 store.update_user_settings(cx, |settings| {
@@ -706,7 +673,6 @@ mod tests {
             "warnings are filtered out under `errors`",
         );
 
-        // `off`: the setting suppresses diagnostics entirely, not just warnings.
         cx.update(|cx| {
             cx.update_global::<SettingsStore, _>(|store, cx| {
                 store.update_user_settings(cx, |settings| {

@@ -23,12 +23,9 @@ use workspace::Workspace;
 
 use crate::MAX_BREADCRUMB_MENU_ENTRIES;
 
-/// Bounds how far [`descend_single_child_directories`] walks, guarding against a pathologically
-/// deep chain or a symlink cycle.
+// Guards against a pathologically deep chain or a symlink cycle.
 const MAX_BREADCRUMB_DESCENT_DEPTH: usize = 64;
 
-/// Walks down through directories that hold exactly one child directory, stopping one short of a
-/// file so the user still opens it themselves.
 fn descend_single_child_directories(
     start: Arc<RelPath>,
     mut child_entries: impl FnMut(&RelPath) -> Vec<(Arc<RelPath>, bool)>,
@@ -60,8 +57,6 @@ fn breadcrumb_directory_children(
         .collect()
 }
 
-/// Which icon a listing row uses. With folder icons off a directory falls back to a chevron
-/// rather than to nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BreadcrumbEntryIconSource {
     File,
@@ -83,7 +78,6 @@ fn breadcrumb_entry_label_color(
     editor::items::entry_git_aware_label_color(git_summary, entry.is_ignored, is_active_file)
 }
 
-// Diagnostics tint the icon and git status the label, the same split the project panel uses.
 fn breadcrumb_entry_icon_color(entry: &BreadcrumbDirectoryEntry) -> Color {
     editor::items::entry_diagnostic_aware_icon_decoration_and_color(entry.diagnostic_severity)
         .map(|(_, color)| color)
@@ -108,28 +102,24 @@ fn breadcrumb_entry_icon_source(
     }
 }
 
-/// The directory dropdown's contents. Choosing a directory navigates the bar into it; choosing a
-/// file opens it.
+/// The directory dropdown's contents. Choosing a directory navigates into it; a file opens it.
 pub struct BreadcrumbDirectoryDelegate {
     editor: WeakEntity<Editor>,
     workspace: WeakEntity<Workspace>,
     worktree_id: WorktreeId,
     current_path: Arc<RelPath>,
-    /// The open file's own path, so the row leading to it reads as the current one.
     active_path: Option<Arc<RelPath>>,
     entries: Vec<BreadcrumbDirectoryEntry>,
     matches: Vec<StringMatch>,
     selected_index: usize,
-    /// Whether any row draws an icon: reserving the column when every icon is off would indent
-    /// the list for nothing.
+    /// Whether any row draws an icon; reserving the column for none would indent the list.
     show_icons: bool,
     _expand_task: gpui::Task<()>,
 }
 
 pub type BreadcrumbDirectoryPicker = Picker<BreadcrumbDirectoryDelegate>;
 
-/// Newtype over the concrete popover handle, so it can implement `ErasedBreadcrumbPopoverHandle`
-/// without running into the orphan rule.
+/// Newtype avoiding an orphan-rule conflict for `ErasedBreadcrumbPopoverHandle`.
 pub(crate) struct DirectoryPopoverHandle(pub PopoverMenuHandle<BreadcrumbDirectoryPicker>);
 
 impl ErasedBreadcrumbPopoverHandle for DirectoryPopoverHandle {
@@ -172,8 +162,7 @@ impl BreadcrumbDirectoryDelegate {
             let mut picker = Picker::uniform_list(delegate, window, cx)
                 .popover()
                 .show_scrollbar(true)
-                // Narrower than the picker default, which is sized for modals: this lists file
-                // names beside their own segment.
+                // Narrower than the picker default, which is sized for modals.
                 .initial_width(rems(15.));
             picker.delegate.reload_entries(cx);
             picker.delegate.expand_current_path(window, cx);
@@ -206,8 +195,6 @@ impl BreadcrumbDirectoryDelegate {
         });
     }
 
-    /// Starts on the row leading to the open file, so the dropdown opens where the user already is
-    /// rather than at the top of an unrelated directory.
     fn select_active_path(&mut self) {
         let Some(active_path) = self.active_path.as_ref() else {
             return;
@@ -223,9 +210,7 @@ impl BreadcrumbDirectoryDelegate {
             .unwrap_or(0);
     }
 
-    /// Triggers the same worktree scan the project panel makes when a directory is expanded.
-    /// Gitignored directories are never scanned proactively, so without this the dropdown lists
-    /// nothing.
+    /// Gitignored directories are never scanned proactively; without this the dropdown is empty.
     fn expand_current_path(
         &mut self,
         window: &mut Window,
@@ -298,8 +283,6 @@ impl PickerDelegate for BreadcrumbDirectoryDelegate {
     }
 
     fn editor_position(&self) -> PickerEditorPosition {
-        // Below the list, so a folder with three entries still reads as a menu rather than as a
-        // search dialog that happens to have results.
         PickerEditorPosition::End
     }
 
@@ -309,8 +292,7 @@ impl PickerDelegate for BreadcrumbDirectoryDelegate {
         _window: &mut Window,
         cx: &mut Context<BreadcrumbDirectoryPicker>,
     ) -> Task<()> {
-        // Re-read rather than filtered from the previous listing: a pending scan or an edit
-        // elsewhere may have changed what this directory holds.
+        // Re-read rather than filtered: a pending scan or edit elsewhere may change this listing.
         self.reload_entries(cx);
         let candidates = self
             .entries
@@ -388,8 +370,6 @@ impl PickerDelegate for BreadcrumbDirectoryDelegate {
             return;
         }
 
-        // Descending happens on confirm rather than on open: a segment's own dropdown lists its
-        // children verbatim, and only choosing a row walks through single-child directories.
         let Some(worktree) = self.worktree(cx) else {
             return;
         };
@@ -397,8 +377,7 @@ impl PickerDelegate for BreadcrumbDirectoryDelegate {
             breadcrumb_directory_children(&worktree, path, cx)
         });
 
-        // `current_path` isn't updated in place: the popover is dismissed and reopened under the
-        // resolved directory's own segment.
+        // `current_path` isn't updated in place; the popover reopens under the resolved segment.
         if let Some(editor) = self.editor.upgrade() {
             editor.update(cx, |editor, cx| {
                 editor.navigate_breadcrumb_to(self.worktree_id, resolved_path, window, cx);
@@ -406,8 +385,7 @@ impl PickerDelegate for BreadcrumbDirectoryDelegate {
         }
     }
 
-    // Some rather than None when handled: None lets the keystroke fall through to cursor
-    // movement in the query editor.
+    // Some rather than None when handled: None lets the keystroke fall through to cursor movement in the query editor.
     fn select_child(
         &mut self,
         window: &mut Window,
@@ -468,8 +446,6 @@ impl PickerDelegate for BreadcrumbDirectoryDelegate {
                 cx,
             ),
             BreadcrumbEntryIconSource::Chevron => {
-                // These rows aren't expandable in place — choosing a directory navigates into it
-                // rather than expanding it inline — so there's no expanded state to reflect.
                 file_icons::FileIcons::get_chevron_icon(false, cx)
             }
             BreadcrumbEntryIconSource::None => None,
@@ -507,9 +483,6 @@ impl PickerDelegate for BreadcrumbDirectoryDelegate {
     }
 }
 
-/// A path segment whose dropdown lists `path`'s direct children, directories first then
-/// alphabetical. Opening it only marks the segment active; single-child chains are resolved only
-/// once a row is chosen.
 pub(crate) fn render_breadcrumb_directory_segment(
     editor: WeakEntity<Editor>,
     workspace: WeakEntity<Workspace>,
@@ -527,8 +500,7 @@ pub(crate) fn render_breadcrumb_directory_segment(
         .height(rems_from_px(22.).into())
         .child(label);
 
-    // Only the active segment's popover carries the shared handle `Editor::navigate_breadcrumb_to`
-    // reopens through; the rest get a throwaway one.
+    // Only the active segment carries the handle `Editor::navigate_breadcrumb_to` reopens through.
     let popover_handle = if is_active_segment {
         shared_popover_handle
             .as_any()
@@ -579,11 +551,7 @@ pub(crate) fn render_breadcrumb_directory_segment(
             Some(picker)
         });
 
-    // Double clicking a segment reveals its directory in the project panel, the way IntelliJ's
-    // navigation bar does. Capture phase, and on mouse down rather than on click: the first
-    // click opens the popover, whose window-level dismiss handler then swallows the second
-    // mouse down on the trigger (`PopoverMenu::paint` stops its propagation), so neither a
-    // click handler nor a bubble-phase mouse down handler ever sees a double click.
+    // Capture-phase mouse down, not click: the popover's dismiss handler swallows the second click.
     div()
         .capture_any_mouse_down(move |event, _, cx| {
             if event.button != MouseButton::Left || event.click_count < 2 {
@@ -600,7 +568,6 @@ pub(crate) fn render_breadcrumb_directory_segment(
         .into_any_element()
 }
 
-/// Selects `path` in the project panel, expanding whatever is needed to show it.
 fn reveal_breadcrumb_directory_in_project_panel(
     workspace: &WeakEntity<Workspace>,
     worktree_id: WorktreeId,
@@ -625,9 +592,6 @@ fn reveal_breadcrumb_directory_in_project_panel(
         return;
     };
     project.update(cx, |_, cx| {
-        // Opened explicitly rather than relying on the reveal to do it: the panel only activates
-        // itself when the reveal succeeds, and a closed panel should open either way, which is
-        // what IntelliJ does.
         cx.emit(project::Event::ActivateProjectPanel);
         cx.emit(project::Event::RevealInProjectPanel(entry_id));
     });
@@ -642,8 +606,6 @@ mod tests {
     use std::cell::RefCell;
     use workspace::Workspace;
 
-    /// Selects the row for `path` in an open directory picker and confirms it, standing in for a
-    /// click on that row.
     fn confirm_breadcrumb_row(
         picker: &Entity<BreadcrumbDirectoryPicker>,
         path: &str,
@@ -691,14 +653,11 @@ mod tests {
     fn test_breadcrumb_entry_label_color_honors_git_status_setting() {
         let entry = test_entry(git::status::GitSummary::UNTRACKED);
 
-        // On: an untracked file reads as "created", same as the project panel.
         assert_eq!(
             breadcrumb_entry_label_color(&entry, true, false),
             Color::Created
         );
 
-        // Off: falls back to the status-less color, ignoring the entry's own git summary — same
-        // as an unselected, untracked project panel entry with `git_status` off.
         assert_eq!(
             breadcrumb_entry_label_color(&entry, false, false),
             Color::Muted
@@ -790,8 +749,6 @@ mod tests {
                 .collect()
         });
 
-        // Stops at `repository` rather than descending into the file it alone contains — the
-        // user still clicks `Repositories.kt` themselves.
         assert_eq!(result, rel_path("repository").into_arc());
     }
 
@@ -799,8 +756,7 @@ mod tests {
     fn test_descend_single_child_directories_caps_depth() {
         use util::rel_path::rel_path;
 
-        // Each directory has exactly one child, forever — simulates a symlink cycle or a
-        // pathologically deep chain. The cap must stop the walk rather than looping forever.
+        // Simulates a symlink cycle; the cap must stop the walk instead of looping forever.
         let result = descend_single_child_directories(rel_path("a").into_arc(), |path| {
             vec![(
                 rel_path(&format!("{}/x", path.as_unix_str())).into_arc(),
@@ -823,9 +779,6 @@ mod tests {
         assert_eq!(result, rel_path("empty").into_arc());
     }
 
-    /// Without the fix, choosing a directory row panics: `choose` runs while the browser entity
-    /// is leased by `cx.listener`, and re-anchoring the popover synchronously updates that same
-    /// leased entity again ("cannot update ... while it is already being updated").
     #[gpui::test]
     async fn test_choosing_breadcrumb_directory_row_does_not_double_lease_browser(
         cx: &mut TestAppContext,
@@ -836,10 +789,7 @@ mod tests {
         use serde_json::json;
         use util::path;
 
-        // `PopoverMenu` only wires itself up during a real layout pass, so this needs an honest
-        // `Render` mounted as a window root rather than a bare drawn element. The `Editor` is
-        // created inside this same window too, since the re-anchor's deferred work is associated
-        // with the window it starts on and nothing else here drains another one.
+        // `PopoverMenu` only wires up during a real layout pass; needs a real `Render` root.
         struct Harness {
             handle: PopoverMenuHandle<BreadcrumbDirectoryPicker>,
             editor: Entity<Editor>,
@@ -862,9 +812,6 @@ mod tests {
                     .with_handle(self.handle.clone())
                     .trigger(ButtonLike::new("trigger").child(div()))
                     .menu(move |window, cx| {
-                        // Marking the segment active must happen in the same opening sequence
-                        // that creates the browser below, not as a separate step — a separate
-                        // call would dismiss the already-open browser via `handle` first.
                         if let Some(editor_entity) = editor.upgrade() {
                             editor_entity.update(cx, |editor, cx| {
                                 editor.open_breadcrumb_navigation(
@@ -919,9 +866,6 @@ mod tests {
 
         let harness_window = cx.add_window(|window, cx| {
             let editor = cx.new(|cx| build_editor(buffer, window, cx));
-            // The real handle `Editor::navigate_breadcrumb_to` re-anchors, exactly like
-            // `render_breadcrumb_directory_segment` uses for the active segment — not a fresh
-            // handle of the test's own, which `navigate_breadcrumb_to` would have no way to reach.
             let handle = editor
                 .read(cx)
                 .breadcrumb_popover_handle()
@@ -947,13 +891,10 @@ mod tests {
             .unwrap();
         let cx = &mut VisualTestContext::from_window(*harness_window, cx);
 
-        // Wires `handle` up to the popover's state, like a real breadcrumb bar render pass does.
         cx.update(|window, cx| {
             let _ = window.draw(cx);
         });
 
-        // Opening through `handle.show` makes `browser` the same entity `handle` holds internally
-        // — required for the repro, since the panic is about reaching back into a leased entity.
         cx.update(|window, cx| handle.show(window, cx));
         let browser = captured_browser.borrow().clone().expect("popover opened");
         assert!(handle.is_deployed());
@@ -975,7 +916,7 @@ mod tests {
             assert!(navigation.navigated);
             assert!(
                 editor.breadcrumb_reanchoring(),
-                "re-anchor is still in flight — the popover isn't back open yet"
+                "re-anchor is still in flight, the popover isn't back open yet"
             );
         });
         assert!(
@@ -983,8 +924,6 @@ mod tests {
             "the pre-navigation popover was dismissed synchronously by the defer"
         );
 
-        // Re-anchoring hides then re-shows the popover once the new active segment lays out; by
-        // then `browser` is no longer leased.
         cx.update(|window, cx| {
             editor.update(cx, |editor, cx| {
                 editor.reanchor_breadcrumb_popover(window, cx);
@@ -1003,8 +942,6 @@ mod tests {
         );
     }
 
-    /// The whole flow driven by `menu::` actions rather than by simulated keystrokes: move the
-    /// selection, submit it, and end up inside the chosen directory.
     #[gpui::test]
     async fn test_breadcrumb_directory_picker_navigates_from_the_keyboard(cx: &mut TestAppContext) {
         use editor::MultiBuffer;
@@ -1071,7 +1008,6 @@ mod tests {
         });
         cx.run_until_parked();
 
-        // The listing opens on `alpha`; one step down lands on `beta`.
         cx.dispatch_action(menu::SelectNext);
         picker.read_with(cx, |picker, _| {
             assert_eq!(
@@ -1095,8 +1031,6 @@ mod tests {
         });
     }
 
-    /// Double clicking a segment has to reach the project panel, which listens for this event
-    /// rather than being called directly.
     #[gpui::test]
     async fn test_revealing_a_breadcrumb_directory_emits_for_the_project_panel(
         cx: &mut TestAppContext,
@@ -1171,8 +1105,6 @@ mod tests {
         assert_eq!(activated.load(Ordering::Acquire), 1);
     }
 
-    /// Worktrees never scan gitignored directories proactively, so without the expansion call a
-    /// dropdown that only reads the snapshot lists nothing. One level per dropdown opened.
     #[gpui::test]
     async fn test_breadcrumb_directory_browser_expands_nested_gitignored_directories(
         cx: &mut TestAppContext,
@@ -1288,8 +1220,6 @@ mod tests {
         let editor = editor_window.root(cx).unwrap();
         let cx = &mut VisualTestContext::from_window(*editor_window, cx);
 
-        // `a`'s only child is `b`, whose only child is the file `c.txt` — a single-child chain —
-        // so choosing `a` descends straight to `a/b`, stopping short of the file.
         let browser = editor_window
             .update(cx, |_, window, cx| {
                 BreadcrumbDirectoryDelegate::picker(

@@ -1,23 +1,14 @@
 use super::*;
 
-/// Where a segment sits in [`plan_breadcrumb_layout`]'s drop order when the bar can't fit
-/// everything.
+/// Where a segment sits in [`plan_breadcrumb_layout`]'s drop order when the bar can't fit everything.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BreadcrumbSegmentKind {
-    /// The leading project-root segment — kept only once every [`Middle`](Self::Middle) segment
-    /// is gone, since it's the one segment whose dropdown reaches top-level entries.
     Root,
-    /// A directory component strictly between the root (or the start of the trail) and the file
-    /// segment — dropped first, since the "⋯" is exactly what stands in for these.
     Middle,
-    /// The open file, or the directory navigated into, dropped only once every `Root` and
-    /// `Middle` segment is gone.
     File,
-    /// An ancestor symbol, outermost first. The last one is nearest the cursor and never dropped.
     Symbol,
 }
 
-/// Assigns each segment its kind purely from its position relative to `file_segment_index`.
 pub(crate) fn classify_breadcrumb_segment_kinds(
     segment_count: usize,
     file_segment_index: usize,
@@ -33,8 +24,7 @@ pub(crate) fn classify_breadcrumb_segment_kinds(
         .collect()
 }
 
-/// Aligns `symbol_segments` 1:1 with `segments`, replacing it wholesale if the lengths disagree:
-/// later steps assume equal length and would otherwise panic in `Vec::splice`.
+/// Replaces `symbol_segments` wholesale if its length disagrees with `segments`: later steps assume equal length and would panic in `Vec::splice` otherwise.
 pub(crate) fn align_symbol_segments(
     segments: &[HighlightedText],
     symbol_segments: Vec<Option<BreadcrumbSegmentTarget>>,
@@ -46,13 +36,8 @@ pub(crate) fn align_symbol_segments(
     }
 }
 
-/// A safety net against a pathologically deep path. Ordinary breadcrumbs never approach it; the
-/// width comparison in `plan_breadcrumb_layout` is what actually fires.
 const MAX_BREADCRUMB_SEGMENTS_HARD_CAP: usize = 64;
 
-/// Trims a pathologically long run of `Middle` segments to a bounded prefix and suffix before the
-/// width-based planner sees it. The run is always contiguous, so this is a single splice that
-/// never touches `Root`, `File` or `Symbol`.
 pub(crate) fn hard_cap_breadcrumb_middle_segments(
     mut segments: Vec<HighlightedText>,
     mut symbol_segments: Vec<Option<BreadcrumbSegmentTarget>>,
@@ -101,8 +86,7 @@ pub(crate) fn hard_cap_breadcrumb_middle_segments(
     (segments, symbol_segments, kinds, file_segment_index)
 }
 
-/// What [`plan_breadcrumb_layout`] decided: `visible` and `ellipses` together partition
-/// `0..segment_count`.
+/// `visible` and `ellipses` together partition `0..segment_count`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BreadcrumbLayoutPlan {
     pub(crate) visible: Vec<usize>,
@@ -150,9 +134,7 @@ fn breadcrumb_layout_plan_from_dropped(dropped: &[bool]) -> BreadcrumbLayoutPlan
     BreadcrumbLayoutPlan { visible, ellipses }
 }
 
-/// Drops segments cheapest first until the row fits: every `Middle`, then `Root`, then `File`,
-/// then `Symbol` outermost first. The last segment is never a candidate, so the bar never empties.
-/// A pure function of the measured widths, so it is testable without a `Window`.
+/// Drops segments cheapest first (`Middle`, `Root`, `File`, `Symbol`); the last segment is never a candidate, so the bar never empties.
 pub(crate) fn plan_breadcrumb_layout(
     widths: &[Pixels],
     kinds: &[BreadcrumbSegmentKind],
@@ -226,7 +208,6 @@ mod tests {
                 highlights: vec![],
             })
             .collect();
-        // Shorter than `segments` on purpose: models a navigation whose worktree failed to resolve.
         let symbol_segments = vec![Some(BreadcrumbSegmentTarget::Symbol {
             buffer_id: BufferId::new(1).unwrap(),
             item: None,
@@ -240,7 +221,6 @@ mod tests {
 
     #[test]
     fn test_classify_breadcrumb_segment_kinds() {
-        // Root, two directory components, file, two ancestor symbols.
         let kinds = classify_breadcrumb_segment_kinds(6, 3, true);
         assert_eq!(
             kinds,
@@ -254,8 +234,6 @@ mod tests {
             ]
         );
 
-        // No root segment (`Siblings` mode, or the path wasn't split at all): the first segment
-        // is `Middle`, not `Root`.
         let kinds = classify_breadcrumb_segment_kinds(3, 1, false);
         assert_eq!(
             kinds,
@@ -266,14 +244,11 @@ mod tests {
             ]
         );
 
-        // The path wasn't split (unsaved buffer): a single `File` segment, `file_segment_index`
-        // stays `0`.
         let kinds = classify_breadcrumb_segment_kinds(1, 0, false);
         assert_eq!(kinds, vec![BreadcrumbSegmentKind::File]);
     }
 
-    /// Without `align_symbol_segments`, a short `symbol_segments` (from a worktree that failed to
-    /// resolve) panics: splice ranges below are computed from `segments.len()` alone.
+    /// Without `align_symbol_segments`, a short `symbol_segments` panics: splices below assume `segments.len()`.
     #[test]
     fn test_hard_cap_breadcrumb_middle_segments_does_not_panic_on_divergent_symbol_segments() {
         let segments: Vec<HighlightedText> = (0..100)
@@ -282,7 +257,6 @@ mod tests {
                 highlights: vec![],
             })
             .collect();
-        // Only one entry — far shorter than `segments` — modeling the divergence described above.
         let symbol_segments = vec![Some(BreadcrumbSegmentTarget::Symbol {
             buffer_id: BufferId::new(1).unwrap(),
             item: None,
@@ -290,14 +264,12 @@ mod tests {
         let symbol_segments = align_symbol_segments(&segments, symbol_segments);
         assert_eq!(symbol_segments.len(), segments.len());
 
-        // A root segment, 98 middle components, then the file at the end.
         let kinds = classify_breadcrumb_segment_kinds(segments.len(), 99, true);
 
         let (segments, symbol_segments, kinds, file_segment_index) =
             hard_cap_breadcrumb_middle_segments(segments, symbol_segments, kinds, 99);
 
-        // Root (1) + hard-capped middle (32 kept prefix + 1 "⋯" + 32 kept suffix = 65) + file (1)
-        // = 67.
+        // 67 = root (1) + capped middle (32 prefix + 1 "⋯" + 32 suffix) + file (1).
         assert_eq!(segments.len(), 67);
         assert_eq!(symbol_segments.len(), segments.len());
         assert_eq!(kinds.len(), segments.len());
@@ -325,9 +297,6 @@ mod tests {
         assert_eq!(file_segment_index, 3);
     }
 
-    /// Widths (in pixels) for a synthetic six-segment trail modeling the report's own example:
-    /// root, four middle directory components, the file, then two ancestor symbols (outermost
-    /// first, cursor-nearest last) — `root, a, b, c, d, file.kt, Class, fun method`.
     fn sample_breadcrumb_widths_and_kinds() -> (Vec<Pixels>, Vec<BreadcrumbSegmentKind>) {
         use BreadcrumbSegmentKind::*;
         let widths = vec![
@@ -359,23 +328,18 @@ mod tests {
     fn test_plan_breadcrumb_layout_drops_middle_before_root_before_file_before_outer_symbols() {
         let (widths, kinds) = sample_breadcrumb_widths_and_kinds();
 
-        // Narrow enough that all 4 middle components must go (dropping only 3 still leaves it too
-        // wide), but root, file, and both symbols still fit once all 4 are gone.
         let plan = plan_breadcrumb_layout(&widths, &kinds, px(20.), px(380.));
         assert_eq!(plan.visible, vec![0, 5, 6, 7]);
         assert_eq!(plan.ellipses, vec![1..5]);
 
-        // Narrow enough that root has to go too, but file and both symbols still fit.
         let plan = plan_breadcrumb_layout(&widths, &kinds, px(20.), px(340.));
         assert_eq!(plan.visible, vec![5, 6, 7]);
         assert_eq!(plan.ellipses, vec![0..5]);
 
-        // Narrower still: file goes too, leaving just the symbol chain.
         let plan = plan_breadcrumb_layout(&widths, &kinds, px(20.), px(230.));
         assert_eq!(plan.visible, vec![6, 7]);
         assert_eq!(plan.ellipses, vec![0..6]);
 
-        // Narrower yet: the outer symbol goes too, leaving only the innermost — never dropped.
         let plan = plan_breadcrumb_layout(&widths, &kinds, px(20.), px(140.));
         assert_eq!(plan.visible, vec![7]);
         assert_eq!(plan.ellipses, vec![0..7]);
@@ -385,7 +349,6 @@ mod tests {
     fn test_plan_breadcrumb_layout_degenerate_case_always_keeps_the_last_segment() {
         let (widths, kinds) = sample_breadcrumb_widths_and_kinds();
 
-        // Not even the innermost symbol alone fits — still renders it rather than nothing.
         let plan = plan_breadcrumb_layout(&widths, &kinds, px(20.), px(1.));
         assert_eq!(plan.visible, vec![7]);
         assert_eq!(plan.ellipses, vec![0..7]);

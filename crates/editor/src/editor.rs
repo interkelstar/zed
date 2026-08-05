@@ -1129,19 +1129,11 @@ pub struct Editor {
     previous_search_ranges: Option<Arc<[Range<Anchor>]>>,
     breadcrumb_header: Option<String>,
     breadcrumb_navigation: Option<BreadcrumbNavigation>,
-    /// Shared by every breadcrumb directory segment, so one dropdown is open at a time and
-    /// [`Editor::navigate_breadcrumb_to`] can reopen it under a different segment. `None` when no
-    /// picker renderers are registered and segments render as plain text.
     breadcrumb_popover_handle: Option<Rc<dyn ErasedBreadcrumbPopoverHandle>>,
-    /// Replaced each time a dropdown opens, and dropped with the editor rather than detached.
     breadcrumb_dismiss_subscription: Option<Subscription>,
-    /// Suppresses [`Editor::clear_breadcrumb_navigation`] while the dropdown is moving between
-    /// segments, since dismissing the old one would otherwise wipe the state just set. The
-    /// identity check there can't cover this: reselecting the active path dismisses with that same
-    /// identity. See `test_reanchoring_guard_survives_same_identity_reselection`.
+    /// Suppresses [`Editor::clear_breadcrumb_navigation`] while the dropdown moves between segments.
     breadcrumb_reanchoring: bool,
-    /// Waiting for the new active segment to exist. `BreadcrumbsRow::prepaint` clears it, that
-    /// being where the segment's `PopoverMenu` has just registered the shared handle.
+    /// Waiting for the new active segment's `PopoverMenu` to register the shared handle.
     breadcrumb_pending_reanchor: bool,
     focused_block: Option<FocusedBlock>,
     next_scroll_position: NextScrollCursorCenterTopBottom,
@@ -10994,20 +10986,14 @@ impl Editor {
         }
     }
 
-    /// Which directory segment produced the open dropdown, and whether a row inside it has
-    /// replaced the bar with that directory's own path.
     pub fn breadcrumb_navigation(&self) -> Option<&BreadcrumbNavigation> {
         self.breadcrumb_navigation.as_ref()
     }
 
-    /// Shared by whichever segment is active, so exactly one dropdown can be opened or closed
-    /// programmatically at a time. `None` when no picker renderers are registered.
     pub fn breadcrumb_popover_handle(&self) -> Option<Rc<dyn ErasedBreadcrumbPopoverHandle>> {
         self.breadcrumb_popover_handle.clone()
     }
 
-    /// Ends the session `path`'s segment started, on any route out of the dropdown: `Escape`,
-    /// focus moving away, or another segment hiding it.
     pub fn watch_breadcrumb_dismissal<T: EventEmitter<DismissEvent> + 'static>(
         &mut self,
         entity: &Entity<T>,
@@ -11023,21 +11009,13 @@ impl Editor {
         ));
     }
 
-    /// Marks `path`'s segment active because its dropdown opened, leaving what the bar shows
-    /// alone. `navigated` survives a segment reopening its own dropdown, so the bar doesn't flick
-    /// back to the real file's path.
-    ///
-    /// `path` identifies the segment itself, not the directory its dropdown lists. The `hide`
-    /// below is synchronous because nothing that reaches here holds an entity lease; keep it out
-    /// of `Entity::update` and `cx.listener` callbacks or that stops being true.
+    /// Do not call from `Entity::update` or `cx.listener`: `hide` below needs no lease held.
     pub fn open_breadcrumb_navigation(
         &mut self,
         worktree_id: WorktreeId,
         path: Arc<RelPath>,
         cx: &mut Context<Self>,
     ) {
-        // The shared handle points at whichever segment last became active, so this closes that
-        // one before this segment's opens.
         if let Some(handle) = &self.breadcrumb_popover_handle {
             handle.hide(cx);
         }
@@ -11058,11 +11036,7 @@ impl Editor {
         cx.emit(EditorEvent::BreadcrumbsChanged);
     }
 
-    /// Moves the bar into `path`, reopening the open dropdown under `path`'s own segment.
-    ///
-    /// Reached from the picker's `confirm`, so that picker's lease is still on the stack and
-    /// `PopoverMenuHandle::hide` would double-lease it. `cx.defer_in` runs once the outermost
-    /// `App::update` has returned the entity.
+    /// Uses `cx.defer_in`: called while the picker's `confirm` lease is still on the stack.
     pub fn navigate_breadcrumb_to(
         &mut self,
         worktree_id: WorktreeId,
@@ -11084,10 +11058,6 @@ impl Editor {
             if let Some(handle) = &handle {
                 handle.hide(cx);
             }
-            // Reopening has to wait for `path`'s segment to exist and register the shared handle,
-            // which happens while the bar lays itself out. `BreadcrumbsRow::prepaint` is the point
-            // where that has just finished, so it picks this flag up rather than this code trying
-            // to guess how many frames away that is.
             editor.breadcrumb_pending_reanchor = true;
             cx.notify();
         });
@@ -11102,8 +11072,6 @@ impl Editor {
         self.breadcrumb_reanchoring
     }
 
-    /// Reopens the dropdown [`Self::navigate_breadcrumb_to`] dismissed, now that the segment it
-    /// belongs to has been laid out.
     pub fn reanchor_breadcrumb_popover(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.breadcrumb_pending_reanchor {
             return;
@@ -11112,8 +11080,7 @@ impl Editor {
 
         let handle = self.breadcrumb_popover_handle.clone();
         let editor = cx.entity().downgrade();
-        // Deferred rather than immediate: this runs mid-draw, and `show` builds and focuses the
-        // dropdown's entity.
+        // Deferred: runs mid-draw, and `show` needs to build and focus the dropdown.
         window.defer(cx, move |window, cx| {
             if let Some(handle) = &handle {
                 handle.show(window, cx);
@@ -11124,12 +11091,6 @@ impl Editor {
         });
     }
 
-    /// Ends the navigation session, reverting the bar to the open file's path and symbols.
-    ///
-    /// A no-op unless `path` identifies the segment that is still active. `DismissEvent` is queued
-    /// rather than delivered synchronously, so hiding one segment's dropdown to open another's
-    /// lands here only after the second segment is already active; clearing unconditionally would
-    /// wipe that newer state.
     pub(crate) fn clear_breadcrumb_navigation(
         &mut self,
         worktree_id: WorktreeId,
@@ -12011,7 +11972,6 @@ impl Deref for EditorSnapshot {
     }
 }
 
-/// See [`Editor::breadcrumb_navigation`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BreadcrumbNavigation {
     pub worktree_id: WorktreeId,

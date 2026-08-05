@@ -18,13 +18,11 @@ use workspace::ItemHandle;
 
 use crate::MAX_BREADCRUMB_MENU_ENTRIES;
 
-/// The symbols a breadcrumb segment can move to, filtered by the picker's query.
 pub struct BreadcrumbSymbolDelegate {
     editor: WeakEntity<Editor>,
     items: Vec<OutlineItem<Anchor>>,
     matches: Vec<StringMatch>,
     selected_index: usize,
-    /// The segment's own symbol, so the row standing for it reads as the current one.
     current_range: Option<Range<Anchor>>,
 }
 
@@ -57,8 +55,6 @@ impl BreadcrumbSymbolDelegate {
         })
     }
 
-    /// Whether any listed symbol is the segment's own. If none is, the checkmark column is left
-    /// out rather than indenting every row for a mark that never appears.
     fn shows_current_marker(&self) -> bool {
         self.current_range
             .as_ref()
@@ -178,9 +174,7 @@ impl PickerDelegate for BreadcrumbSymbolDelegate {
 
     fn dismissed(&mut self, _window: &mut Window, _cx: &mut Context<BreadcrumbSymbolPicker>) {}
 
-    /// Rendered with the symbol's own syntax highlighting, the way the outline picker and panel
-    /// draw it. The fuzzy match positions are left off, since the two highlight sets would
-    /// fight.
+    /// Uses the symbol's own highlighting; fuzzy match positions are dropped to avoid a clash.
     fn render_match(
         &self,
         index: usize,
@@ -224,8 +218,6 @@ impl PickerDelegate for BreadcrumbSymbolDelegate {
     }
 }
 
-/// A segment whose dropdown drills into the outline: `target`'s children, else its siblings, else
-/// the buffer's top-level symbols.
 pub(crate) fn render_breadcrumb_symbol_segment(
     editor: WeakEntity<Editor>,
     buffer_id: BufferId,
@@ -233,8 +225,7 @@ pub(crate) fn render_breadcrumb_symbol_segment(
     label: gpui::AnyElement,
     index: usize,
 ) -> gpui::AnyElement {
-    // `ButtonLike` wraps its click handler in `cx.stop_propagation()`, which is what keeps this
-    // click from also reaching the outline toggle behind the popover.
+    // `ButtonLike` stops propagation, keeping this click off the outline toggle behind it.
     let trigger = ButtonLike::new(("breadcrumb-symbol", index))
         .style(ButtonStyle::Transparent)
         .size(ui::ButtonSize::None)
@@ -253,8 +244,7 @@ pub(crate) fn render_breadcrumb_symbol_segment(
             editor_entity
                 .read(cx)
                 .breadcrumb_symbol_menu_items(buffer_id, target.as_ref(), cx);
-        // Nothing to drill into, so fall through to the outline picker rather than flashing an
-        // empty popover.
+        // Nothing to drill into: fall through to the outline picker instead of an empty popover.
         if menu_items.is_empty() {
             if let Some(callback) = zed_actions::outline::TOGGLE_OUTLINE.get() {
                 callback(editor_entity.to_any_view(), window, cx);
@@ -293,7 +283,6 @@ mod tests {
         });
     }
 
-    /// A zero-width item anchored at the start of `row`, standing in for a real outline entry.
     fn test_item(snapshot: &MultiBufferSnapshot, row: u32, text: &str) -> OutlineItem<Anchor> {
         let range =
             snapshot.anchor_before(Point::new(row, 0))..snapshot.anchor_after(Point::new(row, 0));
@@ -389,8 +378,6 @@ mod tests {
             })
             .unwrap();
 
-        // "gam" is a subsequence of "gamma" only: neither "alpha" nor "beta" contains a 'g' or
-        // 'm', so this discriminates cleanly under fuzzy matching.
         picker
             .update_in(cx, |picker, window, cx| {
                 picker
@@ -463,8 +450,6 @@ mod tests {
         drop(subscription);
     }
 
-    /// The whole flow driven by `menu::` actions rather than by simulated keystrokes: move the
-    /// selection, submit it, and end up with the cursor on the chosen symbol.
     #[gpui::test]
     async fn test_breadcrumb_symbol_picker_navigates_from_the_keyboard(cx: &mut TestAppContext) {
         init_test(cx);
@@ -507,7 +492,6 @@ mod tests {
         });
         cx.run_until_parked();
 
-        // The listing opens on `alpha`; one step down lands on `beta`.
         cx.dispatch_action(menu::SelectNext);
         picker.read_with(cx, |picker, _| {
             assert_eq!(

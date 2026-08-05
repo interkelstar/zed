@@ -1185,8 +1185,6 @@
       "escape": "menu::Cancel",
       "up": "menu::SelectPrevious",
       "down": "menu::SelectNext",
-      // Harmless for pickers that leave these unhandled: the key then falls
-      // through to the next binding, ordinary cursor movement.
       "left": "menu::SelectParent",
       "right": "menu::SelectChild",
       "tab": "picker::ConfirmCompletion",

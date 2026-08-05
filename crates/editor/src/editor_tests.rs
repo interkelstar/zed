@@ -341,21 +341,17 @@ fn test_breadcrumb_navigation_state_transitions(cx: &mut TestAppContext) {
             "no session until a segment's dropdown opens"
         );
 
-        // Opening a segment's dropdown marks it active without navigating anywhere.
         editor.open_breadcrumb_navigation(worktree_id, rel_path("src").into_arc(), cx);
         let navigation = editor.breadcrumb_navigation().unwrap();
         assert_eq!(navigation.worktree_id, worktree_id);
         assert_eq!(navigation.active_path.as_unix_str(), "src");
         assert!(!navigation.navigated);
 
-        // Choosing a row inside that dropdown replaces the bar with the resolved directory.
         editor.navigate_breadcrumb_to(worktree_id, rel_path("src/main").into_arc(), window, cx);
         let navigation = editor.breadcrumb_navigation().unwrap();
         assert_eq!(navigation.active_path.as_unix_str(), "src/main");
         assert!(navigation.navigated);
 
-        // While the re-anchor is in flight, the outgoing popover's dismissal must not wipe the
-        // navigation state just set above, even when it identifies the now-active segment.
         editor.clear_breadcrumb_navigation(worktree_id, &rel_path("src/main").into_arc(), cx);
         assert!(
             editor.breadcrumb_navigation().is_some(),
@@ -363,11 +359,8 @@ fn test_breadcrumb_navigation_state_transitions(cx: &mut TestAppContext) {
         );
     });
 
-    // Stands in for the breadcrumb bar laying itself out, which is what completes the re-anchor
-    // (see `BreadcrumbsRow::prepaint`). It has to happen outside any `Editor` update above, since
-    // it updates `Editor` itself and entities can't be updated reentrantly. `App::with_window`
-    // reaches the window without going through (and so without locking) the root view entity the
-    // way `WindowHandle::update` does.
+    // Stands in for the bar's layout completing the re-anchor (`BreadcrumbsRow::prepaint`);
+    // `with_window` avoids a reentrant `Editor` update.
     let editor_entity = editor.root(cx).unwrap();
     cx.update(|cx| {
         cx.with_window(editor_entity.entity_id(), |window, cx| {
@@ -378,20 +371,11 @@ fn test_breadcrumb_navigation_state_transitions(cx: &mut TestAppContext) {
     });
 
     _ = editor.update(cx, |editor, _, cx| {
-        // Dismissing the dropdown (Escape, clicking outside, clicking into the editor) ends the
-        // session and reverts the bar to the current file's path and symbols. Identified by the
-        // still-active segment's own identity, exactly like a real dismiss subscription would.
         editor.clear_breadcrumb_navigation(worktree_id, &rel_path("src/main").into_arc(), cx);
         assert!(editor.breadcrumb_navigation().is_none());
     });
 }
 
-/// Clicking a new segment while another's dropdown is still open must not lose the new
-/// navigation: the old popover's `DismissEvent` is queued by `cx.emit` and only lands after
-/// `open_breadcrumb_navigation` has already overwritten `breadcrumb_navigation`, and
-/// `clear_breadcrumb_navigation` used to clear unconditionally when it ran. This drives that
-/// reordering directly rather than through the full `PopoverMenu` machinery, which the
-/// `element.rs` breadcrumb tests cover but always through an already-current handle.
 #[gpui::test]
 fn test_stale_breadcrumb_dismissal_does_not_clobber_newer_navigation(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
@@ -405,8 +389,7 @@ fn test_stale_breadcrumb_dismissal_does_not_clobber_newer_navigation(cx: &mut Te
     let frontend_path = rel_path("frontend").into_arc();
 
     let editor_entity = editor.root(cx).unwrap();
-    // Stands in for the breadcrumb bar laying itself out, which is what completes the re-anchor
-    // (see `BreadcrumbsRow::prepaint`).
+    // Stands in for the bar's layout completing the re-anchor (`BreadcrumbsRow::prepaint`).
     let drain_reanchor = |cx: &mut TestAppContext| {
         cx.update(|cx| {
             cx.with_window(editor_entity.entity_id(), |window, cx| {
@@ -417,9 +400,6 @@ fn test_stale_breadcrumb_dismissal_does_not_clobber_newer_navigation(cx: &mut Te
         });
     };
 
-    // Navigate into "bin" — an empty directory, so `descend_single_child_directories` (see its own
-    // unit tests) resolves it to itself, exactly what confirming an empty directory's row would
-    // produce for choosing an empty directory's row.
     _ = editor.update(cx, |editor, window, cx| {
         editor.navigate_breadcrumb_to(worktree_id, bin_path.clone(), window, cx);
     });
@@ -431,9 +411,6 @@ fn test_stale_breadcrumb_dismissal_does_not_clobber_newer_navigation(cx: &mut Te
         assert!(navigation.navigated);
     });
 
-    // Click the root segment directly while still navigated to "bin" — mirrors
-    // `render_breadcrumb_directory_segment`'s `.menu()` builder, whose first action is exactly
-    // this call.
     _ = editor.update(cx, |editor, _, cx| {
         editor.open_breadcrumb_navigation(worktree_id, root_path.clone(), cx);
         let navigation = editor.breadcrumb_navigation().unwrap();
@@ -441,10 +418,6 @@ fn test_stale_breadcrumb_dismissal_does_not_clobber_newer_navigation(cx: &mut Te
         assert!(!navigation.navigated);
     });
 
-    // The stale, queued dismissal of "bin"'s own popover — closed by the click above's
-    // `self.breadcrumb_popover_handle.hide(cx)`, but only actually processed after
-    // `open_breadcrumb_navigation` already returned (see this test's doc comment) — must not
-    // clobber the root's freshly-set state just because it runs after the fact.
     _ = editor.update(cx, |editor, _, cx| {
         editor.clear_breadcrumb_navigation(worktree_id, &bin_path, cx);
         let navigation = editor
@@ -456,9 +429,6 @@ fn test_stale_breadcrumb_dismissal_does_not_clobber_newer_navigation(cx: &mut Te
         );
     });
 
-    // From here the session must behave completely normally: navigating on to "frontend" (a
-    // populated sibling of "bin") and settling the re-anchor must land on "frontend", not on
-    // whatever `bin`'s stale dismissal would have reverted to.
     _ = editor.update(cx, |editor, window, cx| {
         editor.navigate_breadcrumb_to(worktree_id, frontend_path.clone(), window, cx);
     });
@@ -472,8 +442,6 @@ fn test_stale_breadcrumb_dismissal_does_not_clobber_newer_navigation(cx: &mut Te
         assert!(navigation.navigated);
     });
 
-    // And the segments actually rendered from that final state must read "<root> › frontend", the
-    // same as if the empty `bin` detour had never happened.
     let (labels, _) = editor
         .update(cx, |editor, _, _cx| {
             let navigation = editor.breadcrumb_navigation().unwrap().clone();
@@ -497,12 +465,6 @@ fn test_stale_breadcrumb_dismissal_does_not_clobber_newer_navigation(cx: &mut Te
     );
 }
 
-/// `clear_breadcrumb_navigation`'s identity check can only reject a stale dismissal whose identity
-/// *differs* from the freshly-set navigation. Re-choosing a row that resolves back to the path
-/// already active (a parent segment's dropdown still lists the child the bar is sitting on) makes
-/// `navigate_breadcrumb_to` re-set the same `(worktree_id, active_path)`, so the queued dismissal
-/// that follows carries a matching identity too. `breadcrumb_reanchoring` breaks that tie by
-/// timing instead.
 #[gpui::test]
 fn test_reanchoring_guard_survives_same_identity_reselection(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
@@ -514,12 +476,10 @@ fn test_reanchoring_guard_survives_same_identity_reselection(cx: &mut TestAppCon
     let src_path = rel_path("src").into_arc();
     let editor_entity = editor.root(cx).unwrap();
 
-    // Navigate to "src" and let the popover re-anchor settle, mirroring an ordinary click.
     _ = editor.update(cx, |editor, window, cx| {
         editor.navigate_breadcrumb_to(worktree_id, src_path.clone(), window, cx);
     });
-    // Stands in for the breadcrumb bar laying itself out, which is what completes the re-anchor
-    // (see `BreadcrumbsRow::prepaint`).
+    // Stands in for the bar's layout completing the re-anchor (`BreadcrumbsRow::prepaint`).
     cx.update(|cx| {
         cx.with_window(editor_entity.entity_id(), |window, cx| {
             editor_entity.update(cx, |editor, cx| {
@@ -531,21 +491,11 @@ fn test_reanchoring_guard_survives_same_identity_reselection(cx: &mut TestAppCon
         assert!(!editor.breadcrumb_reanchoring);
     });
 
-    // Re-choosing "src" from its own siblings dropdown (a multi-child directory, so
-    // `descend_single_child_directories` resolves back to itself) re-navigates to the identical
-    // `(worktree_id, active_path)` it already had.
     _ = editor.update(cx, |editor, window, cx| {
         editor.navigate_breadcrumb_to(worktree_id, src_path.clone(), window, cx);
-        // Still inside the re-anchor window: the guard must be up before the stale dismissal
-        // below arrives, exactly as it is between the real `hide` and `show` calls.
         assert!(editor.breadcrumb_reanchoring);
     });
 
-    // The stale dismissal of the popover `navigate_breadcrumb_to` just hid, carrying `src`'s own
-    // identity — which now matches the current navigation exactly, unlike the differing-identity
-    // case `test_stale_breadcrumb_dismissal_does_not_clobber_newer_navigation` covers. Without
-    // `breadcrumb_reanchoring`, the identity check alone would accept this as current and clear
-    // the session out from under the reselection that's still in flight.
     _ = editor.update(cx, |editor, _, cx| {
         editor.clear_breadcrumb_navigation(worktree_id, &src_path, cx);
         let navigation = editor
