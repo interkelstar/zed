@@ -452,6 +452,7 @@ fn test_stale_breadcrumb_dismissal_does_not_clobber_newer_navigation(cx: &mut Te
                 None,
                 None,
                 Some(&navigation.active_path),
+                false,
             )
         })
         .unwrap();

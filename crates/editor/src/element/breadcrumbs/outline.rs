@@ -1,5 +1,5 @@
 /// Parent is the nearest preceding entry with a smaller depth, not `depth - 1`: tree-sitter outlines can jump depth unevenly.
-fn outline_parents(depths: &[usize]) -> Vec<Option<usize>> {
+pub(crate) fn outline_parents(depths: &[usize]) -> Vec<Option<usize>> {
     let mut parents = Vec::with_capacity(depths.len());
     let mut ancestor_stack: Vec<(usize, usize)> = Vec::new();
     for (index, &depth) in depths.iter().enumerate() {
