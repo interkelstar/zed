@@ -9,7 +9,8 @@ use agent_ui::terminal_thread_metadata_store::{
     TerminalThreadMetadata, TerminalThreadMetadataStore, terminal_title_prefix,
 };
 use agent_ui::thread_metadata_store::{
-    ThreadMetadata, ThreadMetadataStore, WorktreePaths, worktree_info_from_thread_paths,
+    ThreadMetadata, ThreadMetadataStore, WorktreePaths, recent_thread_order,
+    worktree_info_from_thread_paths,
 };
 use agent_ui::threads_archive_view::{
     ThreadsArchiveView, ThreadsArchiveViewEvent, format_history_entry_timestamp,
@@ -55,9 +56,9 @@ use std::sync::Arc;
 use theme::{ActiveTheme, CLIENT_SIDE_DECORATION_ROUNDING};
 use ui::{
     AgentThreadStatus, CommonAnimationExt, ContextMenu, ContextMenuEntry, Divider, GradientFade,
-    HighlightedLabel, KeyBinding, PopoverMenu, PopoverMenuHandle, ProjectEmptyState, ScrollAxes,
-    Scrollbars, Tab, ThreadItem, ThreadItemWorktreeInfo, TintColor, Tooltip, WithScrollbar,
-    prelude::*, render_modifiers, right_click_menu,
+    HighlightedLabel, KeyBinding, ListItem, PopoverMenu, PopoverMenuHandle, ProjectEmptyState,
+    ScrollAxes, Scrollbars, Tab, ThreadItem, ThreadItemWorktreeInfo, TintColor, Tooltip,
+    WithScrollbar, prelude::*, render_modifiers, right_click_menu,
 };
 use unicode_segmentation::UnicodeSegmentation as _;
 use util::ResultExt as _;
@@ -6278,6 +6279,107 @@ impl Sidebar {
         window.focus(&focus, cx);
     }
 
+    /// How many recent threads to show in the sidebar toggle's hover
+    /// popover (see `render_recent_threads_popover_impl`).
+    const RECENT_THREADS_POPOVER_LIMIT: usize = 15;
+
+    /// Builds the recent-threads hover popover shown when the sidebar
+    /// toggle button is hovered. Reuses `self.contents.entries` (the same
+    /// data the sidebar's own thread list renders from) so the popover
+    /// never falls out of sync with the sidebar, and reuses the same
+    /// thread-activation paths as clicking a row in the sidebar.
+    fn render_recent_threads_popover_impl(
+        &mut self,
+        on_activated: Rc<dyn Fn(&mut Window, &mut App)>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let candidates: Vec<Arc<ThreadEntry>> = self
+            .contents
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                ListEntry::Thread(thread) if thread.draft.is_none() => Some(thread.clone()),
+                _ => None,
+            })
+            .collect();
+
+        let metadata: Vec<ThreadMetadata> = candidates
+            .iter()
+            .map(|thread| thread.metadata.clone())
+            .collect();
+        let order = recent_thread_order(&metadata, Self::RECENT_THREADS_POPOVER_LIMIT);
+
+        let mut list = v_flex()
+            .id("recent-threads-popover")
+            .elevation_3(cx)
+            .p_1()
+            .gap_0p5()
+            .w(rems_from_px(280.))
+            .max_h(rems_from_px(384.))
+            .overflow_y_scroll();
+
+        if order.is_empty() {
+            return list
+                .p_2()
+                .child(Label::new("No recent threads").color(Color::Muted))
+                .into_any_element();
+        }
+
+        for candidate_index in order {
+            let thread = candidates[candidate_index].clone();
+            let title = thread.metadata.display_title();
+            let timestamp = format_history_entry_timestamp(thread.metadata.display_time());
+            let workspace = thread.workspace.clone();
+            let metadata = thread.metadata.clone();
+            let on_activated = on_activated.clone();
+            let id = SharedString::from(format!("recent-thread-{candidate_index}"));
+
+            list = list.child(
+                ListItem::new(id)
+                    .rounded()
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .gap_0p5()
+                            .child(Label::new(title).truncate())
+                            .child(
+                                Label::new(timestamp)
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            ),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        match &workspace {
+                            ThreadEntryWorkspace::Open(workspace) => {
+                                this.activate_thread(
+                                    metadata.clone(),
+                                    workspace,
+                                    false,
+                                    window,
+                                    cx,
+                                );
+                            }
+                            ThreadEntryWorkspace::Closed {
+                                folder_paths,
+                                project_group_key,
+                            } => {
+                                this.open_workspace_and_activate_thread(
+                                    metadata.clone(),
+                                    folder_paths.clone(),
+                                    project_group_key,
+                                    window,
+                                    cx,
+                                );
+                            }
+                        }
+                        on_activated(window, cx);
+                    })),
+            );
+        }
+
+        list.into_any_element()
+    }
+
     fn render_thread(
         &self,
         ix: usize,
@@ -8001,6 +8103,15 @@ impl WorkspaceSidebar for Sidebar {
 
     fn cycle_thread(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.cycle_thread_impl(forward, window, cx);
+    }
+
+    fn render_recent_threads_popover(
+        &mut self,
+        on_activated: Rc<dyn Fn(&mut Window, &mut App)>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.render_recent_threads_popover_impl(on_activated, cx)
     }
 
     fn serialized_state(&self, _cx: &App) -> Option<String> {

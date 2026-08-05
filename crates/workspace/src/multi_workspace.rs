@@ -141,6 +141,20 @@ pub trait Sidebar: Focusable + Render + EventEmitter<SidebarEvent> + Sized {
     /// Activates the next or previous thread in sidebar order.
     fn cycle_thread(&mut self, _forward: bool, _window: &mut Window, _cx: &mut Context<Self>) {}
 
+    /// Builds the contents of the hover popover shown when the sidebar
+    /// toggle button is hovered, previewing recent threads so the user can
+    /// switch to one without opening the sidebar. `on_activated` must be
+    /// called once a thread has been activated, so the caller can dismiss
+    /// the popover.
+    fn render_recent_threads_popover(
+        &mut self,
+        _on_activated: Rc<dyn Fn(&mut Window, &mut App)>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> AnyElement {
+        gpui::Empty.into_any_element()
+    }
+
     /// Return an opaque JSON blob of sidebar-specific state to persist.
     fn serialized_state(&self, _cx: &App) -> Option<String> {
         None
@@ -168,6 +182,12 @@ pub trait SidebarHandle: 'static + Send + Sync {
     fn toggle_thread_switcher(&self, select_last: bool, window: &mut Window, cx: &mut App);
     fn cycle_project(&self, forward: bool, window: &mut Window, cx: &mut App);
     fn cycle_thread(&self, forward: bool, window: &mut Window, cx: &mut App);
+    fn render_recent_threads_popover(
+        &self,
+        on_activated: Rc<dyn Fn(&mut Window, &mut App)>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> AnyElement;
 
     fn is_threads_list_view_active(&self, cx: &App) -> bool;
 
@@ -244,6 +264,17 @@ impl<T: Sidebar> SidebarHandle for Entity<T> {
                 this.cycle_thread(forward, window, cx);
             });
         });
+    }
+
+    fn render_recent_threads_popover(
+        &self,
+        on_activated: Rc<dyn Fn(&mut Window, &mut App)>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> AnyElement {
+        self.update(cx, |this, cx| {
+            this.render_recent_threads_popover(on_activated, window, cx)
+        })
     }
 
     fn is_threads_list_view_active(&self, cx: &App) -> bool {

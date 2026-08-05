@@ -361,6 +361,30 @@ impl ThreadMetadata {
     ) -> bool {
         same_remote_connection_identity(self.remote_connection.as_ref(), remote_connection)
     }
+
+    /// The timestamp used to order this thread in "recent" listings: the
+    /// last time the user interacted with it, falling back to when it was
+    /// last updated.
+    pub fn display_time(&self) -> DateTime<Utc> {
+        self.interacted_at.unwrap_or(self.updated_at)
+    }
+}
+
+/// Returns indices into `entries` for the most recently active, non-archived
+/// threads, most recent first, truncated to `limit`. Kept independent of any
+/// particular rendering so it can be reused (and unit-tested) anywhere a
+/// "recent threads" preview is needed, such as the sidebar toggle's hover
+/// popover.
+pub fn recent_thread_order(entries: &[ThreadMetadata], limit: usize) -> Vec<usize> {
+    let mut indices: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, metadata)| !metadata.archived)
+        .map(|(index, _)| index)
+        .collect();
+    indices.sort_by(|&a, &b| entries[b].display_time().cmp(&entries[a].display_time()));
+    indices.truncate(limit);
+    indices
 }
 
 /// Derives worktree display info from a thread's stored path list.
@@ -1944,6 +1968,77 @@ mod tests {
         metadata.title_override = None;
         assert_eq!(metadata.title().as_deref(), Some("Agent Generated Title"));
         assert_eq!(metadata.display_title().as_ref(), "Agent Generated Title");
+    }
+
+    #[test]
+    fn test_recent_thread_order_sorts_by_display_time_descending() {
+        let now = Utc::now();
+        let oldest = make_metadata(
+            "session-1",
+            "Oldest",
+            now - chrono::Duration::hours(2),
+            PathList::default(),
+        );
+        let newest = make_metadata("session-2", "Newest", now, PathList::default());
+        let middle = make_metadata(
+            "session-3",
+            "Middle",
+            now - chrono::Duration::hours(1),
+            PathList::default(),
+        );
+        let entries = vec![oldest, newest, middle];
+
+        assert_eq!(recent_thread_order(&entries, 10), vec![1, 2, 0]);
+    }
+
+    #[test]
+    fn test_recent_thread_order_truncates_to_limit() {
+        let now = Utc::now();
+        let entries: Vec<ThreadMetadata> = (0..5)
+            .map(|index| {
+                make_metadata(
+                    &format!("session-{index}"),
+                    &format!("Thread {index}"),
+                    now - chrono::Duration::minutes(index),
+                    PathList::default(),
+                )
+            })
+            .collect();
+
+        assert_eq!(recent_thread_order(&entries, 2), vec![0, 1]);
+        assert_eq!(recent_thread_order(&entries, 0), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn test_recent_thread_order_excludes_archived_threads() {
+        let now = Utc::now();
+        let mut archived = make_metadata("session-1", "Archived", now, PathList::default());
+        archived.archived = true;
+        let active = make_metadata(
+            "session-2",
+            "Active",
+            now - chrono::Duration::hours(1),
+            PathList::default(),
+        );
+        let entries = vec![archived, active];
+
+        assert_eq!(recent_thread_order(&entries, 10), vec![1]);
+    }
+
+    #[test]
+    fn test_recent_thread_order_prefers_interacted_at_over_updated_at() {
+        let now = Utc::now();
+        let mut recently_interacted = make_metadata(
+            "session-1",
+            "Interacted",
+            now - chrono::Duration::hours(5),
+            PathList::default(),
+        );
+        recently_interacted.interacted_at = Some(now + chrono::Duration::minutes(1));
+        let recently_updated = make_metadata("session-2", "Updated", now, PathList::default());
+        let entries = vec![recently_updated, recently_interacted];
+
+        assert_eq!(recent_thread_order(&entries, 10), vec![1, 0]);
     }
 
     #[gpui::test]

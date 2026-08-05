@@ -4,12 +4,21 @@ use crate::{
 };
 use gpui::{
     Anchor, AnyView, App, Context, Decorations, Entity, FocusHandle, Focusable, IntoElement,
-    ParentElement, Render, Role, SharedString, Styled, Subscription, WeakEntity, Window,
+    ParentElement, Render, Role, SharedString, Styled, Subscription, Task, WeakEntity, Window,
+    anchored, deferred,
 };
 use settings::{SettingsContent, update_settings_file};
-use std::{any::TypeId, sync::Arc};
+use std::{any::TypeId, rc::Rc, sync::Arc, time::Duration};
 use theme::CLIENT_SIDE_DECORATION_ROUNDING;
 use ui::{ContextMenu, Divider, IconPosition, Indicator, Tooltip, prelude::*, right_click_menu};
+
+/// How long the pointer must hover the sidebar toggle before the recent
+/// threads popover appears, matching the feel of a regular tooltip.
+const RECENT_THREADS_POPOVER_SHOW_DELAY: Duration = Duration::from_millis(500);
+/// Grace period after the pointer leaves the toggle button or the popover
+/// before it's dismissed, so moving the pointer from one to the other
+/// doesn't flicker it closed.
+const RECENT_THREADS_POPOVER_HIDE_DELAY: Duration = Duration::from_millis(300);
 
 /// Describes how a status-bar item can be hidden by the user.
 ///
@@ -104,6 +113,13 @@ pub struct StatusBar {
     multi_workspace: Option<WeakEntity<MultiWorkspace>>,
     focus_handle: FocusHandle,
     _observe_active_pane: Subscription,
+    /// Whether the recent-threads hover popover for the sidebar toggle is
+    /// currently shown. Hover-only; unrelated to the sidebar's open state.
+    recent_threads_popover_visible: bool,
+    /// Debounces both showing (after `RECENT_THREADS_POPOVER_SHOW_DELAY`)
+    /// and hiding (after `RECENT_THREADS_POPOVER_HIDE_DELAY`) the popover.
+    /// Replacing this field cancels whichever transition was pending.
+    _recent_threads_popover_hover_task: Option<Task<()>>,
 }
 
 impl Focusable for StatusBar {
@@ -181,35 +197,46 @@ impl Render for StatusBar {
                     .border_b(px(1.0))
                     .border_color(cx.theme().colors().status_bar_background),
             })
-            .child(self.render_left_tools(&sidebar, cx))
-            .child(self.render_right_tools(&sidebar, cx))
+            .child(self.render_left_tools(&sidebar, window, cx))
+            .child(self.render_right_tools(&sidebar, window, cx))
     }
 }
 
 impl StatusBar {
     fn render_left_tools(
-        &self,
+        &mut self,
         sidebar: &SidebarStatus,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let toggle = (sidebar.show_toggle && !sidebar.open && sidebar.side == SidebarSide::Left)
+            .then(|| {
+                self.render_sidebar_toggle(sidebar, window, cx)
+                    .into_any_element()
+            });
+
         h_flex()
             .gap_1()
             .min_w_0()
             .overflow_x_hidden()
-            .when(
-                sidebar.show_toggle && !sidebar.open && sidebar.side == SidebarSide::Left,
-                |this| this.child(self.render_sidebar_toggle(sidebar, cx)),
-            )
+            .children(toggle)
             .children(self.left_items.iter().enumerate().map(|(index, item)| {
                 render_hideable_item("status-bar-left", index, item.as_ref(), cx)
             }))
     }
 
     fn render_right_tools(
-        &self,
+        &mut self,
         sidebar: &SidebarStatus,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let toggle = (sidebar.show_toggle && !sidebar.open && sidebar.side == SidebarSide::Right)
+            .then(|| {
+                self.render_sidebar_toggle(sidebar, window, cx)
+                    .into_any_element()
+            });
+
         h_flex()
             .flex_shrink_0()
             .gap_1()
@@ -223,15 +250,65 @@ impl StatusBar {
                         render_hideable_item("status-bar-right", index, item.as_ref(), cx)
                     }),
             )
-            .when(
-                sidebar.show_toggle && !sidebar.open && sidebar.side == SidebarSide::Right,
-                |this| this.child(self.render_sidebar_toggle(sidebar, cx)),
-            )
+            .children(toggle)
+    }
+
+    /// Updates the popover's hover-show/hide debounce in response to the
+    /// pointer entering or leaving the toggle button or the popover itself.
+    /// Re-entering either area (before the hide grace period elapses)
+    /// cancels the pending dismissal, so moving the pointer from the button
+    /// to the popover doesn't flicker it closed.
+    fn on_recent_threads_hover_changed(
+        &mut self,
+        hovered: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if hovered {
+            if self.recent_threads_popover_visible {
+                self._recent_threads_popover_hover_task = None;
+                return;
+            }
+            self._recent_threads_popover_hover_task =
+                Some(cx.spawn_in(window, async move |this, cx| {
+                    cx.background_executor()
+                        .timer(RECENT_THREADS_POPOVER_SHOW_DELAY)
+                        .await;
+                    this.update(cx, |this, cx| {
+                        this.recent_threads_popover_visible = true;
+                        cx.notify();
+                    })
+                    .ok();
+                }));
+        } else {
+            self._recent_threads_popover_hover_task =
+                Some(cx.spawn_in(window, async move |this, cx| {
+                    cx.background_executor()
+                        .timer(RECENT_THREADS_POPOVER_HIDE_DELAY)
+                        .await;
+                    this.update(cx, |this, cx| {
+                        this.recent_threads_popover_visible = false;
+                        cx.notify();
+                    })
+                    .ok();
+                }));
+        }
+    }
+
+    /// Dismisses the popover immediately, e.g. after a thread was activated
+    /// from it or the user clicked outside of it.
+    fn hide_recent_threads_popover(&mut self, cx: &mut Context<Self>) {
+        self._recent_threads_popover_hover_task = None;
+        if self.recent_threads_popover_visible {
+            self.recent_threads_popover_visible = false;
+            cx.notify();
+        }
     }
 
     fn render_sidebar_toggle(
-        &self,
+        &mut self,
         sidebar: &SidebarStatus,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let on_right = sidebar.side == SidebarSide::Right;
@@ -277,15 +354,86 @@ impl StatusBar {
                 })
             });
 
-        h_flex()
-            .gap_0p5()
-            .when(on_right, |this| {
-                this.child(Divider::vertical().color(ui::DividerColor::Border))
-            })
-            .child(toggle)
-            .when(!on_right, |this| {
-                this.child(Divider::vertical().color(ui::DividerColor::Border))
-            })
+        let popover = self
+            .recent_threads_popover_visible
+            .then(|| self.render_recent_threads_popover(on_right, window, cx))
+            .flatten();
+
+        div()
+            .relative()
+            .child(
+                h_flex()
+                    .id("sidebar-status-toggle-hover-area")
+                    .gap_0p5()
+                    .on_hover(cx.listener(move |this, hovered: &bool, window, cx| {
+                        this.on_recent_threads_hover_changed(*hovered, window, cx);
+                    }))
+                    .when(on_right, |this| {
+                        this.child(Divider::vertical().color(ui::DividerColor::Border))
+                    })
+                    .child(toggle)
+                    .when(!on_right, |this| {
+                        this.child(Divider::vertical().color(ui::DividerColor::Border))
+                    }),
+            )
+            .children(popover)
+    }
+
+    /// Builds the anchored overlay hosting the recent-threads popover
+    /// content, positioned above the toggle button (the status bar sits at
+    /// the bottom of the window).
+    fn render_recent_threads_popover(
+        &mut self,
+        on_right: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let multi_workspace = self.multi_workspace.as_ref()?.upgrade()?;
+        let this_entity = cx.entity();
+        let on_activated: Rc<dyn Fn(&mut Window, &mut App)> = Rc::new(move |_window, cx| {
+            this_entity.update(cx, |this, cx| {
+                this.hide_recent_threads_popover(cx);
+            });
+        });
+
+        let content = multi_workspace.update(cx, move |multi_workspace, cx| {
+            let sidebar = multi_workspace.sidebar()?;
+            Some(sidebar.render_recent_threads_popover(on_activated, window, cx))
+        })?;
+
+        let content = div()
+            .id("recent-threads-popover-content")
+            .occlude()
+            .on_hover(cx.listener(move |this, hovered: &bool, window, cx| {
+                this.on_recent_threads_hover_changed(*hovered, window, cx);
+            }))
+            .on_mouse_down_out(cx.listener(|this, _, _window, cx| {
+                this.hide_recent_threads_popover(cx);
+            }))
+            .child(content);
+
+        Some(
+            div()
+                .absolute()
+                .bottom_0()
+                .when(on_right, |this| this.right_0())
+                .when(!on_right, |this| this.left_0())
+                .size_0()
+                .child(
+                    deferred(
+                        anchored()
+                            .anchor(if on_right {
+                                Anchor::BottomRight
+                            } else {
+                                Anchor::BottomLeft
+                            })
+                            .snap_to_window_with_margin(px(8.))
+                            .child(content),
+                    )
+                    .with_priority(1),
+                )
+                .into_any_element(),
+        )
     }
 }
 
@@ -339,6 +487,8 @@ impl StatusBar {
             _observe_active_pane: cx.observe_in(active_pane, window, |this, _, window, cx| {
                 this.update_active_pane_item(window, cx)
             }),
+            recent_threads_popover_visible: false,
+            _recent_threads_popover_hover_task: None,
         };
         this.update_active_pane_item(window, cx);
         this
