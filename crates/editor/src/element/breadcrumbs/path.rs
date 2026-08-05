@@ -21,6 +21,7 @@ pub(crate) fn breadcrumb_path_segments(
     active_path: Option<Arc<RelPath>>,
     terminal_buffer_id: Option<BufferId>,
     active_segment: Option<&RelPath>,
+    file_segment_active: bool,
 ) -> (Vec<HighlightedText>, Vec<Option<BreadcrumbSegmentTarget>>) {
     let mut labels = vec![HighlightedText {
         text: root_name.to_string().into(),
@@ -48,6 +49,7 @@ pub(crate) fn breadcrumb_path_segments(
                 BreadcrumbSegmentTarget::Symbol {
                     buffer_id,
                     item: None,
+                    is_active_segment: file_segment_active,
                 }
             } else {
                 BreadcrumbSegmentTarget::Directory {
@@ -256,6 +258,7 @@ mod tests {
             Some(path.clone()),
             Some(buffer_id),
             None,
+            false,
         );
 
         assert_eq!(
@@ -298,9 +301,11 @@ mod tests {
             BreadcrumbSegmentTarget::Symbol {
                 buffer_id: id,
                 item,
+                is_active_segment,
             } => {
                 assert_eq!(*id, buffer_id);
                 assert!(item.is_none());
+                assert!(!is_active_segment);
             }
             other => panic!("expected symbol target for the file segment, got {other:?}"),
         }
@@ -321,6 +326,7 @@ mod tests {
             Some(path.clone()),
             Some(buffer_id),
             None,
+            false,
         );
 
         assert_eq!(
@@ -351,6 +357,7 @@ mod tests {
             None,
             None,
             Some(rel_path("src/main")),
+            false,
         );
 
         assert_eq!(
@@ -386,6 +393,7 @@ mod tests {
             Some(path.clone()),
             None,
             None,
+            false,
         );
 
         assert_eq!(

@@ -13,6 +13,7 @@ use layout::{
     align_symbol_segments, classify_breadcrumb_segment_kinds, hard_cap_breadcrumb_middle_segments,
 };
 use layout::{breadcrumb_layout_plan_width, plan_breadcrumb_layout};
+pub(crate) use outline::outline_parents;
 pub use outline::{child_outline_indices, sibling_outline_indices, top_level_outline_indices};
 use path::breadcrumb_path_is_navigable;
 pub(crate) use path::breadcrumb_path_segments;
@@ -44,10 +45,14 @@ pub struct BreadcrumbPickerRenderers {
         WeakEntity<Editor>,
         BufferId,
         Option<OutlineItem<Anchor>>,
+        Option<(WorktreeId, Arc<RelPath>)>,
+        bool,
+        Rc<dyn ErasedBreadcrumbPopoverHandle>,
         gpui::AnyElement,
         usize,
     ) -> gpui::AnyElement,
     pub popover_handle: fn() -> Rc<dyn ErasedBreadcrumbPopoverHandle>,
+    pub symbol_popover_handle: fn() -> Rc<dyn ErasedBreadcrumbPopoverHandle>,
 }
 
 pub static BREADCRUMB_PICKER_RENDERERS: OnceLock<BreadcrumbPickerRenderers> = OnceLock::new();
@@ -57,6 +62,7 @@ pub(crate) enum BreadcrumbSegmentTarget {
     Symbol {
         buffer_id: BufferId,
         item: Option<OutlineItem<Anchor>>,
+        is_active_segment: bool,
     },
     Directory {
         worktree_id: WorktreeId,
@@ -271,48 +277,81 @@ impl BreadcrumbsRow {
         let Some(renderers) = BREADCRUMB_PICKER_RENDERERS.get() else {
             return label;
         };
-        let element = match (segment.target.clone(), self.editor.clone()) {
-            (Some(BreadcrumbSegmentTarget::Symbol { buffer_id, item }), Some(editor)) => {
-                (renderers.symbol)(editor, buffer_id, item, label, index)
-            }
-            (
-                Some(BreadcrumbSegmentTarget::Directory {
-                    worktree_id,
-                    path,
-                    active_path,
-                    is_active_segment,
-                }),
-                Some(editor),
-            ) => {
-                let Some(upgraded_editor) = editor.upgrade() else {
-                    return label;
-                };
-                let Some(workspace) = upgraded_editor
-                    .read(cx)
-                    .workspace()
-                    .map(|workspace| workspace.downgrade())
-                else {
-                    return label;
-                };
-                let Some(shared_popover_handle) =
-                    upgraded_editor.read(cx).breadcrumb_popover_handle()
-                else {
-                    return label;
-                };
-                (renderers.directory)(
-                    editor,
-                    workspace,
-                    worktree_id,
-                    path,
-                    active_path,
-                    is_active_segment,
-                    shared_popover_handle,
-                    label,
-                    index,
-                )
-            }
-            _ => return label,
-        };
+        let element =
+            match (segment.target.clone(), self.editor.clone()) {
+                (
+                    Some(BreadcrumbSegmentTarget::Symbol {
+                        buffer_id,
+                        item,
+                        is_active_segment,
+                    }),
+                    Some(editor),
+                ) => {
+                    let parent_dir = self.segments[..index].iter().rev().find_map(|segment| {
+                        match &segment.target {
+                            Some(BreadcrumbSegmentTarget::Directory {
+                                worktree_id, path, ..
+                            }) => Some((*worktree_id, path.clone())),
+                            _ => None,
+                        }
+                    });
+                    let Some(upgraded_editor) = editor.upgrade() else {
+                        return label;
+                    };
+                    let Some(shared_popover_handle) =
+                        upgraded_editor.read(cx).breadcrumb_symbol_popover_handle()
+                    else {
+                        return label;
+                    };
+                    (renderers.symbol)(
+                        editor,
+                        buffer_id,
+                        item,
+                        parent_dir,
+                        is_active_segment,
+                        shared_popover_handle,
+                        label,
+                        index,
+                    )
+                }
+                (
+                    Some(BreadcrumbSegmentTarget::Directory {
+                        worktree_id,
+                        path,
+                        active_path,
+                        is_active_segment,
+                    }),
+                    Some(editor),
+                ) => {
+                    let Some(upgraded_editor) = editor.upgrade() else {
+                        return label;
+                    };
+                    let Some(workspace) = upgraded_editor
+                        .read(cx)
+                        .workspace()
+                        .map(|workspace| workspace.downgrade())
+                    else {
+                        return label;
+                    };
+                    let Some(shared_popover_handle) =
+                        upgraded_editor.read(cx).breadcrumb_popover_handle()
+                    else {
+                        return label;
+                    };
+                    (renderers.directory)(
+                        editor,
+                        workspace,
+                        worktree_id,
+                        path,
+                        active_path,
+                        is_active_segment,
+                        shared_popover_handle,
+                        label,
+                        index,
+                    )
+                }
+                _ => return label,
+            };
         self.wrap_segment(element)
     }
 
@@ -455,7 +494,7 @@ impl gpui::Element for BreadcrumbsRow {
         }
 
         if let Some(editor) = self.editor.as_ref().and_then(WeakEntity::upgrade)
-            && editor.read(cx).breadcrumb_pending_reanchor()
+            && editor.read(cx).breadcrumb_pending_reanchor().is_some()
         {
             editor.update(cx, |editor, cx| {
                 editor.reanchor_breadcrumb_popover(window, cx);
@@ -546,6 +585,11 @@ pub fn render_breadcrumb_text(
                 .as_ref()
                 .map(|navigation| navigation.active_path.clone());
 
+            let symbol_navigation = editor_ref.breadcrumb_symbol_navigation().cloned();
+            let file_segment_active = symbol_navigation.as_ref().is_some_and(|navigation| {
+                navigation.buffer_id == buffer_id && navigation.active_item.is_none()
+            });
+
             let is_navigable = breadcrumb_path_is_navigable(
                 real_project_path.is_some(),
                 real_project_path.as_ref().and_then(|project_path| {
@@ -580,6 +624,7 @@ pub fn render_breadcrumb_text(
                                 real_project_path.as_ref().map(|path| path.path.clone()),
                                 None,
                                 active_segment.as_deref(),
+                                false,
                             )
                         })
                 } else if let Some(project_path) = real_project_path.as_ref()
@@ -594,6 +639,7 @@ pub fn render_breadcrumb_text(
                         Some(project_path.path.clone()),
                         Some(buffer_id),
                         active_segment.as_deref(),
+                        file_segment_active,
                     ))
                 } else {
                     None
@@ -613,24 +659,59 @@ pub fn render_breadcrumb_text(
                 symbol_segments.push(Some(BreadcrumbSegmentTarget::Symbol {
                     buffer_id,
                     item: None,
+                    is_active_segment: file_segment_active,
                 }));
             } else if !path_split {
                 symbol_segments.push(None);
             }
 
+            // Directory navigation replaces the whole bar; symbol segments don't apply.
             if !navigated {
-                let ancestors = editor_ref
-                    .outline_symbols_at_cursor
-                    .as_ref()
-                    .filter(|(id, _)| *id == buffer_id)
-                    .map(|(_, ancestors)| ancestors.as_slice())
-                    .unwrap_or_default();
-                symbol_segments.extend(ancestors.iter().cloned().map(|item| {
-                    Some(BreadcrumbSegmentTarget::Symbol {
-                        buffer_id,
-                        item: Some(item),
-                    })
-                }));
+                let symbol_navigated = symbol_navigation.as_ref().is_some_and(|navigation| {
+                    navigation.buffer_id == buffer_id && navigation.navigated
+                });
+
+                if symbol_navigated {
+                    let trail = symbol_navigation
+                        .as_ref()
+                        .and_then(|navigation| navigation.active_item.as_ref())
+                        .map(|item| editor_ref.breadcrumb_symbol_trail(buffer_id, item, cx))
+                        .unwrap_or_default();
+                    // The incoming labels carry the cursor's symbol trail; navigation replaces it.
+                    segments.truncate(file_segment_index + 1);
+                    segments.extend(trail.iter().map(|item| HighlightedText {
+                        text: item.text.clone(),
+                        highlights: item.highlight_ranges.clone(),
+                    }));
+                    let last_index = trail.len().saturating_sub(1);
+                    symbol_segments.extend(trail.into_iter().enumerate().map(|(index, item)| {
+                        Some(BreadcrumbSegmentTarget::Symbol {
+                            buffer_id,
+                            item: Some(item),
+                            is_active_segment: index == last_index,
+                        })
+                    }));
+                } else {
+                    let ancestors = editor_ref
+                        .outline_symbols_at_cursor
+                        .as_ref()
+                        .filter(|(id, _)| *id == buffer_id)
+                        .map(|(_, ancestors)| ancestors.as_slice())
+                        .unwrap_or_default();
+                    let active_range = symbol_navigation
+                        .as_ref()
+                        .filter(|navigation| navigation.buffer_id == buffer_id)
+                        .and_then(|navigation| navigation.active_item.as_ref())
+                        .map(|item| item.range.clone());
+                    symbol_segments.extend(ancestors.iter().cloned().map(|item| {
+                        let is_active_segment = active_range.as_ref() == Some(&item.range);
+                        Some(BreadcrumbSegmentTarget::Symbol {
+                            buffer_id,
+                            item: Some(item),
+                            is_active_segment,
+                        })
+                    }));
+                }
             }
         }
     }

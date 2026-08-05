@@ -152,20 +152,16 @@ impl Editor {
         });
     }
 
-    /// `target`'s children, or its siblings when it has none; `target: None` lists top-level symbols.
-    pub fn breadcrumb_symbol_menu_items(
+    /// Converted outline items and their depths, resolved against the current multi-buffer snapshot.
+    fn breadcrumb_converted_outline(
         &self,
         buffer_id: BufferId,
-        target: Option<&OutlineItem<Anchor>>,
         cx: &App,
-    ) -> Vec<OutlineItem<Anchor>> {
-        let Some(outline) = self
+    ) -> Option<(Vec<OutlineItem<Anchor>>, Vec<usize>)> {
+        let outline = self
             .breadcrumb_outline
             .as_ref()
-            .filter(|outline| outline.buffer_id == buffer_id)
-        else {
-            return Vec::new();
-        };
+            .filter(|outline| outline.buffer_id == buffer_id)?;
 
         let multi_buffer_snapshot = self.buffer().read(cx).snapshot(cx);
         let items = outline
@@ -174,6 +170,19 @@ impl Editor {
             .filter_map(|item| text_outline_item_to_multibuffer(item, &multi_buffer_snapshot))
             .collect::<Vec<_>>();
         let depths = items.iter().map(|item| item.depth).collect::<Vec<_>>();
+        Some((items, depths))
+    }
+
+    /// `target`'s children, or its siblings when it has none; `target: None` lists top-level symbols.
+    pub fn breadcrumb_symbol_menu_items(
+        &self,
+        buffer_id: BufferId,
+        target: Option<&OutlineItem<Anchor>>,
+        cx: &App,
+    ) -> Vec<OutlineItem<Anchor>> {
+        let Some((items, depths)) = self.breadcrumb_converted_outline(buffer_id, cx) else {
+            return Vec::new();
+        };
 
         let indices = if let Some(target) = target {
             let Some(target_index) = items.iter().position(|item| item.range == target.range)
@@ -195,6 +204,57 @@ impl Editor {
             .into_iter()
             .filter_map(|index| items.get(index).cloned())
             .collect()
+    }
+
+    /// The outline parent of `item`, or `None` when `item` is top-level.
+    pub fn breadcrumb_symbol_parent(
+        &self,
+        buffer_id: BufferId,
+        item: &OutlineItem<Anchor>,
+        cx: &App,
+    ) -> Option<OutlineItem<Anchor>> {
+        let (items, depths) = self.breadcrumb_converted_outline(buffer_id, cx)?;
+        let index = items
+            .iter()
+            .position(|candidate| candidate.range == item.range)?;
+        let parent_index = crate::element::outline_parents(&depths)
+            .get(index)
+            .copied()
+            .flatten()?;
+        items.get(parent_index).cloned()
+    }
+
+    /// The ancestor chain of `item`, root first, ending with `item` itself.
+    pub fn breadcrumb_symbol_trail(
+        &self,
+        buffer_id: BufferId,
+        item: &OutlineItem<Anchor>,
+        cx: &App,
+    ) -> Vec<OutlineItem<Anchor>> {
+        let Some((items, depths)) = self.breadcrumb_converted_outline(buffer_id, cx) else {
+            return Vec::new();
+        };
+        let Some(mut current) = items
+            .iter()
+            .position(|candidate| candidate.range == item.range)
+        else {
+            return Vec::new();
+        };
+
+        let parents = crate::element::outline_parents(&depths);
+        let mut trail = Vec::new();
+        loop {
+            let Some(current_item) = items.get(current) else {
+                break;
+            };
+            trail.push(current_item.clone());
+            match parents.get(current).copied().flatten() {
+                Some(parent_index) => current = parent_index,
+                None => break,
+            }
+        }
+        trail.reverse();
+        trail
     }
 
     pub fn navigate_to_outline_item(
@@ -895,6 +955,86 @@ mod tests {
                     .map(|item| item.text.as_str())
                     .collect::<Vec<_>>(),
                 vec!["fn main"]
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_breadcrumb_symbol_parent_top_level_has_no_parent(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+
+        let mut cx = EditorLspTestContext::new_rust(lsp::ServerCapabilities::default(), cx).await;
+        cx.set_state("fn maˇin() {}\n");
+        cx.run_until_parked();
+
+        let buffer_id = cx.update_editor(|editor, _window, cx| {
+            let buffer_id = editor
+                .buffer()
+                .read(cx)
+                .as_singleton()
+                .unwrap()
+                .read(cx)
+                .remote_id();
+            editor.prefetch_breadcrumb_outline(buffer_id, cx);
+            buffer_id
+        });
+        cx.run_until_parked();
+
+        cx.update_editor(|editor, _window, cx| {
+            let top_level = editor.breadcrumb_symbol_menu_items(buffer_id, None, cx);
+            let main_item = top_level.first().expect("fn main should be top-level");
+            assert!(
+                editor
+                    .breadcrumb_symbol_parent(buffer_id, main_item, cx)
+                    .is_none(),
+                "a top-level item has no outline parent"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_breadcrumb_symbol_parent_and_trail_for_a_nested_item(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+
+        let mut cx = EditorLspTestContext::new_rust(lsp::ServerCapabilities::default(), cx).await;
+        cx.set_state("struct Foo {}\n\nimpl Foo {\n    fn baˇr() {}\n}\n");
+        cx.run_until_parked();
+
+        let buffer_id = cx.update_editor(|editor, _window, cx| {
+            let buffer_id = editor
+                .buffer()
+                .read(cx)
+                .as_singleton()
+                .unwrap()
+                .read(cx)
+                .remote_id();
+            editor.prefetch_breadcrumb_outline(buffer_id, cx);
+            buffer_id
+        });
+        cx.run_until_parked();
+
+        cx.update_editor(|editor, _window, cx| {
+            let top_level = editor.breadcrumb_symbol_menu_items(buffer_id, None, cx);
+            let impl_item = top_level
+                .iter()
+                .find(|item| item.text.contains("impl"))
+                .expect("the impl block is top-level");
+            let children = editor.breadcrumb_symbol_menu_items(buffer_id, Some(impl_item), cx);
+            let method_item = children.first().expect("the impl block has a method child");
+
+            let parent = editor
+                .breadcrumb_symbol_parent(buffer_id, method_item, cx)
+                .expect("a nested item's parent resolves to its enclosing block");
+            assert_eq!(parent.range, impl_item.range);
+
+            let trail = editor.breadcrumb_symbol_trail(buffer_id, method_item, cx);
+            assert_eq!(
+                trail
+                    .iter()
+                    .map(|item| item.range.clone())
+                    .collect::<Vec<_>>(),
+                vec![impl_item.range.clone(), method_item.range.clone()],
+                "the trail runs root to item inclusive"
             );
         });
     }
