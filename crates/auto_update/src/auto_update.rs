@@ -45,6 +45,10 @@ impl std::fmt::Display for MissingDependencyError {
 
 impl std::error::Error for MissingDependencyError {}
 const POLL_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+/// Dev-channel builds of this fork are provisioned from this repository's
+/// GitHub Releases instead of zed.dev, which rejects the dev channel.
+const FORK_REPO: &str = "interkelstar/zed";
 const NIGHTLY_POLL_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const REMOTE_SERVER_CACHE_LIMIT: usize = 5;
 
@@ -352,7 +356,7 @@ pub fn release_notes_url(cx: &mut App) -> Option<String> {
         ReleaseChannel::Nightly => {
             "https://github.com/zed-industries/zed/commits/nightly/".to_string()
         }
-        ReleaseChannel::Dev => "https://github.com/zed-industries/zed/commits/main/".to_string(),
+        ReleaseChannel::Dev => format!("https://github.com/{FORK_REPO}/releases"),
     };
     Some(url)
 }
@@ -632,7 +636,6 @@ impl AutoUpdater {
         set_status: impl Fn(&str, &mut AsyncApp) + Send + 'static,
         cx: &mut AsyncApp,
     ) -> Result<PathBuf> {
-        const FORK_REPO: &str = "interkelstar/zed";
         let this = cx.update(|cx| {
             cx.default_global::<GlobalAutoUpdate>()
                 .0
@@ -709,6 +712,90 @@ impl AutoUpdater {
                 .await?;
 
         Ok(Some(release.url))
+    }
+
+    /// Resolves the app asset of the fork's latest GitHub release. The returned
+    /// `version` is the release tag, not a semver.
+    async fn get_fork_app_release_asset(
+        this: &Entity<Self>,
+        cx: &mut AsyncApp,
+    ) -> Result<ReleaseAsset> {
+        #[derive(Deserialize)]
+        struct GithubRelease {
+            tag_name: String,
+            assets: Vec<GithubReleaseAsset>,
+        }
+        #[derive(Deserialize)]
+        struct GithubReleaseAsset {
+            name: String,
+            browser_download_url: String,
+        }
+
+        let asset_name = match (OS, ARCH) {
+            ("linux", arch) => format!("zed-linux-{arch}.tar.gz"),
+            ("windows", arch) => format!("zed-windows-{arch}-setup.exe"),
+            (os, arch) => anyhow::bail!("fork releases carry no build for {os}-{arch}"),
+        };
+
+        let http_client = this.read_with(cx, |this, _| this.client.http_client());
+        let url = format!("https://api.github.com/repos/{FORK_REPO}/releases/latest");
+        let mut response = http_client.get(&url, Default::default(), true).await?;
+        let mut body = Vec::new();
+        response.body_mut().read_to_end(&mut body).await?;
+        anyhow::ensure!(
+            response.status().is_success(),
+            "failed to fetch fork release: {:?}",
+            String::from_utf8_lossy(&body),
+        );
+        let release: GithubRelease = serde_json::from_slice(&body).with_context(|| {
+            format!(
+                "error deserializing fork release {:?}",
+                String::from_utf8_lossy(&body),
+            )
+        })?;
+
+        let asset = release
+            .assets
+            .iter()
+            .find(|asset| asset.name == asset_name)
+            .with_context(|| {
+                format!(
+                    "fork release {} has no asset named {asset_name}",
+                    release.tag_name
+                )
+            })?;
+
+        Ok(ReleaseAsset {
+            version: release.tag_name.clone(),
+            url: asset.browser_download_url.clone(),
+        })
+    }
+
+    /// A fork release is "newer" when its tag differs from the tag this binary
+    /// was built from. Local builds carry no tag and never self-update.
+    fn check_if_fork_release_is_newer(
+        fetched_tag: &str,
+        installed_version: &Version,
+        status: &AutoUpdateStatus,
+    ) -> Result<Option<Version>> {
+        let Some(current_tag) = option_env!("ZED_FORK_RELEASE_TAG") else {
+            return Ok(None);
+        };
+        if fetched_tag == current_tag {
+            return Ok(None);
+        }
+        if let AutoUpdateStatus::Updated { version } = status
+            && version.build.as_str() == fetched_tag
+        {
+            return Ok(None);
+        }
+        // Statuses carry a semver, so surface the tag through build metadata:
+        // "1.15.0+improvements-2026-08-05".
+        let mut version = installed_version.clone();
+        version.pre = semver::Prerelease::EMPTY;
+        version.build = semver::BuildMetadata::new(fetched_tag)
+            .with_context(|| format!("release tag {fetched_tag} is not valid build metadata"))?;
+        Ok(Some(version))
     }
 
     async fn get_release_asset(
@@ -793,17 +880,29 @@ impl AutoUpdater {
             cx.notify();
         });
 
-        let fetched_release_data =
-            Self::get_release_asset(&this, release_channel, None, "zed", OS, ARCH, cx).await?;
-        let fetched_version = fetched_release_data.clone().version;
-        let app_commit_sha = Ok(cx.update(|cx| AppCommitSha::try_global(cx).map(|sha| sha.full())));
-        let newer_version = Self::check_if_fetched_version_is_newer(
-            release_channel,
-            app_commit_sha,
-            installed_version,
-            fetched_version,
-            previous_status.clone(),
-        )?;
+        let (fetched_release_data, newer_version) = if release_channel == ReleaseChannel::Dev {
+            let release = Self::get_fork_app_release_asset(&this, cx).await?;
+            let newer = Self::check_if_fork_release_is_newer(
+                &release.version,
+                &installed_version,
+                &previous_status,
+            )?;
+            (release, newer)
+        } else {
+            let release =
+                Self::get_release_asset(&this, release_channel, None, "zed", OS, ARCH, cx).await?;
+            let fetched_version = release.version.clone();
+            let app_commit_sha =
+                Ok(cx.update(|cx| AppCommitSha::try_global(cx).map(|sha| sha.full())));
+            let newer = Self::check_if_fetched_version_is_newer(
+                release_channel,
+                app_commit_sha,
+                installed_version,
+                fetched_version,
+                previous_status.clone(),
+            )?;
+            (release, newer)
+        };
 
         let Some(newer_version) = newer_version else {
             this.update(cx, |this, cx| {
