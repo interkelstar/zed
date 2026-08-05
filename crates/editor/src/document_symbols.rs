@@ -20,8 +20,7 @@ use crate::display_map::DisplaySnapshot;
 use crate::scroll::Autoscroll;
 use crate::{Editor, LSP_REQUEST_DEBOUNCE_TIMEOUT, SelectionEffects};
 
-/// The outline behind the breadcrumb symbol dropdowns, kept with the buffer version it came from
-/// so a prefetch can tell an up-to-date cache from one worth refreshing.
+/// The outline behind the breadcrumb symbol dropdowns, tagged with the buffer version it came from.
 pub(crate) struct BreadcrumbOutline {
     buffer_id: BufferId,
     version: clock::Global,
@@ -60,9 +59,7 @@ impl Editor {
             let buffer_snapshot = buffer.read(cx).snapshot();
             let syntax = cx.theme().syntax().clone();
             cx.background_executor().spawn(async move {
-                // Not `snapshot.outline(..)`: that wraps the items in an `Outline`, which builds a
-                // fuzzy-match candidate string per item for the outline picker's search. Every
-                // caller here drops those immediately.
+                // Not `snapshot.outline(..)`: it builds a fuzzy-match string per item that every caller here drops.
                 buffer_snapshot.outline_items_containing(
                     0..buffer_snapshot.len(),
                     true,
@@ -123,9 +120,6 @@ impl Editor {
         Some((buffer.remote_id(), symbols))
     }
 
-    /// Starts fetching the outline backing the breadcrumb dropdowns, unless the cached one was
-    /// already computed from this exact buffer version. Called when the pointer reaches the
-    /// breadcrumb bar, so opening a dropdown reads a cache instead of walking the whole file.
     pub(crate) fn prefetch_breadcrumb_outline(
         &mut self,
         buffer_id: BufferId,
@@ -158,11 +152,7 @@ impl Editor {
         });
     }
 
-    /// A segment's dropdown rows in document order: `target`'s children, or its siblings when it
-    /// has none, so the deepest segment isn't a dead end. `target: None` lists top-level symbols.
-    ///
-    /// Reads what [`Self::prefetch_breadcrumb_outline`] fetched. A stale outline is used as is,
-    /// since the items are anchors; an absent one yields nothing.
+    /// `target`'s children, or its siblings when it has none; `target: None` lists top-level symbols.
     pub fn breadcrumb_symbol_menu_items(
         &self,
         buffer_id: BufferId,
@@ -207,8 +197,6 @@ impl Editor {
             .collect()
     }
 
-    /// Moves the cursor to `item` and scrolls it into view, the way confirming an entry in the
-    /// outline picker does.
     pub fn navigate_to_outline_item(
         &mut self,
         item: &OutlineItem<Anchor>,
@@ -333,8 +321,7 @@ fn lsp_symbols_enabled(buffer: &Buffer, cx: &App) -> bool {
         .lsp_enabled()
 }
 
-/// Lifts a buffer-local outline item's anchors into the multibuffer's anchor space, dropping
-/// the item if any of its anchors don't resolve (e.g. the buffer has no excerpts anymore).
+// Drops the item if any anchor fails to resolve, e.g. the buffer has no excerpts anymore.
 fn text_outline_item_to_multibuffer(
     item: &OutlineItem<text::Anchor>,
     multi_buffer_snapshot: &MultiBufferSnapshot,
@@ -738,7 +725,7 @@ mod tests {
         let first_count = request_count.load(atomic::Ordering::Acquire);
         assert_eq!(first_count, 1, "Should have made exactly one request");
 
-        // Move cursor within the same buffer version — should use cache
+        // Move cursor within the same buffer version: should use cache
         cx.update_editor(|editor, window, cx| {
             editor.move_down(&MoveDown, window, cx);
         });
@@ -798,8 +785,6 @@ mod tests {
         });
     }
 
-    /// A generated file with hundreds of flat top-level symbols lists all of them: the dropdown
-    /// filters by the query typed into it rather than cutting the listing short.
     #[gpui::test]
     async fn test_breadcrumb_symbol_menu_items_lists_every_top_level_symbol(
         cx: &mut TestAppContext,
@@ -869,8 +854,6 @@ mod tests {
         });
     }
 
-    /// Opening a segment's dropdown must not walk the file's syntax tree itself: the entries come
-    /// from the outline prefetched when the pointer reaches the bar, and are empty until it lands.
     #[gpui::test]
     async fn test_breadcrumb_symbol_menu_items_come_from_the_prefetched_outline(
         cx: &mut TestAppContext,
@@ -1098,7 +1081,7 @@ mod tests {
         init_test(cx, |_| {});
 
         let request_count = Arc::new(atomic::AtomicUsize::new(0));
-        // Do NOT enable document_symbols — defaults to Off
+        // Do NOT enable document_symbols, defaults to Off
         let mut cx = EditorLspTestContext::new_rust(
             lsp::ServerCapabilities {
                 document_symbol_provider: Some(lsp::OneOf::Left(true)),

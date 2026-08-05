@@ -1478,8 +1478,7 @@ impl<D: PickerDelegate> Picker<D> {
             )
             .with_sizing_behavior(sizing_behavior)
             .flex_grow_1()
-            // Whole pixels: fractional padding on the scroll container loses a pixel to
-            // layout snapping, leaving a list that fits its rows scrollable by that pixel.
+            // Rounded, as fractional padding makes a list that fits its rows scrollable by 1px.
             .py((window.rem_size() * 0.25).round())
             .track_scroll(&scroll_handle)
             .into_any_element(),

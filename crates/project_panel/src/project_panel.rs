@@ -6683,10 +6683,30 @@ impl ProjectPanel {
 
         self.expand_entry(worktree_id, entry_id, cx);
         self.update_visible_entries(Some((worktree_id, entry_id)), false, true, window, cx);
+        // A folded chain renders as one row keyed by its deepest entry: revealing an
+        // interior component must mark that row and make the component active, or the
+        // selection lands on an id no visible row carries.
+        let mut revealed_entry_id = entry_id;
+        for (&row_entry_id, folded) in self.state.ancestors.iter_mut() {
+            if let Some(depth) = folded.ancestors.iter().position(|&id| id == entry_id) {
+                if row_entry_id != entry_id {
+                    folded.current_ancestor_depth = depth;
+                    revealed_entry_id = row_entry_id;
+                }
+                break;
+            }
+        }
+        if revealed_entry_id != entry_id {
+            self.selection = Some(SelectedEntry {
+                worktree_id,
+                entry_id: revealed_entry_id,
+            });
+            self.autoscroll(cx);
+        }
         self.marked_entries.clear();
         self.marked_entries.push(SelectedEntry {
             worktree_id,
-            entry_id,
+            entry_id: revealed_entry_id,
         });
         cx.notify();
         Ok(())
