@@ -9,21 +9,27 @@ use gpui::{
 };
 use language::OutlineItem;
 use picker::{Picker, PickerDelegate, PickerEditorPosition};
+use project::WorktreeId;
 use text::BufferId;
 use ui::{
     ButtonLike, ButtonStyle, Color, Icon, IconName, IconSize, ListItem, ListItemSpacing,
     PopoverMenu, prelude::*,
 };
+use util::rel_path::RelPath;
 use workspace::ItemHandle;
 
 use crate::MAX_BREADCRUMB_MENU_ENTRIES;
 
 pub struct BreadcrumbSymbolDelegate {
     editor: WeakEntity<Editor>,
+    buffer_id: BufferId,
     items: Vec<OutlineItem<Anchor>>,
     matches: Vec<StringMatch>,
     selected_index: usize,
     current_range: Option<Range<Anchor>>,
+    /// Levels drilled through with the right arrow, restored by the left arrow.
+    level_stack: Vec<(Vec<OutlineItem<Anchor>>, usize)>,
+    parent_dir: Option<(WorktreeId, Arc<RelPath>)>,
 }
 
 pub type BreadcrumbSymbolPicker = Picker<BreadcrumbSymbolDelegate>;
@@ -31,8 +37,10 @@ pub type BreadcrumbSymbolPicker = Picker<BreadcrumbSymbolDelegate>;
 impl BreadcrumbSymbolDelegate {
     fn picker(
         editor: WeakEntity<Editor>,
+        buffer_id: BufferId,
         items: Vec<OutlineItem<Anchor>>,
         current_range: Option<Range<Anchor>>,
+        parent_dir: Option<(WorktreeId, Arc<RelPath>)>,
         window: &mut Window,
         cx: &mut App,
     ) -> Entity<BreadcrumbSymbolPicker> {
@@ -43,10 +51,13 @@ impl BreadcrumbSymbolDelegate {
                 .unwrap_or(0);
             let delegate = Self {
                 editor,
+                buffer_id,
                 items,
                 matches: Vec::new(),
                 selected_index,
                 current_range,
+                level_stack: Vec::new(),
+                parent_dir,
             };
             Picker::uniform_list(delegate, window, cx)
                 .popover()
@@ -63,6 +74,30 @@ impl BreadcrumbSymbolDelegate {
 
     fn item_at(&self, index: usize) -> Option<&OutlineItem<Anchor>> {
         self.items.get(self.matches.get(index)?.candidate_id)
+    }
+
+    /// Rebuilds `matches` after `items` changed in place; `set_query("")` alone won't
+    /// refresh them when the query is already empty.
+    fn rebuild_matches_for_level(&mut self, preferred_index: Option<usize>) {
+        self.matches = self
+            .items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| StringMatch {
+                candidate_id: index,
+                string: flatten_text_for_single_line_display(&item.text),
+                positions: Vec::new(),
+                score: 0.,
+            })
+            .collect();
+        self.selected_index = preferred_index
+            .filter(|&index| index < self.matches.len())
+            .or_else(|| {
+                self.current_range
+                    .as_ref()
+                    .and_then(|range| self.items.iter().position(|item| &item.range == range))
+            })
+            .unwrap_or(0);
     }
 }
 
@@ -174,6 +209,48 @@ impl PickerDelegate for BreadcrumbSymbolDelegate {
 
     fn dismissed(&mut self, _window: &mut Window, _cx: &mut Context<BreadcrumbSymbolPicker>) {}
 
+    fn select_child(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<BreadcrumbSymbolPicker>,
+    ) -> Option<String> {
+        let selected = self.item_at(self.selected_index)?.clone();
+        let editor = self.editor.upgrade()?;
+        let children =
+            editor
+                .read(cx)
+                .breadcrumb_symbol_menu_items(self.buffer_id, Some(&selected), cx);
+        // The sibling fallback lists the item itself: a leaf, nothing to drill into.
+        if children.is_empty() || children.iter().any(|item| item.range == selected.range) {
+            return None;
+        }
+        let parent_items = std::mem::replace(&mut self.items, children);
+        self.level_stack.push((parent_items, self.selected_index));
+        self.rebuild_matches_for_level(Some(0));
+        cx.notify();
+        Some(String::new())
+    }
+
+    fn select_parent(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<BreadcrumbSymbolPicker>,
+    ) -> Option<String> {
+        if let Some((items, index)) = self.level_stack.pop() {
+            self.items = items;
+            self.rebuild_matches_for_level(Some(index));
+            cx.notify();
+            return Some(String::new());
+        }
+        let (worktree_id, parent_path) = self.parent_dir.clone()?;
+        let editor = self.editor.upgrade()?;
+        editor.update(cx, |editor, cx| {
+            editor.navigate_breadcrumb_to(worktree_id, parent_path, window, cx);
+        });
+        cx.emit(DismissEvent);
+        Some(String::new())
+    }
+
     /// Uses the symbol's own highlighting; fuzzy match positions are dropped to avoid a clash.
     fn render_match(
         &self,
@@ -222,6 +299,7 @@ pub(crate) fn render_breadcrumb_symbol_segment(
     editor: WeakEntity<Editor>,
     buffer_id: BufferId,
     target: Option<OutlineItem<Anchor>>,
+    parent_dir: Option<(WorktreeId, Arc<RelPath>)>,
     label: gpui::AnyElement,
     index: usize,
 ) -> gpui::AnyElement {
@@ -253,8 +331,10 @@ pub(crate) fn render_breadcrumb_symbol_segment(
         }
         Some(BreadcrumbSymbolDelegate::picker(
             editor.clone(),
+            buffer_id,
             menu_items,
             target.as_ref().map(|item| item.range.clone()),
+            parent_dir.clone(),
             window,
             cx,
         ))
@@ -327,8 +407,10 @@ mod tests {
             .update(cx, |_, window, cx| {
                 BreadcrumbSymbolDelegate::picker(
                     editor.downgrade(),
+                    BufferId::new(1).unwrap(),
                     items,
                     Some(current_range),
+                    None,
                     window,
                     cx,
                 )
@@ -374,7 +456,15 @@ mod tests {
 
         let picker = editor_window
             .update(cx, |_, window, cx| {
-                BreadcrumbSymbolDelegate::picker(editor.downgrade(), items, None, window, cx)
+                BreadcrumbSymbolDelegate::picker(
+                    editor.downgrade(),
+                    BufferId::new(1).unwrap(),
+                    items,
+                    None,
+                    None,
+                    window,
+                    cx,
+                )
             })
             .unwrap();
 
@@ -419,7 +509,15 @@ mod tests {
 
         let picker = editor_window
             .update(cx, |_, window, cx| {
-                BreadcrumbSymbolDelegate::picker(editor.downgrade(), items, None, window, cx)
+                BreadcrumbSymbolDelegate::picker(
+                    editor.downgrade(),
+                    BufferId::new(1).unwrap(),
+                    items,
+                    None,
+                    None,
+                    window,
+                    cx,
+                )
             })
             .unwrap();
 
@@ -475,8 +573,15 @@ mod tests {
                 test_item(&snapshot, 1, "beta"),
                 test_item(&snapshot, 2, "gamma"),
             ];
-            let picker =
-                BreadcrumbSymbolDelegate::picker(editor.downgrade(), items, None, window, cx);
+            let picker = BreadcrumbSymbolDelegate::picker(
+                editor.downgrade(),
+                BufferId::new(1).unwrap(),
+                items,
+                None,
+                None,
+                window,
+                cx,
+            );
             Harness { picker, editor }
         });
         let (picker, editor) = harness_window

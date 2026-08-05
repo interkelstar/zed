@@ -44,6 +44,7 @@ pub struct BreadcrumbPickerRenderers {
         WeakEntity<Editor>,
         BufferId,
         Option<OutlineItem<Anchor>>,
+        Option<(WorktreeId, Arc<RelPath>)>,
         gpui::AnyElement,
         usize,
     ) -> gpui::AnyElement,
@@ -271,48 +272,57 @@ impl BreadcrumbsRow {
         let Some(renderers) = BREADCRUMB_PICKER_RENDERERS.get() else {
             return label;
         };
-        let element = match (segment.target.clone(), self.editor.clone()) {
-            (Some(BreadcrumbSegmentTarget::Symbol { buffer_id, item }), Some(editor)) => {
-                (renderers.symbol)(editor, buffer_id, item, label, index)
-            }
-            (
-                Some(BreadcrumbSegmentTarget::Directory {
-                    worktree_id,
-                    path,
-                    active_path,
-                    is_active_segment,
-                }),
-                Some(editor),
-            ) => {
-                let Some(upgraded_editor) = editor.upgrade() else {
-                    return label;
-                };
-                let Some(workspace) = upgraded_editor
-                    .read(cx)
-                    .workspace()
-                    .map(|workspace| workspace.downgrade())
-                else {
-                    return label;
-                };
-                let Some(shared_popover_handle) =
-                    upgraded_editor.read(cx).breadcrumb_popover_handle()
-                else {
-                    return label;
-                };
-                (renderers.directory)(
-                    editor,
-                    workspace,
-                    worktree_id,
-                    path,
-                    active_path,
-                    is_active_segment,
-                    shared_popover_handle,
-                    label,
-                    index,
-                )
-            }
-            _ => return label,
-        };
+        let element =
+            match (segment.target.clone(), self.editor.clone()) {
+                (Some(BreadcrumbSegmentTarget::Symbol { buffer_id, item }), Some(editor)) => {
+                    let parent_dir = self.segments[..index].iter().rev().find_map(|segment| {
+                        match &segment.target {
+                            Some(BreadcrumbSegmentTarget::Directory {
+                                worktree_id, path, ..
+                            }) => Some((*worktree_id, path.clone())),
+                            _ => None,
+                        }
+                    });
+                    (renderers.symbol)(editor, buffer_id, item, parent_dir, label, index)
+                }
+                (
+                    Some(BreadcrumbSegmentTarget::Directory {
+                        worktree_id,
+                        path,
+                        active_path,
+                        is_active_segment,
+                    }),
+                    Some(editor),
+                ) => {
+                    let Some(upgraded_editor) = editor.upgrade() else {
+                        return label;
+                    };
+                    let Some(workspace) = upgraded_editor
+                        .read(cx)
+                        .workspace()
+                        .map(|workspace| workspace.downgrade())
+                    else {
+                        return label;
+                    };
+                    let Some(shared_popover_handle) =
+                        upgraded_editor.read(cx).breadcrumb_popover_handle()
+                    else {
+                        return label;
+                    };
+                    (renderers.directory)(
+                        editor,
+                        workspace,
+                        worktree_id,
+                        path,
+                        active_path,
+                        is_active_segment,
+                        shared_popover_handle,
+                        label,
+                        index,
+                    )
+                }
+                _ => return label,
+            };
         self.wrap_segment(element)
     }
 
