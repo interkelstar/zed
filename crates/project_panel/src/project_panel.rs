@@ -147,6 +147,9 @@ pub struct ProjectPanel {
     folded_directory_drag_target: Option<FoldedDirectoryDragTarget>,
     drag_target_entry: Option<DragTarget>,
     marked_entries: Vec<SelectedEntry>,
+    /// A reveal target inside a folded chain: fold state is derived in a background
+    /// task, so the chain to mark may not exist until that task lands.
+    pending_folded_reveal: Option<SelectedEntry>,
     selection: Option<SelectedEntry>,
     context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
     filename_editor: Entity<Editor>,
@@ -838,6 +841,7 @@ impl ProjectPanel {
                 folded_directory_drag_target: None,
                 drag_target_entry: None,
                 marked_entries: Default::default(),
+                pending_folded_reveal: None,
                 selection: None,
                 context_menu: None,
                 filename_editor,
@@ -4515,6 +4519,42 @@ impl ProjectPanel {
                         entry_id,
                     });
                 }
+                if let Some(pending) = this.pending_folded_reveal.take() {
+                    let mut revealed_row = None;
+                    for (&row_entry_id, folded) in this.state.ancestors.iter_mut() {
+                        if let Some(depth) = folded
+                            .ancestors
+                            .iter()
+                            .position(|&id| id == pending.entry_id)
+                        {
+                            folded.current_ancestor_depth = depth;
+                            revealed_row = Some(row_entry_id);
+                            break;
+                        }
+                    }
+                    match revealed_row {
+                        Some(row_entry_id) => {
+                            let selected = SelectedEntry {
+                                worktree_id: pending.worktree_id,
+                                entry_id: row_entry_id,
+                            };
+                            this.selection = Some(selected);
+                            this.marked_entries.clear();
+                            this.marked_entries.push(selected);
+                            this.autoscroll(cx);
+                        }
+                        // No chain contains the entry yet, e.g. its directory is still
+                        // being scanned: keep waiting unless it surfaced as a plain row.
+                        None => {
+                            if this
+                                .index_for_entry(pending.entry_id, pending.worktree_id)
+                                .is_none()
+                            {
+                                this.pending_folded_reveal = Some(pending);
+                            }
+                        }
+                    }
+                }
                 let elapsed = now.elapsed();
                 if this.last_reported_update.elapsed() > Duration::from_secs(3600) {
                     telemetry::event!(
@@ -6681,32 +6721,19 @@ impl ProjectPanel {
             return Ok(());
         }
 
+        // A folded chain renders as one row keyed by its deepest entry, and fold state
+        // is derived in a background task: marking the right row and component has to
+        // wait until the task delivers a chain containing this entry.
+        self.pending_folded_reveal = Some(SelectedEntry {
+            worktree_id,
+            entry_id,
+        });
         self.expand_entry(worktree_id, entry_id, cx);
         self.update_visible_entries(Some((worktree_id, entry_id)), false, true, window, cx);
-        // A folded chain renders as one row keyed by its deepest entry: revealing an
-        // interior component must mark that row and make the component active, or the
-        // selection lands on an id no visible row carries.
-        let mut revealed_entry_id = entry_id;
-        for (&row_entry_id, folded) in self.state.ancestors.iter_mut() {
-            if let Some(depth) = folded.ancestors.iter().position(|&id| id == entry_id) {
-                if row_entry_id != entry_id {
-                    folded.current_ancestor_depth = depth;
-                    revealed_entry_id = row_entry_id;
-                }
-                break;
-            }
-        }
-        if revealed_entry_id != entry_id {
-            self.selection = Some(SelectedEntry {
-                worktree_id,
-                entry_id: revealed_entry_id,
-            });
-            self.autoscroll(cx);
-        }
         self.marked_entries.clear();
         self.marked_entries.push(SelectedEntry {
             worktree_id,
-            entry_id: revealed_entry_id,
+            entry_id,
         });
         cx.notify();
         Ok(())
