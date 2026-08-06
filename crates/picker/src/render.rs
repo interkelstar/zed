@@ -161,6 +161,9 @@ impl<D: PickerDelegate> Picker<D> {
         if self.preview.is_some() {
             key_context.add("with_preview");
         }
+        if let Some(extra) = self.delegate.extra_key_context() {
+            key_context.add(extra);
+        }
 
         let menu = v_flex()
             .key_context(key_context)

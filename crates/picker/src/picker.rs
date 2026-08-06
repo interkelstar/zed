@@ -327,6 +327,11 @@ pub trait PickerDelegate: Sized + 'static {
         PickerEditorPosition::default()
     }
 
+    /// An extra identifier added to the picker's key context, alongside "Picker".
+    fn extra_key_context(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Prevent closing the modal on clicking in a popover menu that portrudes out
     /// This is already set by the Actions menu from the picker, this is here to
     /// support extra menus added by the delegate.
@@ -1596,6 +1601,9 @@ mod tests {
         supports_multi_select: bool,
         selected_items: Vec<usize>,
         multi_confirmed: Rc<Cell<Option<Vec<usize>>>>,
+        drill_context: bool,
+        parent_selected: Rc<Cell<bool>>,
+        child_selected: Rc<Cell<bool>>,
     }
 
     impl TestDelegate {
@@ -1607,11 +1615,19 @@ mod tests {
                 supports_multi_select: false,
                 selected_items: Vec::new(),
                 multi_confirmed: Rc::new(Cell::new(None)),
+                drill_context: false,
+                parent_selected: Rc::new(Cell::new(false)),
+                child_selected: Rc::new(Cell::new(false)),
             }
         }
 
         fn with_multi_select(mut self) -> Self {
             self.supports_multi_select = true;
+            self
+        }
+
+        fn with_drill_context(mut self) -> Self {
+            self.drill_context = true;
             self
         }
     }
@@ -1712,6 +1728,28 @@ mod tests {
 
         fn dismissed(&mut self, _window: &mut Window, _cx: &mut Context<Picker<Self>>) {}
 
+        fn extra_key_context(&self) -> Option<&'static str> {
+            self.drill_context.then_some("BreadcrumbPicker")
+        }
+
+        fn select_parent(
+            &mut self,
+            _window: &mut Window,
+            _cx: &mut Context<Picker<Self>>,
+        ) -> Option<String> {
+            self.parent_selected.set(true);
+            Some("parent".to_string())
+        }
+
+        fn select_child(
+            &mut self,
+            _window: &mut Window,
+            _cx: &mut Context<Picker<Self>>,
+        ) -> Option<String> {
+            self.child_selected.set(true);
+            Some("child".to_string())
+        }
+
         fn render_match(
             &self,
             ix: usize,
@@ -1734,6 +1772,38 @@ mod tests {
             cx.set_global(store);
             theme_settings::init(theme::LoadThemes::JustBase, cx);
             editor::init(cx);
+        });
+    }
+
+    /// Binds the same context strings the default keymaps use.
+    fn bind_drill_navigation_keymap(cx: &mut TestAppContext) {
+        use settings::KeymapFile;
+
+        cx.update(|cx| {
+            // Later bindings win ties, so "Editor" comes before the overrides.
+            cx.bind_keys(KeymapFile::load_panic_on_failure(
+                r#"[
+                    {
+                        "context": "Editor",
+                        "bindings": {
+                            "left": "editor::MoveLeft",
+                            "right": "editor::MoveRight"
+                        }
+                    },
+                    {
+                        "context": "Picker > Editor",
+                        "bindings": { "escape": "menu::Cancel" }
+                    },
+                    {
+                        "context": "BreadcrumbPicker > Editor",
+                        "bindings": {
+                            "left": "menu::SelectParent",
+                            "right": "menu::SelectChild"
+                        }
+                    }
+                ]"#,
+                cx,
+            ));
         });
     }
 
@@ -1934,6 +2004,74 @@ mod tests {
                 picker.delegate.selected_item_count(),
                 0,
                 "leaving the mode should clear the selection"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_plain_left_right_drill_only_in_tagged_picker(cx: &mut TestAppContext) {
+        init_test(cx);
+        bind_drill_navigation_keymap(cx);
+
+        let parent_selected = Rc::new(Cell::new(false));
+        let (picker, cx) = cx.add_window_view(|window, cx| {
+            let mut delegate = TestDelegate::new(vec![true]).with_drill_context();
+            delegate.parent_selected = parent_selected.clone();
+            Picker::uniform_list(delegate, window, cx)
+        });
+
+        picker.update_in(cx, |picker, window, cx| {
+            picker.focus(window, cx);
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("left");
+        cx.run_until_parked();
+
+        assert!(
+            parent_selected.get(),
+            "a picker tagged BreadcrumbPicker should drill on plain left through the real keymap"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_plain_left_right_reach_editor_cursor_elsewhere(cx: &mut TestAppContext) {
+        init_test(cx);
+        bind_drill_navigation_keymap(cx);
+
+        let parent_selected = Rc::new(Cell::new(false));
+        let (picker, cx) = cx.add_window_view(|window, cx| {
+            let mut delegate = TestDelegate::new(vec![true]);
+            delegate.parent_selected = parent_selected.clone();
+            Picker::uniform_list(delegate, window, cx)
+        });
+
+        picker.update_in(cx, |picker, window, cx| {
+            picker.focus(window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("a b");
+        cx.run_until_parked();
+        picker.update(cx, |picker, cx| {
+            assert_eq!(picker.query(cx), "ab");
+        });
+
+        cx.simulate_keystrokes("left");
+        cx.run_until_parked();
+
+        assert!(
+            !parent_selected.get(),
+            "a plain picker (e.g. Open Path) must not have select_parent consume the keystroke"
+        );
+
+        // A cursor moved by "left" yields "acb"; a swallowed "left" yields "abc".
+        cx.simulate_keystrokes("c");
+        cx.run_until_parked();
+        picker.update(cx, |picker, cx| {
+            assert_eq!(
+                picker.query(cx),
+                "acb",
+                "plain left must reach the query editor's cursor movement"
             );
         });
     }

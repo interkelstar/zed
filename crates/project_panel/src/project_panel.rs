@@ -92,6 +92,7 @@ use crate::{
 
 const PROJECT_PANEL_KEY: &str = "ProjectPanel";
 const NEW_ENTRY_ID: ProjectEntryId = ProjectEntryId::MAX;
+const MAX_PENDING_FOLDED_REVEAL_ATTEMPTS: u8 = 5;
 
 struct VisibleEntriesForWorktree {
     worktree_id: WorktreeId,
@@ -150,6 +151,7 @@ pub struct ProjectPanel {
     /// A reveal target inside a folded chain: fold state is derived in a background
     /// task, so the chain to mark may not exist until that task lands.
     pending_folded_reveal: Option<SelectedEntry>,
+    pending_folded_reveal_attempts: u8,
     selection: Option<SelectedEntry>,
     context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
     filename_editor: Entity<Editor>,
@@ -842,6 +844,7 @@ impl ProjectPanel {
                 drag_target_entry: None,
                 marked_entries: Default::default(),
                 pending_folded_reveal: None,
+                pending_folded_reveal_attempts: 0,
                 selection: None,
                 context_menu: None,
                 filename_editor,
@@ -931,7 +934,7 @@ impl ProjectPanel {
                                     let entry = SelectedEntry { worktree_id, entry_id };
                                     project_panel.marked_entries.clear();
                                     project_panel.marked_entries.push(entry);
-                                    project_panel.selection = Some(entry);
+                                    project_panel.select_and_cancel_pending_reveal(entry);
                                 });
                                 if !focus_opened_item {
                                     let focus_handle = project_panel.read(cx).focus_handle.clone();
@@ -1069,7 +1072,7 @@ impl ProjectPanel {
             return;
         };
 
-        self.selection = Some(SelectedEntry {
+        self.select_and_cancel_pending_reveal(SelectedEntry {
             worktree_id,
             entry_id,
         });
@@ -1683,6 +1686,12 @@ impl ProjectPanel {
         });
     }
 
+    fn select_and_cancel_pending_reveal(&mut self, selection: SelectedEntry) {
+        self.pending_folded_reveal = None;
+        self.pending_folded_reveal_attempts = 0;
+        self.selection = Some(selection);
+    }
+
     fn select_previous(&mut self, _: &SelectPrevious, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(edit_state) = &self.state.edit_state
             && edit_state.processing_filename.is_none()
@@ -1720,7 +1729,7 @@ impl ProjectPanel {
                 worktree_id: *worktree_id,
                 entry_id: entries[entry_ix].id,
             };
-            self.selection = Some(selection);
+            self.select_and_cancel_pending_reveal(selection);
             if window.modifiers().shift {
                 self.marked_entries.push(selection);
             }
@@ -2998,7 +3007,7 @@ impl ProjectPanel {
                     worktree_id: *worktree_id,
                     entry_id: entry.id,
                 };
-                self.selection = Some(selection);
+                self.select_and_cancel_pending_reveal(selection);
                 if window.modifiers().shift {
                     self.marked_entries.push(selection);
                 }
@@ -3037,7 +3046,7 @@ impl ProjectPanel {
         );
 
         if let Some(selection) = selection {
-            self.selection = Some(selection);
+            self.select_and_cancel_pending_reveal(selection);
             self.expand_entry(selection.worktree_id, selection.entry_id, cx);
             self.update_visible_entries(
                 Some((selection.worktree_id, selection.entry_id)),
@@ -3076,7 +3085,7 @@ impl ProjectPanel {
         );
 
         if let Some(selection) = selection {
-            self.selection = Some(selection);
+            self.select_and_cancel_pending_reveal(selection);
             self.expand_entry(selection.worktree_id, selection.entry_id, cx);
             self.update_visible_entries(
                 Some((selection.worktree_id, selection.entry_id)),
@@ -3114,7 +3123,7 @@ impl ProjectPanel {
         );
 
         if let Some(selection) = selection {
-            self.selection = Some(selection);
+            self.select_and_cancel_pending_reveal(selection);
             self.expand_entry(selection.worktree_id, selection.entry_id, cx);
             self.update_visible_entries(
                 Some((selection.worktree_id, selection.entry_id)),
@@ -3149,7 +3158,7 @@ impl ProjectPanel {
         );
 
         if let Some(selection) = selection {
-            self.selection = Some(selection);
+            self.select_and_cancel_pending_reveal(selection);
             self.autoscroll(cx);
             cx.notify();
         }
@@ -3177,7 +3186,7 @@ impl ProjectPanel {
         );
 
         if let Some(selection) = selection {
-            self.selection = Some(selection);
+            self.select_and_cancel_pending_reveal(selection);
             self.autoscroll(cx);
             cx.notify();
         }
@@ -3206,7 +3215,7 @@ impl ProjectPanel {
         );
 
         if let Some(selection) = selection {
-            self.selection = Some(selection);
+            self.select_and_cancel_pending_reveal(selection);
             self.expand_entry(selection.worktree_id, selection.entry_id, cx);
             self.update_visible_entries(
                 Some((selection.worktree_id, selection.entry_id)),
@@ -3224,7 +3233,7 @@ impl ProjectPanel {
             if let Some(parent) = entry.path.parent() {
                 let worktree = worktree.read(cx);
                 if let Some(parent_entry) = worktree.entry_for_path(parent) {
-                    self.selection = Some(SelectedEntry {
+                    self.select_and_cancel_pending_reveal(SelectedEntry {
                         worktree_id: worktree.id(),
                         entry_id: parent_entry.id,
                     });
@@ -3249,7 +3258,7 @@ impl ProjectPanel {
                 worktree_id: *worktree_id,
                 entry_id: entry.id,
             };
-            self.selection = Some(selection);
+            self.select_and_cancel_pending_reveal(selection);
             if window.modifiers().shift {
                 self.marked_entries.push(selection);
             }
@@ -3273,7 +3282,7 @@ impl ProjectPanel {
                         worktree_id: *worktree_id,
                         entry_id: entry.id,
                     };
-                    self.selection = Some(selection);
+                    self.select_and_cancel_pending_reveal(selection);
                     self.autoscroll(cx);
                     cx.notify();
                 }
@@ -4543,14 +4552,28 @@ impl ProjectPanel {
                             this.marked_entries.push(selected);
                             this.autoscroll(cx);
                         }
-                        // No chain contains the entry yet, e.g. its directory is still
-                        // being scanned: keep waiting unless it surfaced as a plain row.
+                        // Keep waiting unless it surfaced as a plain row, was deleted,
+                        // or exhausted its retries.
                         None => {
-                            if this
+                            let still_visible = this
                                 .index_for_entry(pending.entry_id, pending.worktree_id)
-                                .is_none()
+                                .is_some();
+                            let still_exists = this
+                                .project
+                                .read(cx)
+                                .worktree_for_id(pending.worktree_id, cx)
+                                .is_some_and(|worktree| {
+                                    worktree.read(cx).entry_for_id(pending.entry_id).is_some()
+                                });
+                            if !still_visible
+                                && still_exists
+                                && this.pending_folded_reveal_attempts
+                                    < MAX_PENDING_FOLDED_REVEAL_ATTEMPTS
                             {
+                                this.pending_folded_reveal_attempts += 1;
                                 this.pending_folded_reveal = Some(pending);
+                            } else {
+                                this.pending_folded_reveal_attempts = 0;
                             }
                         }
                     }
@@ -6074,7 +6097,7 @@ impl ProjectPanel {
                                 }
                             }
 
-                            project_panel.selection = Some(clicked_entry);
+                            project_panel.select_and_cancel_pending_reveal(clicked_entry);
                             if !project_panel.marked_entries.contains(&clicked_entry) {
                                 project_panel.marked_entries.push(clicked_entry);
                             }
@@ -6083,7 +6106,7 @@ impl ProjectPanel {
                         if event.click_count() > 1 {
                             project_panel.split_entry(entry_id, false, None, cx);
                         } else {
-                            project_panel.selection = Some(selection);
+                            project_panel.select_and_cancel_pending_reveal(selection);
                             if let Some(position) = project_panel
                                 .marked_entries
                                 .iter()
@@ -6728,6 +6751,7 @@ impl ProjectPanel {
             worktree_id,
             entry_id,
         });
+        self.pending_folded_reveal_attempts = 0;
         self.expand_entry(worktree_id, entry_id, cx);
         self.update_visible_entries(Some((worktree_id, entry_id)), false, true, window, cx);
         self.marked_entries.clear();

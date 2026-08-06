@@ -286,6 +286,10 @@ impl PickerDelegate for BreadcrumbDirectoryDelegate {
         PickerEditorPosition::End
     }
 
+    fn extra_key_context(&self) -> Option<&'static str> {
+        Some("BreadcrumbPicker")
+    }
+
     fn update_matches(
         &mut self,
         query: String,
@@ -373,9 +377,14 @@ impl PickerDelegate for BreadcrumbDirectoryDelegate {
         let Some(worktree) = self.worktree(cx) else {
             return;
         };
-        let resolved_path = descend_single_child_directories(entry_path, |path| {
-            breadcrumb_directory_children(&worktree, path, cx)
-        });
+        let auto_fold_dirs = BreadcrumbDirectoryListingSettings::get_global(cx).auto_fold_dirs;
+        let resolved_path = if auto_fold_dirs {
+            descend_single_child_directories(entry_path, |path| {
+                breadcrumb_directory_children(&worktree, path, cx)
+            })
+        } else {
+            entry_path
+        };
 
         // `current_path` isn't updated in place; the popover reopens under the resolved segment.
         if let Some(editor) = self.editor.upgrade() {
@@ -1242,6 +1251,79 @@ mod tests {
                     .active_path
                     .as_unix_str(),
                 "a/b",
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_breadcrumb_directory_browser_choose_respects_auto_fold_dirs_off(
+        cx: &mut TestAppContext,
+    ) {
+        use editor::MultiBuffer;
+        use editor::test::build_editor;
+        use project::{FakeFs, Project};
+        use serde_json::json;
+        use settings::SettingsStore;
+        use util::path;
+
+        init_test(cx);
+        cx.update(|cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings
+                        .project_panel
+                        .get_or_insert_default()
+                        .auto_fold_dirs = Some(false);
+                });
+            });
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                "a": { "b": { "c.txt": "" } },
+            }),
+        )
+        .await;
+        let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+        let worktree_id = project.update(cx, |project, cx| {
+            project.worktrees(cx).next().unwrap().read(cx).id()
+        });
+
+        let workspace_window =
+            cx.add_window(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let workspace = workspace_window.root(cx).unwrap();
+
+        let buffer = cx.new(|cx| language::Buffer::local("", cx));
+        let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+        let editor_window = cx.add_window(|window, cx| build_editor(buffer, window, cx));
+        let editor = editor_window.root(cx).unwrap();
+        let cx = &mut VisualTestContext::from_window(*editor_window, cx);
+
+        let browser = editor_window
+            .update(cx, |_, window, cx| {
+                BreadcrumbDirectoryDelegate::picker(
+                    editor.downgrade(),
+                    workspace.downgrade(),
+                    worktree_id,
+                    RelPath::empty().into(),
+                    None,
+                    window,
+                    cx,
+                )
+            })
+            .unwrap();
+        confirm_breadcrumb_row(&browser, "a", cx);
+        editor.read_with(cx, |editor, _| {
+            assert_eq!(
+                editor
+                    .breadcrumb_navigation()
+                    .expect("navigate_breadcrumb_to set a session")
+                    .active_path
+                    .as_unix_str(),
+                "a",
+                "with auto_fold_dirs off, confirm must land on the chosen directory itself"
             );
         });
     }

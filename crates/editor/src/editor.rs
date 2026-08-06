@@ -21,7 +21,7 @@ pub mod display_map;
 mod document_colors;
 mod document_links;
 mod document_symbols;
-use document_symbols::BreadcrumbOutline;
+use document_symbols::{BreadcrumbOutline, ConvertedBreadcrumbOutline};
 mod editor_settings;
 mod element;
 mod fold;
@@ -237,6 +237,8 @@ use settings::{
 };
 use smallvec::{SmallVec, smallvec};
 use snippet::Snippet;
+#[cfg(any(test, feature = "test-support"))]
+use std::cell::Cell;
 use std::{
     any::{Any, TypeId},
     borrow::Cow,
@@ -1180,6 +1182,10 @@ pub struct Editor {
     outline_symbols_at_cursor: Option<(BufferId, Vec<OutlineItem<Anchor>>)>,
     breadcrumb_outline_task: Task<()>,
     breadcrumb_outline: Option<BreadcrumbOutline>,
+    /// `breadcrumb_outline` converted to multi-buffer anchors, cached by buffer id/version.
+    breadcrumb_converted_outline_cache: RefCell<Option<ConvertedBreadcrumbOutline>>,
+    #[cfg(any(test, feature = "test-support"))]
+    breadcrumb_converted_outline_recomputes: Cell<usize>,
     sticky_headers_task: Task<()>,
     sticky_headers: Option<Vec<OutlineItem<Anchor>>>,
     pub(crate) colorize_brackets_task: Task<()>,
@@ -2504,6 +2510,9 @@ impl Editor {
             outline_symbols_at_cursor: None,
             breadcrumb_outline_task: Task::ready(()),
             breadcrumb_outline: None,
+            breadcrumb_converted_outline_cache: RefCell::new(None),
+            #[cfg(any(test, feature = "test-support"))]
+            breadcrumb_converted_outline_recomputes: Cell::new(0),
             sticky_headers_task: Task::ready(()),
             sticky_headers: None,
             colorize_brackets_task: Task::ready(()),
@@ -11057,7 +11066,7 @@ impl Editor {
             .is_some_and(|navigation| {
                 navigation.navigated
                     && navigation.worktree_id == worktree_id
-                    && navigation.active_path == path
+                    && navigation.active_path.starts_with(&path)
             });
         self.breadcrumb_navigation = Some(BreadcrumbNavigation {
             worktree_id,
@@ -11082,10 +11091,18 @@ impl Editor {
             .breadcrumb_symbol_navigation
             .as_ref()
             .is_some_and(|navigation| {
-                navigation.navigated
-                    && navigation.buffer_id == buffer_id
-                    && navigation.active_item.as_ref().map(|item| &item.range)
-                        == active_item.as_ref().map(|item| &item.range)
+                if !navigation.navigated || navigation.buffer_id != buffer_id {
+                    return false;
+                }
+                let Some(clicked_item) = active_item.as_ref() else {
+                    return true;
+                };
+                let trail = navigation
+                    .active_item
+                    .as_ref()
+                    .map(|item| self.breadcrumb_symbol_trail(buffer_id, item, cx))
+                    .unwrap_or_default();
+                trail.iter().any(|item| item.range == clicked_item.range)
             });
         self.breadcrumb_symbol_navigation = Some(BreadcrumbSymbolNavigation {
             buffer_id,
@@ -11183,6 +11200,26 @@ impl Editor {
                 .update(cx, |editor, _| editor.breadcrumb_reanchoring = false)
                 .ok();
         });
+    }
+
+    pub fn cancel_breadcrumb_reanchor(&mut self, cx: &mut Context<Self>) {
+        let mut changed = false;
+        if self.breadcrumb_reanchoring {
+            self.breadcrumb_reanchoring = false;
+            changed = true;
+        }
+        if self.breadcrumb_pending_reanchor.take().is_some() {
+            changed = true;
+        }
+        if self.breadcrumb_navigation.take().is_some() {
+            changed = true;
+        }
+        if self.breadcrumb_symbol_navigation.take().is_some() {
+            changed = true;
+        }
+        if changed {
+            cx.emit(EditorEvent::BreadcrumbsChanged);
+        }
     }
 
     pub(crate) fn clear_breadcrumb_navigation(

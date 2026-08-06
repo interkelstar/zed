@@ -76,6 +76,7 @@ pub struct BreadcrumbDirectoryListingSettings {
     pub folder_icons: bool,
     pub git_status: bool,
     pub show_diagnostics: ShowDiagnostics,
+    pub auto_fold_dirs: bool,
 }
 
 impl settings::Settings for BreadcrumbDirectoryListingSettings {
@@ -97,6 +98,7 @@ impl settings::Settings for BreadcrumbDirectoryListingSettings {
                     .unwrap()
                     .is_git_status_enabled(),
             show_diagnostics: project_panel.show_diagnostics.unwrap(),
+            auto_fold_dirs: project_panel.auto_fold_dirs.unwrap(),
         }
     }
 }

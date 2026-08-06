@@ -655,14 +655,8 @@ pub fn render_breadcrumb_text(
                 }
             }
 
-            if !path_split && is_navigable {
-                symbol_segments.push(Some(BreadcrumbSegmentTarget::Symbol {
-                    buffer_id,
-                    item: None,
-                    is_active_segment: file_segment_active,
-                }));
-            } else if !path_split {
-                symbol_segments.push(None);
+            if !path_split {
+                symbol_segments.push(file_segment_symbol_target(buffer_id, file_segment_active));
             }
 
             // Directory navigation replaces the whole bar; symbol segments don't apply.
@@ -738,23 +732,21 @@ pub fn render_breadcrumb_text(
         .zip(kinds)
         .enumerate()
         .map(|(index, ((label, target), kind))| {
-            let is_file_segment = kind == BreadcrumbSegmentKind::File
-                && matches!(
-                    target,
-                    Some(BreadcrumbSegmentTarget::Symbol { item: None, .. })
-                );
+            let is_file_segment = is_file_breadcrumb_segment(kind, target.as_ref());
             PreparedBreadcrumbSegment {
                 kind,
                 label,
                 target,
-                dirty_filename_style: apply_dirty_filename_style && index == file_segment_index,
+                dirty_filename_style: apply_dirty_filename_style
+                    && index == file_segment_index
+                    && is_file_segment,
                 icon: is_file_segment.then(|| file_icon.clone()).flatten(),
                 icon_color: if is_file_segment {
                     file_icon_color
                 } else {
                     Color::Muted
                 },
-                label_color: if kind == BreadcrumbSegmentKind::File {
+                label_color: if is_file_segment {
                     file_status_color
                 } else {
                     Color::Muted
@@ -838,28 +830,61 @@ pub fn render_breadcrumb_text(
     }
 }
 
+/// Always a target, even when the path itself isn't navigable (single-file worktree, untitled):
+/// the file segment still opens the outline picker.
+fn file_segment_symbol_target(
+    buffer_id: BufferId,
+    is_active_segment: bool,
+) -> Option<BreadcrumbSegmentTarget> {
+    Some(BreadcrumbSegmentTarget::Symbol {
+        buffer_id,
+        item: None,
+        is_active_segment,
+    })
+}
+
+fn is_file_breadcrumb_segment(
+    kind: BreadcrumbSegmentKind,
+    target: Option<&BreadcrumbSegmentTarget>,
+) -> bool {
+    kind == BreadcrumbSegmentKind::File
+        && matches!(
+            target,
+            Some(BreadcrumbSegmentTarget::Symbol { item: None, .. })
+        )
+}
+
 /// Where the file name starts, shared between painting and measuring.
 fn dirty_filename_offset(segment: &HighlightedText) -> Option<usize> {
     let filename = std::path::Path::new(segment.text.as_ref()).file_name()?;
     segment.text.rfind(filename.to_string_lossy().as_ref())
 }
 
+/// Bolds the filename in place, keeping whatever color `render_segment` already chose (git status).
+fn dirty_filename_text_style(text_style: &gpui::TextStyle) -> gpui::TextStyle {
+    let mut filename_style = text_style.clone();
+    filename_style.font_weight = FontWeight::BOLD;
+    filename_style
+}
+
+fn dirty_filename_highlight_style() -> gpui::HighlightStyle {
+    gpui::HighlightStyle {
+        font_weight: Some(FontWeight::BOLD),
+        ..Default::default()
+    }
+}
+
 fn apply_dirty_filename_style(
     segment: &HighlightedText,
     text_style: &gpui::TextStyle,
-    cx: &App,
+    _cx: &App,
 ) -> Option<gpui::AnyElement> {
     let text = flatten_text_for_single_line_display(&segment.text);
 
     let filename_position = dirty_filename_offset(segment)?;
 
-    let bold_weight = FontWeight::BOLD;
-    let default_color = Color::Default.color(cx);
-
     if filename_position == 0 {
-        let mut filename_style = text_style.clone();
-        filename_style.font_weight = bold_weight;
-        filename_style.color = default_color;
+        let filename_style = dirty_filename_text_style(text_style);
 
         return Some(
             StyledText::new(text)
@@ -868,13 +893,10 @@ fn apply_dirty_filename_style(
         );
     }
 
-    let highlight_style = gpui::HighlightStyle {
-        font_weight: Some(bold_weight),
-        color: Some(default_color),
-        ..Default::default()
-    };
-
-    let highlight = vec![(filename_position..text.len(), highlight_style)];
+    let highlight = vec![(
+        filename_position..text.len(),
+        dirty_filename_highlight_style(),
+    )];
     Some(
         StyledText::new(text)
             .with_default_highlights(text_style, highlight)
@@ -900,5 +922,72 @@ mod tests {
             &flattened[inner_offset..inner_offset + "inner".len()],
             "inner",
         );
+    }
+
+    #[test]
+    fn test_is_file_breadcrumb_segment_requires_the_bare_file_target() {
+        let file_target = BreadcrumbSegmentTarget::Symbol {
+            buffer_id: BufferId::new(1).unwrap(),
+            item: None,
+            is_active_segment: true,
+        };
+        assert!(is_file_breadcrumb_segment(
+            BreadcrumbSegmentKind::File,
+            Some(&file_target)
+        ));
+
+        let directory_target = BreadcrumbSegmentTarget::Directory {
+            worktree_id: WorktreeId::from_usize(0),
+            path: RelPath::empty().into(),
+            active_path: None,
+            is_active_segment: true,
+        };
+        assert!(
+            !is_file_breadcrumb_segment(BreadcrumbSegmentKind::File, Some(&directory_target)),
+            "a navigated bar can put a Directory at file_segment_index"
+        );
+
+        assert!(!is_file_breadcrumb_segment(
+            BreadcrumbSegmentKind::Middle,
+            Some(&file_target)
+        ));
+    }
+
+    #[test]
+    fn test_dirty_filename_text_style_only_changes_font_weight() {
+        let mut base = gpui::TextStyle::default();
+        base.color = gpui::red();
+
+        let dirty = dirty_filename_text_style(&base);
+
+        assert_eq!(dirty.color, base.color, "the git status color must survive");
+        assert_eq!(dirty.font_weight, FontWeight::BOLD);
+    }
+
+    #[test]
+    fn test_file_segment_symbol_target_is_set_even_when_not_navigable() {
+        let buffer_id = BufferId::new(1).unwrap();
+
+        let target = file_segment_symbol_target(buffer_id, false)
+            .expect("the file segment always gets a target, navigable or not");
+        assert!(matches!(
+            target,
+            BreadcrumbSegmentTarget::Symbol {
+                item: None,
+                is_active_segment: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_dirty_filename_highlight_style_carries_no_color() {
+        let highlight = dirty_filename_highlight_style();
+
+        assert_eq!(
+            highlight.color, None,
+            "color must fall through to the base run's"
+        );
+        assert_eq!(highlight.font_weight, Some(FontWeight::BOLD));
     }
 }

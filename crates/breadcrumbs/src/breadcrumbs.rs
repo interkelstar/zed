@@ -75,7 +75,13 @@ impl ToolbarItemView for Breadcrumbs {
         cx: &mut Context<Self>,
     ) -> ToolbarItemLocation {
         cx.notify();
-        self.active_item = None;
+        let switching_away = self.active_item.as_ref().is_some_and(|previous| {
+            Some(previous.item_id()) != active_pane_item.map(ItemHandle::item_id)
+        });
+        let previous_item = self.active_item.take();
+        if switching_away && let Some(previous_item) = previous_item {
+            previous_item.breadcrumb_cancel_reanchor(cx);
+        }
 
         let Some(item) = active_pane_item else {
             return ToolbarItemLocation::Hidden;

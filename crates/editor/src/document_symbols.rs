@@ -27,6 +27,14 @@ pub(crate) struct BreadcrumbOutline {
     items: Vec<OutlineItem<text::Anchor>>,
 }
 
+/// `BreadcrumbOutline`'s items resolved to multi-buffer anchors.
+pub(crate) struct ConvertedBreadcrumbOutline {
+    buffer_id: BufferId,
+    version: clock::Global,
+    items: Vec<OutlineItem<Anchor>>,
+    depths: Vec<usize>,
+}
+
 impl Editor {
     /// Returns all document outline items for a buffer, using LSP or
     /// tree-sitter based on the `document_symbols` setting.
@@ -152,7 +160,7 @@ impl Editor {
         });
     }
 
-    /// Converted outline items and their depths, resolved against the current multi-buffer snapshot.
+    /// Converted outline items and their depths, cached by buffer id/version.
     fn breadcrumb_converted_outline(
         &self,
         buffer_id: BufferId,
@@ -163,6 +171,17 @@ impl Editor {
             .as_ref()
             .filter(|outline| outline.buffer_id == buffer_id)?;
 
+        if let Some(cached) = self.breadcrumb_converted_outline_cache.borrow().as_ref()
+            && cached.buffer_id == outline.buffer_id
+            && cached.version == outline.version
+        {
+            return Some((cached.items.clone(), cached.depths.clone()));
+        }
+
+        #[cfg(any(test, feature = "test-support"))]
+        self.breadcrumb_converted_outline_recomputes
+            .set(self.breadcrumb_converted_outline_recomputes.get() + 1);
+
         let multi_buffer_snapshot = self.buffer().read(cx).snapshot(cx);
         let items = outline
             .items
@@ -170,6 +189,13 @@ impl Editor {
             .filter_map(|item| text_outline_item_to_multibuffer(item, &multi_buffer_snapshot))
             .collect::<Vec<_>>();
         let depths = items.iter().map(|item| item.depth).collect::<Vec<_>>();
+
+        *self.breadcrumb_converted_outline_cache.borrow_mut() = Some(ConvertedBreadcrumbOutline {
+            buffer_id: outline.buffer_id,
+            version: outline.version.clone(),
+            items: items.clone(),
+            depths: depths.clone(),
+        });
         Some((items, depths))
     }
 
@@ -1040,6 +1066,77 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_open_breadcrumb_symbol_navigation_keeps_navigated_for_trail_member(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx, |_| {});
+
+        let mut cx = EditorLspTestContext::new_rust(lsp::ServerCapabilities::default(), cx).await;
+        cx.set_state("struct Foo {}\n\nimpl Foo {\n    fn baˇr() {}\n}\n");
+        cx.run_until_parked();
+
+        let buffer_id = cx.update_editor(|editor, _window, cx| {
+            let buffer_id = editor
+                .buffer()
+                .read(cx)
+                .as_singleton()
+                .unwrap()
+                .read(cx)
+                .remote_id();
+            editor.prefetch_breadcrumb_outline(buffer_id, cx);
+            buffer_id
+        });
+        cx.run_until_parked();
+
+        let (struct_item, impl_item, method_item) = cx.update_editor(|editor, _window, cx| {
+            let top_level = editor.breadcrumb_symbol_menu_items(buffer_id, None, cx);
+            let struct_item = top_level
+                .iter()
+                .find(|item| item.text.contains("Foo") && item.text.contains("struct"))
+                .expect("struct Foo is top-level")
+                .clone();
+            let impl_item = top_level
+                .iter()
+                .find(|item| item.text.contains("impl"))
+                .expect("the impl block is top-level")
+                .clone();
+            let children = editor.breadcrumb_symbol_menu_items(buffer_id, Some(&impl_item), cx);
+            let method_item = children.first().expect("the impl block has a method child");
+            (struct_item, impl_item, method_item.clone())
+        });
+
+        cx.update_editor(|editor, window, cx| {
+            editor.navigate_breadcrumb_symbol_to(buffer_id, Some(method_item.clone()), window, cx);
+            assert!(editor.breadcrumb_symbol_navigation().unwrap().navigated);
+
+            editor.open_breadcrumb_symbol_navigation(buffer_id, Some(impl_item.clone()), cx);
+            let navigation = editor.breadcrumb_symbol_navigation().unwrap();
+            assert_eq!(
+                navigation.active_item.as_ref().map(|item| &item.range),
+                Some(&impl_item.range)
+            );
+            assert!(
+                navigation.navigated,
+                "clicking a member of the navigated trail must not collapse it"
+            );
+
+            editor.open_breadcrumb_symbol_navigation(buffer_id, None, cx);
+            let navigation = editor.breadcrumb_symbol_navigation().unwrap();
+            assert!(
+                navigation.navigated,
+                "the file segment is always part of the trail"
+            );
+
+            editor.open_breadcrumb_symbol_navigation(buffer_id, Some(struct_item.clone()), cx);
+            let navigation = editor.breadcrumb_symbol_navigation().unwrap();
+            assert!(
+                !navigation.navigated,
+                "clicking a symbol outside the trail must revert to the cursor's own trail"
+            );
+        });
+    }
+
+    #[gpui::test]
     async fn test_breadcrumbs_use_lsp_symbols(cx: &mut TestAppContext) {
         init_test(cx, |_| {});
 
@@ -1519,5 +1616,88 @@ mod tests {
             breadcrumb_updates.load(atomic::Ordering::Acquire) > 0,
             "Breadcrumbs should refresh on the setting change, without extra selection changes"
         );
+    }
+
+    #[gpui::test]
+    async fn test_breadcrumb_converted_outline_is_cached_across_calls(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+
+        let mut cx = EditorLspTestContext::new_rust(lsp::ServerCapabilities::default(), cx).await;
+        cx.set_state("struct Foo {}\n\nimpl Foo {\n    fn baˇr() {}\n}\n");
+        cx.run_until_parked();
+
+        let buffer_id = cx.update_editor(|editor, _window, cx| {
+            let buffer_id = editor
+                .buffer()
+                .read(cx)
+                .as_singleton()
+                .unwrap()
+                .read(cx)
+                .remote_id();
+            editor.prefetch_breadcrumb_outline(buffer_id, cx);
+            buffer_id
+        });
+        cx.run_until_parked();
+
+        cx.update_editor(|editor, _window, cx| {
+            editor.breadcrumb_symbol_menu_items(buffer_id, None, cx);
+            let recomputes_after_first_call = editor.breadcrumb_converted_outline_recomputes.get();
+            assert_eq!(recomputes_after_first_call, 1);
+
+            editor.breadcrumb_symbol_menu_items(buffer_id, None, cx);
+            let top_level = editor.breadcrumb_symbol_menu_items(buffer_id, None, cx);
+            let item = top_level.first().unwrap();
+            editor.breadcrumb_symbol_parent(buffer_id, item, cx);
+            editor.breadcrumb_symbol_trail(buffer_id, item, cx);
+
+            assert_eq!(
+                editor.breadcrumb_converted_outline_recomputes.get(),
+                recomputes_after_first_call,
+                "repeated calls at the same buffer version must reuse the cached conversion"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_breadcrumb_converted_outline_cache_invalidates_on_edit(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+
+        let mut cx = EditorLspTestContext::new_rust(lsp::ServerCapabilities::default(), cx).await;
+        cx.set_state("struct Foo {}\n\nimpl Foo {\n    fn baˇr() {}\n}\n");
+        cx.run_until_parked();
+
+        let buffer_id = cx.update_editor(|editor, _window, cx| {
+            let buffer_id = editor
+                .buffer()
+                .read(cx)
+                .as_singleton()
+                .unwrap()
+                .read(cx)
+                .remote_id();
+            editor.prefetch_breadcrumb_outline(buffer_id, cx);
+            buffer_id
+        });
+        cx.run_until_parked();
+
+        let recomputes_before_edit = cx.update_editor(|editor, _window, cx| {
+            editor.breadcrumb_symbol_menu_items(buffer_id, None, cx);
+            editor.breadcrumb_converted_outline_recomputes.get()
+        });
+
+        cx.set_state("struct Foo {}\n\nimpl Foo {\n    fn baz(ˇ) {}\n}\n");
+        cx.run_until_parked();
+
+        cx.update_editor(|editor, _window, cx| {
+            editor.prefetch_breadcrumb_outline(buffer_id, cx);
+        });
+        cx.run_until_parked();
+
+        cx.update_editor(|editor, _window, cx| {
+            editor.breadcrumb_symbol_menu_items(buffer_id, None, cx);
+            assert!(
+                editor.breadcrumb_converted_outline_recomputes.get() > recomputes_before_edit,
+                "a new outline version (from an edit) must invalidate the cache"
+            );
+        });
     }
 }

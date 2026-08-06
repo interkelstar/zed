@@ -1105,6 +1105,10 @@ impl Item for Editor {
             .map(|icon_path| Icon::from_path(icon_path).into_any_element())
     }
 
+    fn breadcrumb_cancel_reanchor(&mut self, cx: &mut Context<Self>) {
+        self.cancel_breadcrumb_reanchor(cx);
+    }
+
     fn added_to_workspace(
         &mut self,
         workspace: &mut Workspace,

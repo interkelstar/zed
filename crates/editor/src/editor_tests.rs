@@ -385,7 +385,7 @@ fn test_stale_breadcrumb_dismissal_does_not_clobber_newer_navigation(cx: &mut Te
     let editor = cx.add_window(|window, cx| build_editor(buffer, window, cx));
     let worktree_id = project::WorktreeId::from_usize(0);
     let bin_path = rel_path("bin").into_arc();
-    let root_path = RelPath::empty().into_arc();
+    let unrelated_path = rel_path("lib").into_arc();
     let frontend_path = rel_path("frontend").into_arc();
 
     let editor_entity = editor.root(cx).unwrap();
@@ -412,9 +412,9 @@ fn test_stale_breadcrumb_dismissal_does_not_clobber_newer_navigation(cx: &mut Te
     });
 
     _ = editor.update(cx, |editor, _, cx| {
-        editor.open_breadcrumb_navigation(worktree_id, root_path.clone(), cx);
+        editor.open_breadcrumb_navigation(worktree_id, unrelated_path.clone(), cx);
         let navigation = editor.breadcrumb_navigation().unwrap();
-        assert_eq!(navigation.active_path, root_path);
+        assert_eq!(navigation.active_path, unrelated_path);
         assert!(!navigation.navigated);
     });
 
@@ -424,8 +424,8 @@ fn test_stale_breadcrumb_dismissal_does_not_clobber_newer_navigation(cx: &mut Te
             .breadcrumb_navigation()
             .expect("a stale dismissal for a segment that's no longer active must be a no-op");
         assert_eq!(
-            navigation.active_path, root_path,
-            "the root segment's own navigation state must survive bin's late dismissal"
+            navigation.active_path, unrelated_path,
+            "lib's own navigation state must survive bin's late dismissal"
         );
     });
 
@@ -504,6 +504,73 @@ fn test_reanchoring_guard_survives_same_identity_reselection(cx: &mut TestAppCon
             .expect("re-anchoring must suppress a same-identity dismissal mid-reselection");
         assert_eq!(navigation.active_path, src_path);
         assert!(navigation.navigated);
+    });
+}
+
+#[gpui::test]
+fn test_open_breadcrumb_navigation_keeps_navigated_for_ancestor_segment(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let buffer = cx.new(|cx| language::Buffer::local("fn main() {}", cx));
+    let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+    let editor = cx.add_window(|window, cx| build_editor(buffer, window, cx));
+    let worktree_id = project::WorktreeId::from_usize(0);
+    let src_main_path = rel_path("src/main").into_arc();
+    let src_path = rel_path("src").into_arc();
+    let unrelated_path = rel_path("lib").into_arc();
+
+    _ = editor.update(cx, |editor, window, cx| {
+        editor.navigate_breadcrumb_to(worktree_id, src_main_path.clone(), window, cx);
+        assert!(editor.breadcrumb_navigation().unwrap().navigated);
+
+        editor.open_breadcrumb_navigation(worktree_id, src_path.clone(), cx);
+        let navigation = editor.breadcrumb_navigation().unwrap();
+        assert_eq!(navigation.active_path, src_path);
+        assert!(
+            navigation.navigated,
+            "clicking an ancestor segment of a navigated bar must not collapse it"
+        );
+
+        editor.open_breadcrumb_navigation(worktree_id, unrelated_path.clone(), cx);
+        let navigation = editor.breadcrumb_navigation().unwrap();
+        assert_eq!(navigation.active_path, unrelated_path);
+        assert!(
+            !navigation.navigated,
+            "clicking an unrelated segment must revert to the real file path"
+        );
+    });
+}
+
+#[gpui::test]
+fn test_cancel_breadcrumb_reanchor_clears_stuck_state(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let buffer = cx.new(|cx| language::Buffer::local("fn main() {}", cx));
+    let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+    let editor = cx.add_window(|window, cx| build_editor(buffer, window, cx));
+    let worktree_id = project::WorktreeId::from_usize(0);
+    let src_path = rel_path("src").into_arc();
+
+    _ = editor.update(cx, |editor, window, cx| {
+        editor.navigate_breadcrumb_to(worktree_id, src_path.clone(), window, cx);
+        assert!(editor.breadcrumb_reanchoring);
+    });
+    cx.run_until_parked();
+    _ = editor.update(cx, |editor, _, _| {
+        assert!(
+            editor.breadcrumb_pending_reanchor().is_some(),
+            "the deferred reanchor must have queued before we cancel it"
+        );
+    });
+
+    _ = editor.update(cx, |editor, _, cx| {
+        editor.cancel_breadcrumb_reanchor(cx);
+        assert!(!editor.breadcrumb_reanchoring);
+        assert!(editor.breadcrumb_pending_reanchor().is_none());
+        assert!(
+            editor.breadcrumb_navigation().is_none(),
+            "a cancelled reanchor must not leave stale navigation for the next prepaint"
+        );
     });
 }
 

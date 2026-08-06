@@ -6864,6 +6864,116 @@ async fn test_selection_restored_when_creation_cancelled(cx: &mut gpui::TestAppC
 }
 
 #[gpui::test]
+async fn test_pending_folded_reveal_drops_when_entry_no_longer_exists(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test_with_editor(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/src",
+        json!({
+            "test": {
+                "first.rs": "// First Rust file",
+            }
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs.clone(), ["/src".as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |mw, _| mw.workspace().clone())
+        .unwrap();
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    let panel = workspace.update_in(cx, ProjectPanel::new);
+    cx.run_until_parked();
+
+    let worktree_id = panel.update(cx, |panel, cx| {
+        panel
+            .project
+            .read(cx)
+            .worktrees(cx)
+            .next()
+            .unwrap()
+            .read(cx)
+            .id()
+    });
+
+    // Simulate a reveal that got queued for an entry that has since been
+    // deleted from the project (e.g. the file was removed before the fold
+    // state describing its chain caught up).
+    panel.update_in(cx, |panel, window, cx| {
+        panel.pending_folded_reveal = Some(SelectedEntry {
+            worktree_id,
+            entry_id: ProjectEntryId::from_usize(999_999),
+        });
+        panel.pending_folded_reveal_attempts = 2;
+        panel.update_visible_entries(None, false, false, window, cx);
+    });
+    cx.run_until_parked();
+
+    panel.update(cx, |panel, _| {
+        assert_eq!(
+            panel.pending_folded_reveal, None,
+            "a reveal target that no longer exists in the project must be dropped, not requeued"
+        );
+        assert_eq!(panel.pending_folded_reveal_attempts, 0);
+    });
+}
+
+#[gpui::test]
+async fn test_manual_selection_cancels_pending_folded_reveal(cx: &mut gpui::TestAppContext) {
+    init_test_with_editor(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/src",
+        json!({
+            "first.rs": "// First Rust file",
+            "second.rs": "// Second Rust file",
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs.clone(), ["/src".as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |mw, _| mw.workspace().clone())
+        .unwrap();
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    let panel = workspace.update_in(cx, ProjectPanel::new);
+    cx.run_until_parked();
+
+    let worktree_id = panel.update(cx, |panel, cx| {
+        panel
+            .project
+            .read(cx)
+            .worktrees(cx)
+            .next()
+            .unwrap()
+            .read(cx)
+            .id()
+    });
+    let first_entry = find_project_entry(&panel, "src/first.rs", cx).unwrap();
+
+    panel.update_in(cx, |panel, window, cx| {
+        panel.pending_folded_reveal = Some(SelectedEntry {
+            worktree_id,
+            entry_id: first_entry,
+        });
+        panel.select_next(&SelectNext, window, cx);
+    });
+
+    panel.update(cx, |panel, _| {
+        assert_eq!(
+            panel.pending_folded_reveal, None,
+            "an explicit user selection must cancel an outstanding folded reveal"
+        );
+    });
+}
+
+#[gpui::test]
 async fn test_basic_file_deletion_scenarios(cx: &mut gpui::TestAppContext) {
     init_test_with_editor(cx);
 

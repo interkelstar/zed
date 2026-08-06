@@ -129,6 +129,10 @@ impl PickerDelegate for BreadcrumbSymbolDelegate {
         PickerEditorPosition::End
     }
 
+    fn extra_key_context(&self) -> Option<&'static str> {
+        Some("BreadcrumbPicker")
+    }
+
     fn update_matches(
         &mut self,
         query: String,

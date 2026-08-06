@@ -357,6 +357,9 @@ pub trait Item: Focusable + EventEmitter<Self::Event> + Render + Sized {
         None
     }
 
+    /// Clears any pending breadcrumb popover reanchor state when losing toolbar focus.
+    fn breadcrumb_cancel_reanchor(&mut self, _cx: &mut Context<Self>) {}
+
     fn added_to_workspace(
         &mut self,
         _workspace: &mut Workspace,
@@ -565,6 +568,7 @@ pub trait ItemHandle: 'static + Send {
     fn breadcrumb_location(&self, cx: &App) -> ToolbarItemLocation;
     fn breadcrumbs(&self, cx: &App) -> Option<(Vec<HighlightedText>, Option<Font>)>;
     fn breadcrumb_prefix(&self, window: &mut Window, cx: &mut App) -> Option<gpui::AnyElement>;
+    fn breadcrumb_cancel_reanchor(&self, cx: &mut App);
     fn show_toolbar(&self, cx: &App) -> bool;
     fn pixel_position_of_cursor(&self, cx: &App) -> Option<Point<Pixels>>;
     fn downgrade_item(&self) -> Box<dyn WeakItemHandle>;
@@ -1125,6 +1129,10 @@ impl<T: Item> ItemHandle for Entity<T> {
 
     fn breadcrumb_prefix(&self, window: &mut Window, cx: &mut App) -> Option<gpui::AnyElement> {
         self.update(cx, |item, cx| item.breadcrumb_prefix(window, cx))
+    }
+
+    fn breadcrumb_cancel_reanchor(&self, cx: &mut App) {
+        self.update(cx, |item, cx| item.breadcrumb_cancel_reanchor(cx))
     }
 
     fn show_toolbar(&self, cx: &App) -> bool {
