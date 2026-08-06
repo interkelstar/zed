@@ -677,6 +677,12 @@ pub fn render_breadcrumb_text(
                         .and_then(|navigation| navigation.active_item.as_ref())
                         .map(|item| editor_ref.breadcrumb_symbol_trail(buffer_id, item, cx))
                         .unwrap_or_default();
+                    // The incoming labels carry the cursor's symbol trail; navigation replaces it.
+                    segments.truncate(file_segment_index + 1);
+                    segments.extend(trail.iter().map(|item| HighlightedText {
+                        text: item.text.clone(),
+                        highlights: item.highlight_ranges.clone(),
+                    }));
                     let last_index = trail.len().saturating_sub(1);
                     symbol_segments.extend(trail.into_iter().enumerate().map(|(index, item)| {
                         Some(BreadcrumbSegmentTarget::Symbol {
