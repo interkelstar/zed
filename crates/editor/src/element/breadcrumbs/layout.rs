@@ -134,12 +134,13 @@ fn breadcrumb_layout_plan_from_dropped(dropped: &[bool]) -> BreadcrumbLayoutPlan
     BreadcrumbLayoutPlan { visible, ellipses }
 }
 
-/// Drops segments cheapest first (`Middle`, `Root`, `File`, `Symbol`); the last segment is never a candidate, so the bar never empties.
+/// Drops segments cheapest first (`Middle`, `Root`, `File`, `Symbol`); the last one and `anchored_index` never drop.
 pub(crate) fn plan_breadcrumb_layout(
     widths: &[Pixels],
     kinds: &[BreadcrumbSegmentKind],
     ellipsis_width: Pixels,
     available_width: Pixels,
+    anchored_index: Option<usize>,
 ) -> BreadcrumbLayoutPlan {
     debug_assert_eq!(widths.len(), kinds.len());
     let segment_count = widths.len();
@@ -167,8 +168,10 @@ pub(crate) fn plan_breadcrumb_layout(
             kinds
                 .iter()
                 .enumerate()
-                .filter(|(index, segment_kind)| *index != last_index && **segment_kind == kind)
-                .map(|(index, _)| index),
+                .filter_map(|(index, segment_kind)| {
+                    (index != last_index && Some(index) != anchored_index && *segment_kind == kind)
+                        .then_some(index)
+                }),
         );
     }
 
@@ -320,7 +323,7 @@ mod tests {
         let (widths, kinds) = sample_breadcrumb_widths_and_kinds();
         let total: Pixels = widths.iter().fold(Pixels::ZERO, |sum, w| sum + *w);
 
-        let plan = plan_breadcrumb_layout(&widths, &kinds, px(20.), total);
+        let plan = plan_breadcrumb_layout(&widths, &kinds, px(20.), total, None);
 
         assert_eq!(plan.visible, (0..widths.len()).collect::<Vec<_>>());
         assert!(plan.ellipses.is_empty());
@@ -330,19 +333,19 @@ mod tests {
     fn test_plan_breadcrumb_layout_drops_middle_before_root_before_file_before_outer_symbols() {
         let (widths, kinds) = sample_breadcrumb_widths_and_kinds();
 
-        let plan = plan_breadcrumb_layout(&widths, &kinds, px(20.), px(380.));
+        let plan = plan_breadcrumb_layout(&widths, &kinds, px(20.), px(380.), None);
         assert_eq!(plan.visible, vec![0, 5, 6, 7]);
         assert_eq!(plan.ellipses, vec![1..5]);
 
-        let plan = plan_breadcrumb_layout(&widths, &kinds, px(20.), px(340.));
+        let plan = plan_breadcrumb_layout(&widths, &kinds, px(20.), px(340.), None);
         assert_eq!(plan.visible, vec![5, 6, 7]);
         assert_eq!(plan.ellipses, vec![0..5]);
 
-        let plan = plan_breadcrumb_layout(&widths, &kinds, px(20.), px(230.));
+        let plan = plan_breadcrumb_layout(&widths, &kinds, px(20.), px(230.), None);
         assert_eq!(plan.visible, vec![6, 7]);
         assert_eq!(plan.ellipses, vec![0..6]);
 
-        let plan = plan_breadcrumb_layout(&widths, &kinds, px(20.), px(140.));
+        let plan = plan_breadcrumb_layout(&widths, &kinds, px(20.), px(140.), None);
         assert_eq!(plan.visible, vec![7]);
         assert_eq!(plan.ellipses, vec![0..7]);
     }
@@ -351,23 +354,44 @@ mod tests {
     fn test_plan_breadcrumb_layout_degenerate_case_always_keeps_the_last_segment() {
         let (widths, kinds) = sample_breadcrumb_widths_and_kinds();
 
-        let plan = plan_breadcrumb_layout(&widths, &kinds, px(20.), px(1.));
+        let plan = plan_breadcrumb_layout(&widths, &kinds, px(20.), px(1.), None);
         assert_eq!(plan.visible, vec![7]);
         assert_eq!(plan.ellipses, vec![0..7]);
     }
 
     #[test]
     fn test_plan_breadcrumb_layout_single_segment_never_collapses() {
-        let plan =
-            plan_breadcrumb_layout(&[px(500.)], &[BreadcrumbSegmentKind::File], px(20.), px(1.));
+        let plan = plan_breadcrumb_layout(
+            &[px(500.)],
+            &[BreadcrumbSegmentKind::File],
+            px(20.),
+            px(1.),
+            None,
+        );
         assert_eq!(plan.visible, vec![0]);
         assert!(plan.ellipses.is_empty());
     }
 
     #[test]
     fn test_plan_breadcrumb_layout_empty_input() {
-        let plan = plan_breadcrumb_layout(&[], &[], px(20.), px(500.));
+        let plan = plan_breadcrumb_layout(&[], &[], px(20.), px(500.), None);
         assert!(plan.visible.is_empty());
         assert!(plan.ellipses.is_empty());
+    }
+
+    #[test]
+    fn test_plan_breadcrumb_layout_keeps_the_anchored_middle_segment() {
+        use BreadcrumbSegmentKind::*;
+        let widths = vec![px(50.), px(40.), px(40.), px(40.), px(60.)];
+        let kinds = vec![Root, Middle, Middle, Middle, File];
+
+        let plan = plan_breadcrumb_layout(&widths, &kinds, px(20.), px(140.), Some(2));
+
+        assert_eq!(
+            plan.visible,
+            vec![2, 4],
+            "the anchored middle segment survives while its neighbours collapse"
+        );
+        assert_eq!(plan.ellipses, vec![0..2, 3..4]);
     }
 }

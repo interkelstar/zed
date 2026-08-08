@@ -1,4 +1,5 @@
 use std::ops::Range;
+use std::rc::Rc;
 
 use collections::HashMap;
 use futures::FutureExt;
@@ -31,8 +32,8 @@ pub(crate) struct BreadcrumbOutline {
 pub(crate) struct ConvertedBreadcrumbOutline {
     buffer_id: BufferId,
     version: clock::Global,
-    items: Vec<OutlineItem<Anchor>>,
-    depths: Vec<usize>,
+    items: Rc<Vec<OutlineItem<Anchor>>>,
+    depths: Rc<Vec<usize>>,
 }
 
 impl Editor {
@@ -128,11 +129,7 @@ impl Editor {
         Some((buffer.remote_id(), symbols))
     }
 
-    pub(crate) fn prefetch_breadcrumb_outline(
-        &mut self,
-        buffer_id: BufferId,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn prefetch_breadcrumb_outline(&mut self, buffer_id: BufferId, cx: &mut Context<Self>) {
         let Some(buffer) = self.buffer.read(cx).buffer(buffer_id) else {
             return;
         };
@@ -160,12 +157,23 @@ impl Editor {
         });
     }
 
+    /// Whether an outline is cached for `buffer_id`: "not fetched yet" versus "genuinely empty".
+    pub fn breadcrumb_outline_ready(&self, buffer_id: BufferId, cx: &App) -> bool {
+        let Some(buffer) = self.buffer.read(cx).buffer(buffer_id) else {
+            return false;
+        };
+        let version = buffer.read(cx).version();
+        self.breadcrumb_outline
+            .as_ref()
+            .is_some_and(|outline| outline.buffer_id == buffer_id && outline.version == version)
+    }
+
     /// Converted outline items and their depths, cached by buffer id/version.
     fn breadcrumb_converted_outline(
         &self,
         buffer_id: BufferId,
         cx: &App,
-    ) -> Option<(Vec<OutlineItem<Anchor>>, Vec<usize>)> {
+    ) -> Option<(Rc<Vec<OutlineItem<Anchor>>>, Rc<Vec<usize>>)> {
         let outline = self
             .breadcrumb_outline
             .as_ref()
@@ -189,6 +197,8 @@ impl Editor {
             .filter_map(|item| text_outline_item_to_multibuffer(item, &multi_buffer_snapshot))
             .collect::<Vec<_>>();
         let depths = items.iter().map(|item| item.depth).collect::<Vec<_>>();
+        let items = Rc::new(items);
+        let depths = Rc::new(depths);
 
         *self.breadcrumb_converted_outline_cache.borrow_mut() = Some(ConvertedBreadcrumbOutline {
             buffer_id: outline.buffer_id,
@@ -948,29 +958,24 @@ mod tests {
 
         let mut cx = EditorLspTestContext::new_rust(lsp::ServerCapabilities::default(), cx).await;
         cx.set_state("fn maˇin() {\n    let x = 1;\n}\n");
-        cx.run_until_parked();
 
+        // The cursor placement above already kicked off a prefetch, still in flight here.
         let buffer_id = cx.update_editor(|editor, _window, cx| {
-            editor
+            let buffer_id = editor
                 .buffer()
                 .read(cx)
                 .as_singleton()
                 .unwrap()
                 .read(cx)
-                .remote_id()
-        });
-
-        cx.update_editor(|editor, _window, cx| {
+                .remote_id();
             let menu_items = editor.breadcrumb_symbol_menu_items(buffer_id, None, cx);
             assert!(
                 menu_items.is_empty(),
-                "Without a prefetched outline the dropdown must stay empty rather than computing one"
+                "the cursor-driven prefetch is still in flight"
             );
+            buffer_id
         });
 
-        cx.update_editor(|editor, _window, cx| {
-            editor.prefetch_breadcrumb_outline(buffer_id, cx);
-        });
         cx.run_until_parked();
 
         cx.update_editor(|editor, _window, cx| {

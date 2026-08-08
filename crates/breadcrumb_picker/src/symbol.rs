@@ -45,6 +45,7 @@ pub struct BreadcrumbSymbolDelegate {
     target: Option<OutlineItem<Anchor>>,
     items: Vec<OutlineItem<Anchor>>,
     matches: Vec<StringMatch>,
+    query: String,
     selected_index: usize,
     current_range: Option<Range<Anchor>>,
     parent_dir: Option<(WorktreeId, Arc<RelPath>)>,
@@ -74,6 +75,7 @@ impl BreadcrumbSymbolDelegate {
                 target,
                 items,
                 matches: Vec::new(),
+                query: String::new(),
                 selected_index,
                 current_range,
                 parent_dir,
@@ -139,6 +141,7 @@ impl PickerDelegate for BreadcrumbSymbolDelegate {
         _window: &mut Window,
         cx: &mut Context<BreadcrumbSymbolPicker>,
     ) -> Task<()> {
+        self.query = query.clone();
         let candidates = self
             .items
             .iter()
@@ -213,6 +216,9 @@ impl PickerDelegate for BreadcrumbSymbolDelegate {
         window: &mut Window,
         cx: &mut Context<BreadcrumbSymbolPicker>,
     ) -> Option<String> {
+        if !self.query.is_empty() {
+            return None;
+        }
         let selected = self.item_at(self.selected_index)?.clone();
         let editor = self.editor.upgrade()?;
         let children =
@@ -234,6 +240,9 @@ impl PickerDelegate for BreadcrumbSymbolDelegate {
         window: &mut Window,
         cx: &mut Context<BreadcrumbSymbolPicker>,
     ) -> Option<String> {
+        if !self.query.is_empty() {
+            return None;
+        }
         let editor = self.editor.upgrade()?;
         if let Some(target) = self.target.clone() {
             let parent = editor
@@ -295,6 +304,30 @@ impl PickerDelegate for BreadcrumbSymbolDelegate {
     }
 }
 
+/// Decided once so the same click never flips between an empty popover and the outline modal.
+enum BreadcrumbSymbolMenuOutcome {
+    ShowPicker(Vec<OutlineItem<Anchor>>),
+    ShowOutlineModal,
+    OutlineNotReady,
+}
+
+fn breadcrumb_symbol_menu_outcome(
+    editor: &Editor,
+    buffer_id: BufferId,
+    target: Option<&OutlineItem<Anchor>>,
+    cx: &App,
+) -> BreadcrumbSymbolMenuOutcome {
+    let menu_items = editor.breadcrumb_symbol_menu_items(buffer_id, target, cx);
+    if !menu_items.is_empty() {
+        return BreadcrumbSymbolMenuOutcome::ShowPicker(menu_items);
+    }
+    if editor.breadcrumb_outline_ready(buffer_id, cx) {
+        BreadcrumbSymbolMenuOutcome::ShowOutlineModal
+    } else {
+        BreadcrumbSymbolMenuOutcome::OutlineNotReady
+    }
+}
+
 pub(crate) fn render_breadcrumb_symbol_segment(
     editor: WeakEntity<Editor>,
     buffer_id: BufferId,
@@ -331,17 +364,27 @@ pub(crate) fn render_breadcrumb_symbol_segment(
     };
     menu.menu(move |window, cx| {
         let editor_entity = editor.upgrade()?;
-        let menu_items =
-            editor_entity
-                .read(cx)
-                .breadcrumb_symbol_menu_items(buffer_id, target.as_ref(), cx);
-        // Nothing to drill into: fall through to the outline picker instead of an empty popover.
-        if menu_items.is_empty() {
-            if let Some(callback) = zed_actions::outline::TOGGLE_OUTLINE.get() {
-                callback(editor_entity.to_any_view(), window, cx);
+        let menu_items = match breadcrumb_symbol_menu_outcome(
+            editor_entity.read(cx),
+            buffer_id,
+            target.as_ref(),
+            cx,
+        ) {
+            BreadcrumbSymbolMenuOutcome::ShowPicker(menu_items) => menu_items,
+            BreadcrumbSymbolMenuOutcome::OutlineNotReady => {
+                // Kick the fetch and let the next click land on a settled UI.
+                editor_entity.update(cx, |editor, cx| {
+                    editor.prefetch_breadcrumb_outline(buffer_id, cx);
+                });
+                return None;
             }
-            return None;
-        }
+            BreadcrumbSymbolMenuOutcome::ShowOutlineModal => {
+                if let Some(callback) = zed_actions::outline::TOGGLE_OUTLINE.get() {
+                    callback(editor_entity.to_any_view(), window, cx);
+                }
+                return None;
+            }
+        };
 
         editor_entity.update(cx, |editor, cx| {
             editor.open_breadcrumb_symbol_navigation(buffer_id, target.clone(), cx);
@@ -722,6 +765,116 @@ mod tests {
         );
         editor.read_with(cx, |editor, _| {
             assert!(editor.breadcrumb_symbol_navigation().is_none());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_select_parent_and_child_do_not_drill_with_a_query(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let (editor_window, editor) = build_test_editor(cx);
+        let cx = &mut VisualTestContext::from_window(*editor_window, cx);
+
+        let snapshot = editor.read_with(cx, |editor, cx| editor.buffer().read(cx).snapshot(cx));
+        let target = test_item(&snapshot, 0, "alpha");
+        let buffer_id = BufferId::new(1).unwrap();
+
+        let picker = editor_window
+            .update(cx, |_, window, cx| {
+                BreadcrumbSymbolDelegate::picker(
+                    editor.downgrade(),
+                    buffer_id,
+                    Some(target),
+                    vec![test_item(&snapshot, 0, "alpha")],
+                    None,
+                    None,
+                    window,
+                    cx,
+                )
+            })
+            .unwrap();
+
+        picker
+            .update_in(cx, |picker, window, cx| {
+                picker
+                    .delegate
+                    .update_matches("alpha".to_string(), window, cx)
+            })
+            .await;
+
+        let parent_result = picker.update_in(cx, |picker, window, cx| {
+            picker.delegate.select_parent(window, cx)
+        });
+        assert!(
+            parent_result.is_none(),
+            "a non-empty query leaves left for the query editor's caret, even with a target set"
+        );
+
+        let child_result = picker.update_in(cx, |picker, window, cx| {
+            picker.delegate.select_child(window, cx)
+        });
+        assert!(
+            child_result.is_none(),
+            "a non-empty query leaves right for the query editor's caret"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_breadcrumb_symbol_menu_outcome_is_not_ready_before_prefetch(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let (editor_window, editor) = build_test_editor(cx);
+        let cx = &mut VisualTestContext::from_window(*editor_window, cx);
+        let buffer_id = editor.read_with(cx, |editor, cx| {
+            editor
+                .buffer()
+                .read(cx)
+                .as_singleton()
+                .unwrap()
+                .read(cx)
+                .remote_id()
+        });
+
+        editor.read_with(cx, |editor, cx| {
+            let outcome = breadcrumb_symbol_menu_outcome(editor, buffer_id, None, cx);
+            assert!(
+                matches!(outcome, BreadcrumbSymbolMenuOutcome::OutlineNotReady),
+                "the outline has not been fetched yet, so neither the picker nor the modal is correct"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_breadcrumb_symbol_menu_outcome_falls_back_to_modal_when_genuinely_empty(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let (editor_window, editor) = build_test_editor(cx);
+        let cx = &mut VisualTestContext::from_window(*editor_window, cx);
+        let buffer_id = editor.read_with(cx, |editor, cx| {
+            editor
+                .buffer()
+                .read(cx)
+                .as_singleton()
+                .unwrap()
+                .read(cx)
+                .remote_id()
+        });
+
+        editor.update(cx, |editor, cx| {
+            editor.prefetch_breadcrumb_outline(buffer_id, cx);
+        });
+        cx.run_until_parked();
+
+        editor.read_with(cx, |editor, cx| {
+            let outcome = breadcrumb_symbol_menu_outcome(editor, buffer_id, None, cx);
+            assert!(
+                matches!(outcome, BreadcrumbSymbolMenuOutcome::ShowOutlineModal),
+                "a loaded outline with no items must fall back to the outline modal"
+            );
         });
     }
 }

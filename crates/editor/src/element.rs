@@ -57,10 +57,9 @@ use gpui::{
     Element, ElementInputHandler, Entity, Focusable as _, Font, FontId, FontWeight,
     GlobalElementId, Hitbox, HitboxBehavior, Hsla, InteractiveElement, IntoElement, IsZero,
     ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
-    ParentElement, Pixels, ScrollHandle, ShapedLine, SharedString, Size,
-    StatefulInteractiveElement, Style, Styled, StyledText, TaskExt, TextAlign, TextRun,
-    TextStyleRefinement, WeakEntity, Window, div, fill, outline, pattern_slash, point, px, quad,
-    relative, size, solid_background, transparent_black,
+    ParentElement, Pixels, ScrollHandle, ShapedLine, SharedString, Size, Style, Styled, StyledText,
+    TaskExt, TextAlign, TextRun, TextStyleRefinement, WeakEntity, Window, div, fill, outline,
+    pattern_slash, point, px, quad, relative, size, solid_background, transparent_black,
 };
 use itertools::Itertools;
 use language::{

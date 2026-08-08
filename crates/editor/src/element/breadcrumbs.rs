@@ -359,6 +359,52 @@ impl BreadcrumbsRow {
         let content = Label::new("⋯").color(Color::Placeholder).into_any_element();
         self.with_separator(position, last_position, content, false, cx)
     }
+
+    /// The segment a popover is currently open under, if any: `plan_breadcrumb_layout` must never collapse it.
+    fn anchored_segment_index(&self) -> Option<usize> {
+        self.segments.iter().position(|segment| {
+            matches!(
+                segment.target,
+                Some(BreadcrumbSegmentTarget::Directory {
+                    is_active_segment: true,
+                    ..
+                }) | Some(BreadcrumbSegmentTarget::Symbol {
+                    is_active_segment: true,
+                    ..
+                })
+            )
+        })
+    }
+}
+
+/// Called when the layout drops the anchored segment: otherwise the popover stays deployed with no trigger left to dismiss it.
+fn dismiss_orphaned_breadcrumb_popover(
+    editor: &Entity<Editor>,
+    target: &BreadcrumbSegmentTarget,
+    cx: &mut App,
+) {
+    match target {
+        BreadcrumbSegmentTarget::Directory {
+            worktree_id, path, ..
+        } => {
+            if let Some(handle) = editor.read(cx).breadcrumb_popover_handle() {
+                handle.hide(cx);
+            }
+            editor.update(cx, |editor, cx| {
+                editor.clear_breadcrumb_navigation(*worktree_id, path, cx);
+            });
+        }
+        BreadcrumbSegmentTarget::Symbol {
+            buffer_id, item, ..
+        } => {
+            if let Some(handle) = editor.read(cx).breadcrumb_symbol_popover_handle() {
+                handle.hide(cx);
+            }
+            editor.update(cx, |editor, cx| {
+                editor.clear_breadcrumb_symbol_navigation(*buffer_id, item.as_ref(), cx);
+            });
+        }
+    }
 }
 
 struct BreadcrumbsRowPrepaintState {
@@ -402,6 +448,7 @@ impl gpui::Element for BreadcrumbsRow {
         let widths = metrics.widths.clone();
         let ellipsis_width = metrics.ellipsis_width;
         let kinds: Vec<BreadcrumbSegmentKind> = self.segments.iter().map(|s| s.kind).collect();
+        let anchored_index = self.anchored_segment_index();
 
         // Answering `MinContent` with the whole trail would stop the parent offering less.
         let mut style = Style::default();
@@ -419,6 +466,7 @@ impl gpui::Element for BreadcrumbsRow {
                                 &kinds,
                                 ellipsis_width,
                                 available_width,
+                                anchored_index,
                             );
                             breadcrumb_layout_plan_width(&widths, &plan, ellipsis_width)
                         }
@@ -447,12 +495,25 @@ impl gpui::Element for BreadcrumbsRow {
         cx: &mut App,
     ) -> Self::PrepaintState {
         let kinds: Vec<BreadcrumbSegmentKind> = self.segments.iter().map(|s| s.kind).collect();
+        let anchored_index = self.anchored_segment_index();
         let plan = plan_breadcrumb_layout(
             &metrics.widths,
             &kinds,
             metrics.ellipsis_width,
             bounds.size.width,
+            anchored_index,
         );
+
+        if let Some(anchored_index) = anchored_index
+            && !plan.visible.contains(&anchored_index)
+            && let Some(target) = self
+                .segments
+                .get(anchored_index)
+                .and_then(|segment| segment.target.clone())
+            && let Some(editor) = self.editor.as_ref().and_then(WeakEntity::upgrade)
+        {
+            dismiss_orphaned_breadcrumb_popover(&editor, &target, cx);
+        }
 
         enum FinalItem {
             Segment(usize),
@@ -538,7 +599,6 @@ pub fn render_breadcrumb_text(
     let mut symbol_segments: Vec<Option<BreadcrumbSegmentTarget>> = Vec::new();
     let mut file_segment_index = 0usize;
     let mut has_root_segment = false;
-    let mut outline_buffer_id = None;
     let mut file_path_for_icon: Option<Arc<RelPath>> = None;
     let mut file_status = None;
     let mut diagnostic_severity = None;
@@ -549,7 +609,6 @@ pub fn render_breadcrumb_text(
         let editor_ref = editor_entity.read(cx);
         if let Some(buffer) = editor_ref.buffer().read(cx).as_singleton() {
             let buffer_id = buffer.read(cx).remote_id();
-            outline_buffer_id = Some(buffer_id);
             let mut path_split = false;
 
             let real_project_path = active_item.project_path(cx);
@@ -786,18 +845,6 @@ pub fn render_breadcrumb_text(
     match editor {
         Some(editor) => element
             .id("breadcrumb_container")
-            .when_some(outline_buffer_id, |this, buffer_id| {
-                let editor = editor.clone();
-                this.on_hover(move |hovered, _, cx| {
-                    if *hovered {
-                        editor
-                            .update(cx, |editor, cx| {
-                                editor.prefetch_breadcrumb_outline(buffer_id, cx)
-                            })
-                            .ok();
-                    }
-                })
-            })
             // Not a `ButtonLike`: it renders `flex_none` and would never shrink.
             .child(
                 h_flex()
@@ -989,5 +1036,46 @@ mod tests {
             "color must fall through to the base run's"
         );
         assert_eq!(highlight.font_weight, Some(FontWeight::BOLD));
+    }
+
+    /// `editor` cannot depend on `breadcrumb_picker` for a real popover handle, so this covers
+    /// only the navigation-state half of `dismiss_orphaned_breadcrumb_popover`.
+    #[gpui::test]
+    fn test_dismiss_orphaned_breadcrumb_popover_clears_directory_navigation(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        crate::editor_tests::init_test(cx, |_| {});
+
+        let buffer = cx.new(|cx| language::Buffer::local("fn main() {}", cx));
+        let buffer = cx.new(|cx| multi_buffer::MultiBuffer::singleton(buffer, cx));
+        let editor_window =
+            cx.add_window(|window, cx| crate::test::build_editor(buffer, window, cx));
+        let editor = editor_window.root(cx).unwrap();
+        let worktree_id = WorktreeId::from_usize(0);
+        let path = RelPath::empty().into_arc();
+
+        editor.update(cx, |editor, cx| {
+            editor.open_breadcrumb_navigation(worktree_id, path.clone(), cx);
+        });
+        editor.read_with(cx, |editor, _| {
+            assert!(editor.breadcrumb_navigation().is_some());
+        });
+
+        let target = BreadcrumbSegmentTarget::Directory {
+            worktree_id,
+            path: path.clone(),
+            active_path: None,
+            is_active_segment: true,
+        };
+        cx.update(|cx| {
+            dismiss_orphaned_breadcrumb_popover(&editor, &target, cx);
+        });
+
+        editor.read_with(cx, |editor, _| {
+            assert!(
+                editor.breadcrumb_navigation().is_none(),
+                "a segment the layout could not keep must drop its navigation session"
+            );
+        });
     }
 }

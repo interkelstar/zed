@@ -111,6 +111,7 @@ pub struct BreadcrumbDirectoryDelegate {
     active_path: Option<Arc<RelPath>>,
     entries: Vec<BreadcrumbDirectoryEntry>,
     matches: Vec<StringMatch>,
+    query: String,
     selected_index: usize,
     /// Whether any row draws an icon; reserving the column for none would indent the list.
     show_icons: bool,
@@ -147,7 +148,7 @@ impl BreadcrumbDirectoryDelegate {
         cx: &mut App,
     ) -> Entity<BreadcrumbDirectoryPicker> {
         cx.new(|cx| {
-            let delegate = Self {
+            let mut delegate = Self {
                 editor,
                 workspace,
                 worktree_id,
@@ -155,16 +156,18 @@ impl BreadcrumbDirectoryDelegate {
                 active_path,
                 entries: Vec::new(),
                 matches: Vec::new(),
+                query: String::new(),
                 selected_index: 0,
                 show_icons: false,
                 _expand_task: gpui::Task::ready(()),
             };
+            // `Picker::uniform_list` below runs an initial `update_matches("")`, which now only filters.
+            delegate.reload_entries(cx);
             let mut picker = Picker::uniform_list(delegate, window, cx)
                 .popover()
                 .show_scrollbar(true)
                 // Narrower than the picker default, which is sized for modals.
                 .initial_width(rems(15.));
-            picker.delegate.reload_entries(cx);
             picker.delegate.expand_current_path(window, cx);
             picker.delegate.select_active_path();
             picker
@@ -184,9 +187,12 @@ impl BreadcrumbDirectoryDelegate {
     fn reload_entries(&mut self, cx: &App) {
         let (Some(project), Some(worktree)) = (self.project(cx), self.worktree(cx)) else {
             self.entries = Vec::new();
+            self.matches.clear();
             return;
         };
         self.entries = breadcrumb_directory_entries(&project, &worktree, &self.current_path, cx);
+        // `matches` holds candidate_id/positions into the entries just replaced above.
+        self.matches.clear();
 
         let settings = BreadcrumbDirectoryListingSettings::get_global(cx);
         self.show_icons = self.entries.iter().any(|entry| {
@@ -235,7 +241,10 @@ impl BreadcrumbDirectoryDelegate {
         self._expand_task = cx.spawn_in(window, async move |picker, cx| {
             expand.await.log_err();
             picker
-                .update_in(cx, |picker, window, cx| picker.refresh(window, cx))
+                .update_in(cx, |picker, window, cx| {
+                    picker.delegate.reload_entries(cx);
+                    picker.refresh(window, cx);
+                })
                 .ok();
         });
     }
@@ -296,8 +305,7 @@ impl PickerDelegate for BreadcrumbDirectoryDelegate {
         _window: &mut Window,
         cx: &mut Context<BreadcrumbDirectoryPicker>,
     ) -> Task<()> {
-        // Re-read rather than filtered: a pending scan or edit elsewhere may change this listing.
-        self.reload_entries(cx);
+        self.query = query.clone();
         let candidates = self
             .entries
             .iter()
@@ -400,6 +408,9 @@ impl PickerDelegate for BreadcrumbDirectoryDelegate {
         window: &mut Window,
         cx: &mut Context<BreadcrumbDirectoryPicker>,
     ) -> Option<String> {
+        if !self.query.is_empty() {
+            return None;
+        }
         if self.entry_at(self.selected_index)?.is_dir {
             self.confirm(false, window, cx);
             return Some(String::new());
@@ -412,6 +423,9 @@ impl PickerDelegate for BreadcrumbDirectoryDelegate {
         window: &mut Window,
         cx: &mut Context<BreadcrumbDirectoryPicker>,
     ) -> Option<String> {
+        if !self.query.is_empty() {
+            return None;
+        }
         let parent = self.current_path.parent()?.into_arc();
         if let Some(editor) = self.editor.upgrade() {
             editor.update(cx, |editor, cx| {
@@ -1324,6 +1338,235 @@ mod tests {
                     .as_unix_str(),
                 "a",
                 "with auto_fold_dirs off, confirm must land on the chosen directory itself"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_select_parent_and_child_only_drill_with_an_empty_query(cx: &mut TestAppContext) {
+        use editor::MultiBuffer;
+        use editor::test::build_editor;
+        use project::{FakeFs, Project};
+        use serde_json::json;
+        use util::path;
+
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                "alpha": { "beta": { "child.txt": "" }, "one.txt": "" },
+            }),
+        )
+        .await;
+        let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+        let worktree_id = project.update(cx, |project, cx| {
+            project.worktrees(cx).next().unwrap().read(cx).id()
+        });
+
+        let workspace_window =
+            cx.add_window(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let workspace = workspace_window.root(cx).unwrap();
+
+        let buffer = cx.new(|cx| language::Buffer::local("", cx));
+        let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+        let editor_window = cx.add_window(|window, cx| build_editor(buffer, window, cx));
+        let editor = editor_window.root(cx).unwrap();
+        let cx = &mut VisualTestContext::from_window(*editor_window, cx);
+
+        let picker = editor_window
+            .update(cx, |_, window, cx| {
+                BreadcrumbDirectoryDelegate::picker(
+                    editor.downgrade(),
+                    workspace.downgrade(),
+                    worktree_id,
+                    util::rel_path::rel_path("alpha").into_arc(),
+                    None,
+                    window,
+                    cx,
+                )
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        picker.read_with(cx, |picker, _| {
+            assert_eq!(
+                picker.delegate.entry_at(0).map(|entry| entry.name.as_ref()),
+                Some("beta"),
+                "directories sort before files"
+            );
+        });
+
+        picker.update_in(cx, |picker, window, cx| {
+            assert!(
+                picker.delegate.select_child(window, cx).is_some(),
+                "an empty query lets right drill into the selected directory"
+            );
+        });
+        editor.read_with(cx, |editor, _| {
+            assert!(editor.breadcrumb_navigation().is_some());
+        });
+
+        picker
+            .update_in(cx, |picker, window, cx| {
+                picker
+                    .delegate
+                    .update_matches("beta".to_string(), window, cx)
+            })
+            .await;
+
+        picker.update_in(cx, |picker, window, cx| {
+            assert!(
+                picker.delegate.select_child(window, cx).is_none(),
+                "a non-empty query leaves right for the query editor's caret"
+            );
+            assert!(
+                picker.delegate.select_parent(window, cx).is_none(),
+                "a non-empty query leaves left for the query editor's caret"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_update_matches_does_not_relist_entries(cx: &mut TestAppContext) {
+        use editor::MultiBuffer;
+        use editor::test::build_editor;
+        use project::{FakeFs, Project};
+        use serde_json::json;
+        use util::path;
+
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                "alpha": { "one.txt": "" },
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        let worktree_id = project.update(cx, |project, cx| {
+            project.worktrees(cx).next().unwrap().read(cx).id()
+        });
+
+        let workspace_window =
+            cx.add_window(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let workspace = workspace_window.root(cx).unwrap();
+
+        let buffer = cx.new(|cx| language::Buffer::local("", cx));
+        let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+        let editor_window = cx.add_window(|window, cx| build_editor(buffer, window, cx));
+        let editor = editor_window.root(cx).unwrap();
+        let cx = &mut VisualTestContext::from_window(*editor_window, cx);
+
+        let picker = editor_window
+            .update(cx, |_, window, cx| {
+                BreadcrumbDirectoryDelegate::picker(
+                    editor.downgrade(),
+                    workspace.downgrade(),
+                    worktree_id,
+                    util::rel_path::rel_path("alpha").into_arc(),
+                    None,
+                    window,
+                    cx,
+                )
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        let entries_before = picker.read_with(cx, |picker, _| picker.delegate.entries.len());
+        assert_eq!(entries_before, 1, "just one.txt at the start");
+
+        fs.insert_file(path!("/root/alpha/two.txt"), Default::default())
+            .await;
+        cx.run_until_parked();
+
+        picker
+            .update_in(cx, |picker, window, cx| {
+                picker
+                    .delegate
+                    .update_matches("one".to_string(), window, cx)
+            })
+            .await;
+
+        picker.read_with(cx, |picker, _| {
+            assert_eq!(
+                picker.delegate.entries.len(),
+                entries_before,
+                "a keystroke must filter the cached listing rather than rescan the directory"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_reload_entries_clears_stale_matches(cx: &mut TestAppContext) {
+        use editor::MultiBuffer;
+        use editor::test::build_editor;
+        use project::{FakeFs, Project};
+        use serde_json::json;
+        use util::path;
+
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                "alpha": { "one.txt": "", "two.txt": "" },
+            }),
+        )
+        .await;
+        let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+        let worktree_id = project.update(cx, |project, cx| {
+            project.worktrees(cx).next().unwrap().read(cx).id()
+        });
+
+        let workspace_window =
+            cx.add_window(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let workspace = workspace_window.root(cx).unwrap();
+
+        let buffer = cx.new(|cx| language::Buffer::local("", cx));
+        let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+        let editor_window = cx.add_window(|window, cx| build_editor(buffer, window, cx));
+        let editor = editor_window.root(cx).unwrap();
+        let cx = &mut VisualTestContext::from_window(*editor_window, cx);
+
+        let picker = editor_window
+            .update(cx, |_, window, cx| {
+                BreadcrumbDirectoryDelegate::picker(
+                    editor.downgrade(),
+                    workspace.downgrade(),
+                    worktree_id,
+                    util::rel_path::rel_path("alpha").into_arc(),
+                    None,
+                    window,
+                    cx,
+                )
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        picker
+            .update_in(cx, |picker, window, cx| {
+                picker
+                    .delegate
+                    .update_matches("one".to_string(), window, cx)
+            })
+            .await;
+        picker.read_with(cx, |picker, _| {
+            assert_eq!(picker.delegate.matches.len(), 1, "query narrows to one.txt");
+        });
+
+        picker.update_in(cx, |picker, _window, cx| {
+            picker.delegate.reload_entries(cx);
+        });
+
+        picker.read_with(cx, |picker, _| {
+            assert!(
+                picker.delegate.matches.is_empty(),
+                "reload must drop matches whose candidate ids point into the entries just replaced"
             );
         });
     }

@@ -3773,11 +3773,17 @@ impl Editor {
 
     #[ztracing::instrument(skip_all)]
     fn refresh_outline_symbols_at_cursor(&mut self, cx: &mut Context<Editor>) {
+        let cursor = self.selections.newest_anchor().head();
+        let multi_buffer_snapshot = self.buffer().read(cx).snapshot(cx);
+
+        // Before the LSP gate below: the breadcrumb outline is wanted either way.
+        if let Some((_, buffer)) = multi_buffer_snapshot.anchor_to_buffer_anchor(cursor) {
+            self.prefetch_breadcrumb_outline(buffer.remote_id(), cx);
+        }
+
         if !self.lsp_data_enabled() {
             return;
         }
-        let cursor = self.selections.newest_anchor().head();
-        let multi_buffer_snapshot = self.buffer().read(cx).snapshot(cx);
 
         if self.uses_lsp_document_symbols(cursor, &multi_buffer_snapshot, cx) {
             self.outline_symbols_at_cursor =
@@ -9639,7 +9645,6 @@ impl Editor {
                 self.refresh_single_line_folds(window, cx);
                 let snapshot = self.snapshot(window, cx);
                 self.refresh_matching_bracket_highlights(&snapshot, cx);
-                self.refresh_outline_symbols_at_cursor(cx);
                 self.refresh_sticky_headers(&snapshot, cx);
                 if source.is_local() && self.has_active_edit_prediction() {
                     self.update_visible_edit_prediction(window, cx);
@@ -9663,6 +9668,9 @@ impl Editor {
                         );
                     }
                 }
+
+                // After `update_lsp_data`, or the outline prefetch caches an empty result.
+                self.refresh_outline_symbols_at_cursor(cx);
 
                 cx.emit(EditorEvent::BufferEdited);
                 cx.emit(SearchEvent::MatchesInvalidated);
