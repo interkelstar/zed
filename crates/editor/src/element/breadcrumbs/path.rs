@@ -1,5 +1,7 @@
 use super::*;
 
+use std::path::PathBuf;
+
 use language::DiagnosticSeverity;
 use project::{Project, ProjectPath};
 use settings::ShowDiagnostics;
@@ -63,6 +65,31 @@ pub(crate) fn breadcrumb_path_segments(
     }
 
     (labels, targets)
+}
+
+/// Pure by design: resolving the abs paths and symbol line against live state happens at the call site.
+pub(crate) fn breadcrumb_segment_copy_path(
+    target: &BreadcrumbSegmentTarget,
+    worktree_abs_path: Option<PathBuf>,
+    file_abs_path: Option<PathBuf>,
+    symbol_line: Option<u32>,
+) -> Option<String> {
+    match target {
+        BreadcrumbSegmentTarget::Directory { path, .. } => Some(
+            worktree_abs_path?
+                .join(path.as_std_path())
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        BreadcrumbSegmentTarget::Symbol { item: None, .. } => {
+            Some(file_abs_path?.to_string_lossy().into_owned())
+        }
+        BreadcrumbSegmentTarget::Symbol { item: Some(_), .. } => Some(format!(
+            "{}:{}",
+            file_abs_path?.to_string_lossy(),
+            symbol_line?
+        )),
+    }
 }
 
 /// Deliberately exposes no breadcrumb-specific overrides yet; the bar always follows the panel.
@@ -215,6 +242,81 @@ mod tests {
         assert!(breadcrumb_path_is_navigable(true, Some(false)));
 
         assert!(breadcrumb_path_is_navigable(true, None));
+    }
+
+    fn sample_symbol_outline_item() -> OutlineItem<Anchor> {
+        OutlineItem {
+            depth: 0,
+            range: Anchor::Min..Anchor::Max,
+            selection_range: Anchor::Min..Anchor::Max,
+            source_range_for_text: Anchor::Min..Anchor::Max,
+            text: "method".into(),
+            highlight_ranges: Vec::new(),
+            name_ranges: Vec::new(),
+            body_range: None,
+            annotation_range: None,
+        }
+    }
+
+    #[test]
+    fn test_breadcrumb_segment_copy_path_directory_joins_worktree_and_segment() {
+        use util::path;
+        use util::rel_path::rel_path;
+
+        let target = BreadcrumbSegmentTarget::Directory {
+            worktree_id: WorktreeId::from_usize(0),
+            path: rel_path("src/main").into_arc(),
+            active_path: None,
+            is_active_segment: false,
+        };
+
+        let copied =
+            breadcrumb_segment_copy_path(&target, Some(PathBuf::from(path!("/root"))), None, None);
+
+        assert_eq!(copied.as_deref(), Some(path!("/root/src/main")));
+    }
+
+    #[test]
+    fn test_breadcrumb_segment_copy_path_file_segment_is_the_file_abs_path() {
+        use util::path;
+
+        let target = BreadcrumbSegmentTarget::Symbol {
+            buffer_id: BufferId::new(1).unwrap(),
+            item: None,
+            is_active_segment: false,
+        };
+
+        let copied = breadcrumb_segment_copy_path(
+            &target,
+            None,
+            Some(PathBuf::from(path!("/root/src/main/Foo.kt"))),
+            None,
+        );
+
+        assert_eq!(copied.as_deref(), Some(path!("/root/src/main/Foo.kt")));
+    }
+
+    #[test]
+    fn test_breadcrumb_segment_copy_path_symbol_segment_appends_the_line() {
+        use util::path;
+
+        let target = BreadcrumbSegmentTarget::Symbol {
+            buffer_id: BufferId::new(1).unwrap(),
+            item: Some(sample_symbol_outline_item()),
+            is_active_segment: false,
+        };
+
+        let copied = breadcrumb_segment_copy_path(
+            &target,
+            None,
+            Some(PathBuf::from(path!("/root/src/main/Foo.kt"))),
+            Some(42),
+        );
+
+        assert_eq!(
+            copied,
+            Some(format!("{}:42", path!("/root/src/main/Foo.kt")))
+        );
     }
 
     #[test]

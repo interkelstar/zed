@@ -1139,6 +1139,7 @@ pub struct Editor {
     breadcrumb_reanchoring: bool,
     /// Waiting for the new active segment's `PopoverMenu` to register the shared handle.
     breadcrumb_pending_reanchor: Option<BreadcrumbPopoverKind>,
+    breadcrumb_expanded: bool,
     focused_block: Option<FocusedBlock>,
     next_scroll_position: NextScrollCursorCenterTopBottom,
     addons: TypeIdHashMap<Box<dyn Addon>>,
@@ -2476,6 +2477,7 @@ impl Editor {
             breadcrumb_reanchoring: false,
             breadcrumb_dismiss_subscription: None,
             breadcrumb_pending_reanchor: None,
+            breadcrumb_expanded: false,
             focused_block: None,
             next_scroll_position: NextScrollCursorCenterTopBottom::default(),
             addons: Default::default(),
@@ -11027,6 +11029,15 @@ impl Editor {
         self.breadcrumb_symbol_popover_handle.clone()
     }
 
+    pub(crate) fn breadcrumb_expanded(&self) -> bool {
+        self.breadcrumb_expanded
+    }
+
+    pub(crate) fn expand_breadcrumb_trail(&mut self, cx: &mut Context<Self>) {
+        self.breadcrumb_expanded = true;
+        cx.emit(EditorEvent::BreadcrumbsChanged);
+    }
+
     pub fn watch_breadcrumb_dismissal<T: EventEmitter<DismissEvent> + 'static>(
         &mut self,
         entity: &Entity<T>,
@@ -11225,6 +11236,10 @@ impl Editor {
         if self.breadcrumb_symbol_navigation.take().is_some() {
             changed = true;
         }
+        if self.breadcrumb_expanded {
+            self.breadcrumb_expanded = false;
+            changed = true;
+        }
         if changed {
             cx.emit(EditorEvent::BreadcrumbsChanged);
         }
@@ -11270,6 +11285,22 @@ impl Editor {
         if is_current && self.breadcrumb_symbol_navigation.take().is_some() {
             cx.emit(EditorEvent::BreadcrumbsChanged);
         }
+    }
+
+    /// Guarded so drilling into a symbol, which moves the cursor, does not collapse an open dropdown.
+    pub(crate) fn collapse_expanded_breadcrumbs_on_selection_change(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.breadcrumb_expanded
+            || self.breadcrumb_navigation.is_some()
+            || self.breadcrumb_symbol_navigation.is_some()
+            || self.breadcrumb_reanchoring
+        {
+            return;
+        }
+        self.breadcrumb_expanded = false;
+        cx.emit(EditorEvent::BreadcrumbsChanged);
     }
 
     fn breadcrumbs_inner(&self, cx: &App) -> Option<Vec<HighlightedText>> {

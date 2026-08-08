@@ -185,6 +185,20 @@ pub(crate) fn plan_breadcrumb_layout(
     breadcrumb_layout_plan_from_dropped(&dropped)
 }
 
+/// `None` when not expanded; width is deliberately not a parameter, so expansion never drops a segment.
+pub(crate) fn breadcrumb_layout_plan_for_expansion(
+    expanded: bool,
+    segment_count: usize,
+) -> Option<BreadcrumbLayoutPlan> {
+    if !expanded {
+        return None;
+    }
+    Some(BreadcrumbLayoutPlan {
+        visible: (0..segment_count).collect(),
+        ellipses: Vec::new(),
+    })
+}
+
 pub(crate) fn breadcrumb_layout_plan_width(
     widths: &[Pixels],
     plan: &BreadcrumbLayoutPlan,
@@ -377,6 +391,18 @@ mod tests {
         let plan = plan_breadcrumb_layout(&[], &[], px(20.), px(500.), None);
         assert!(plan.visible.is_empty());
         assert!(plan.ellipses.is_empty());
+    }
+
+    #[test]
+    fn test_breadcrumb_layout_plan_for_expansion_keeps_every_segment() {
+        let plan = breadcrumb_layout_plan_for_expansion(true, 5).unwrap();
+        assert_eq!(plan.visible, vec![0, 1, 2, 3, 4]);
+        assert!(plan.ellipses.is_empty());
+    }
+
+    #[test]
+    fn test_breadcrumb_layout_plan_for_expansion_defers_when_not_expanded() {
+        assert!(breadcrumb_layout_plan_for_expansion(false, 5).is_none());
     }
 
     #[test]

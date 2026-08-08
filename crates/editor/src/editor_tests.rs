@@ -575,6 +575,75 @@ fn test_cancel_breadcrumb_reanchor_clears_stuck_state(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn test_breadcrumb_expanded_clears_on_cancel_reanchor(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let buffer = cx.new(|cx| language::Buffer::local("fn main() {}", cx));
+    let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+    let editor = cx.add_window(|window, cx| build_editor(buffer, window, cx));
+
+    _ = editor.update(cx, |editor, _, cx| {
+        editor.expand_breadcrumb_trail(cx);
+        assert!(editor.breadcrumb_expanded());
+
+        editor.cancel_breadcrumb_reanchor(cx);
+        assert!(
+            !editor.breadcrumb_expanded(),
+            "switching the active item must collapse an expanded bar"
+        );
+    });
+}
+
+#[gpui::test]
+fn test_breadcrumb_expanded_clears_on_selection_change(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let buffer = cx.new(|cx| language::Buffer::local("fn main() {}", cx));
+    let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+    let editor = cx.add_window(|window, cx| build_editor(buffer, window, cx));
+
+    _ = editor.update(cx, |editor, window, cx| {
+        editor.expand_breadcrumb_trail(cx);
+        assert!(editor.breadcrumb_expanded());
+
+        editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
+            s.select_ranges([MultiBufferOffset(2)..MultiBufferOffset(2)])
+        });
+
+        assert!(
+            !editor.breadcrumb_expanded(),
+            "clicking into the editor must collapse an expanded bar"
+        );
+    });
+}
+
+#[gpui::test]
+fn test_breadcrumb_expanded_survives_selection_change_during_dropdown_session(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx, |_| {});
+
+    let buffer = cx.new(|cx| language::Buffer::local("fn main() {}", cx));
+    let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+    let editor = cx.add_window(|window, cx| build_editor(buffer, window, cx));
+    let worktree_id = project::WorktreeId::from_usize(0);
+
+    _ = editor.update(cx, |editor, window, cx| {
+        editor.expand_breadcrumb_trail(cx);
+        editor.open_breadcrumb_navigation(worktree_id, rel_path("src").into_arc(), cx);
+
+        editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
+            s.select_ranges([MultiBufferOffset(2)..MultiBufferOffset(2)])
+        });
+
+        assert!(
+            editor.breadcrumb_expanded(),
+            "an open dropdown must not let a selection change collapse the bar"
+        );
+    });
+}
+
+#[gpui::test]
 fn test_undo_redo_with_empty_history_selections_does_not_panic(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 

@@ -12,14 +12,16 @@ pub(crate) use layout::BreadcrumbSegmentKind;
 use layout::{
     align_symbol_segments, classify_breadcrumb_segment_kinds, hard_cap_breadcrumb_middle_segments,
 };
-use layout::{breadcrumb_layout_plan_width, plan_breadcrumb_layout};
+use layout::{
+    breadcrumb_layout_plan_for_expansion, breadcrumb_layout_plan_width, plan_breadcrumb_layout,
+};
 pub(crate) use outline::outline_parents;
 pub use outline::{child_outline_indices, sibling_outline_indices, top_level_outline_indices};
 use path::breadcrumb_path_is_navigable;
-pub(crate) use path::breadcrumb_path_segments;
 pub use path::{
     BreadcrumbDirectoryEntry, BreadcrumbDirectoryListingSettings, breadcrumb_directory_entries,
 };
+pub(crate) use path::{breadcrumb_path_segments, breadcrumb_segment_copy_path};
 
 /// Popover handle registered by `breadcrumb_picker`, type-erased to avoid a dependency cycle.
 pub trait ErasedBreadcrumbPopoverHandle: 'static {
@@ -124,6 +126,8 @@ fn segment_text_runs(
 struct BreadcrumbsRow {
     segments: Vec<PreparedBreadcrumbSegment>,
     editor: Option<WeakEntity<Editor>>,
+    /// Set by clicking the ellipsis: renders every segment instead of dropping any.
+    expanded: bool,
 }
 
 const BREADCRUMB_SEGMENT_GROUP: &str = "breadcrumb-segment";
@@ -137,6 +141,14 @@ fn breadcrumb_file_icon(file_path: Option<&RelPath>, cx: &App) -> Option<SharedS
         return None;
     }
     file_icons::FileIcons::get_icon(file_path?.as_std_path(), cx)
+}
+
+/// Keeps at most one file icon on screen: the tab-bar-hidden prefix already renders one.
+fn breadcrumb_segment_file_icon(
+    icon: Option<SharedString>,
+    prefix_present: bool,
+) -> Option<SharedString> {
+    if prefix_present { None } else { icon }
 }
 
 fn breadcrumb_separator_width(window: &Window) -> Pixels {
@@ -271,6 +283,25 @@ impl BreadcrumbsRow {
                 .into_any_element(),
             None => text,
         };
+        let content =
+            if let (Some(target), Some(editor)) = (segment.target.clone(), self.editor.clone()) {
+                div()
+                    .on_mouse_down(gpui::MouseButton::Right, move |_, _, cx| {
+                        let Some(editor) = editor.upgrade() else {
+                            return;
+                        };
+                        let path = editor.update(cx, |editor, cx| {
+                            resolve_breadcrumb_segment_copy_path(&target, editor, cx)
+                        });
+                        if let Some(path) = path {
+                            cx.write_to_clipboard(ClipboardItem::new_string(path));
+                        }
+                    })
+                    .child(content)
+                    .into_any_element()
+            } else {
+                content
+            };
         let interactive = segment.target.is_some() && self.editor.is_some();
         let label = self.with_separator(position, last_position, content, interactive, cx);
 
@@ -357,7 +388,23 @@ impl BreadcrumbsRow {
 
     fn render_ellipsis(&self, position: usize, last_position: usize, cx: &App) -> gpui::AnyElement {
         let content = Label::new("⋯").color(Color::Placeholder).into_any_element();
-        self.with_separator(position, last_position, content, false, cx)
+        let label = self.with_separator(position, last_position, content, true, cx);
+        let Some(editor) = self.editor.clone() else {
+            return label;
+        };
+        let element = div()
+            // Protecting an anchored segment can split the dropped run in two.
+            .id(("breadcrumb-ellipsis", position))
+            .cursor_pointer()
+            .tooltip(Tooltip::text("Show Full Path"))
+            .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
+                if let Some(editor) = editor.upgrade() {
+                    editor.update(cx, |editor, cx| editor.expand_breadcrumb_trail(cx));
+                }
+            })
+            .child(label)
+            .into_any_element();
+        self.wrap_segment(element)
     }
 
     /// The segment a popover is currently open under, if any: `plan_breadcrumb_layout` must never collapse it.
@@ -375,6 +422,32 @@ impl BreadcrumbsRow {
             )
         })
     }
+}
+
+/// Gathers the primitives `breadcrumb_segment_copy_path` needs from the live editor and project state.
+fn resolve_breadcrumb_segment_copy_path(
+    target: &BreadcrumbSegmentTarget,
+    editor: &Editor,
+    cx: &mut Context<Editor>,
+) -> Option<String> {
+    let worktree_abs_path = match target {
+        BreadcrumbSegmentTarget::Directory { worktree_id, .. } => editor
+            .project()
+            .and_then(|project| project.read(cx).worktree_for_id(*worktree_id, cx))
+            .map(|worktree| worktree.read(cx).abs_path().to_path_buf()),
+        BreadcrumbSegmentTarget::Symbol { .. } => None,
+    };
+    let file_abs_path = editor.target_file_abs_path(cx);
+    let symbol_line = match target {
+        BreadcrumbSegmentTarget::Symbol {
+            item: Some(item), ..
+        } => {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            Some(item.range.start.to_point(&snapshot).row + 1)
+        }
+        _ => None,
+    };
+    breadcrumb_segment_copy_path(target, worktree_abs_path, file_abs_path, symbol_line)
 }
 
 /// Called when the layout drops the anchored segment: otherwise the popover stays deployed with no trigger left to dismiss it.
@@ -449,6 +522,7 @@ impl gpui::Element for BreadcrumbsRow {
         let ellipsis_width = metrics.ellipsis_width;
         let kinds: Vec<BreadcrumbSegmentKind> = self.segments.iter().map(|s| s.kind).collect();
         let anchored_index = self.anchored_segment_index();
+        let expanded = self.expanded;
 
         // Answering `MinContent` with the whole trail would stop the parent offering less.
         let mut style = Style::default();
@@ -461,14 +535,18 @@ impl gpui::Element for BreadcrumbsRow {
                     .width
                     .unwrap_or(match available_space.width {
                         AvailableSpace::Definite(available_width) => {
-                            let plan = plan_breadcrumb_layout(
-                                &widths,
-                                &kinds,
-                                ellipsis_width,
-                                available_width,
-                                anchored_index,
-                            );
-                            breadcrumb_layout_plan_width(&widths, &plan, ellipsis_width)
+                            if expanded {
+                                natural_width
+                            } else {
+                                let plan = plan_breadcrumb_layout(
+                                    &widths,
+                                    &kinds,
+                                    ellipsis_width,
+                                    available_width,
+                                    anchored_index,
+                                );
+                                breadcrumb_layout_plan_width(&widths, &plan, ellipsis_width)
+                            }
                         }
                         AvailableSpace::MinContent => widths
                             .last()
@@ -496,13 +574,16 @@ impl gpui::Element for BreadcrumbsRow {
     ) -> Self::PrepaintState {
         let kinds: Vec<BreadcrumbSegmentKind> = self.segments.iter().map(|s| s.kind).collect();
         let anchored_index = self.anchored_segment_index();
-        let plan = plan_breadcrumb_layout(
-            &metrics.widths,
-            &kinds,
-            metrics.ellipsis_width,
-            bounds.size.width,
-            anchored_index,
-        );
+        let plan =
+            breadcrumb_layout_plan_for_expansion(self.expanded, kinds.len()).unwrap_or_else(|| {
+                plan_breadcrumb_layout(
+                    &metrics.widths,
+                    &kinds,
+                    metrics.ellipsis_width,
+                    bounds.size.width,
+                    anchored_index,
+                )
+            });
 
         if let Some(anchored_index) = anchored_index
             && !plan.visible.contains(&anchored_index)
@@ -775,7 +856,10 @@ pub fn render_breadcrumb_text(
     let (segments, symbol_segments, kinds, file_segment_index) =
         hard_cap_breadcrumb_middle_segments(segments, symbol_segments, kinds, file_segment_index);
 
-    let file_icon = breadcrumb_file_icon(file_path_for_icon.as_deref(), cx);
+    let file_icon = breadcrumb_segment_file_icon(
+        breadcrumb_file_icon(file_path_for_icon.as_deref(), cx),
+        prefix.is_some(),
+    );
     let file_status_color = crate::element::file_status_label_color(file_status);
     let file_icon_color =
         crate::items::entry_diagnostic_aware_icon_decoration_and_color(diagnostic_severity)
@@ -814,9 +898,15 @@ pub fn render_breadcrumb_text(
         })
         .collect();
 
+    let expanded = editor
+        .as_ref()
+        .and_then(WeakEntity::upgrade)
+        .is_some_and(|editor_entity| editor_entity.read(cx).breadcrumb_expanded());
+
     let row = BreadcrumbsRow {
         segments: prepared_segments,
         editor: editor.clone(),
+        expanded,
     };
 
     let breadcrumbs_stack = div()
@@ -954,6 +1044,22 @@ fn apply_dirty_filename_style(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_breadcrumb_segment_file_icon_suppressed_when_a_prefix_is_present() {
+        let icon: SharedString = "icons/file.svg".into();
+        assert_eq!(
+            breadcrumb_segment_file_icon(Some(icon.clone()), true),
+            None,
+            "a prefix icon already renders one"
+        );
+        assert_eq!(
+            breadcrumb_segment_file_icon(Some(icon.clone()), false),
+            Some(icon),
+            "no prefix means the segment icon is the only one"
+        );
+        assert_eq!(breadcrumb_segment_file_icon(None, false), None);
+    }
 
     #[test]
     fn test_flatten_text_for_single_line_display_preserves_byte_offsets() {
