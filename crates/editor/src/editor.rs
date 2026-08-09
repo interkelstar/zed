@@ -11214,6 +11214,7 @@ impl Editor {
         self.breadcrumb_pending_reanchor
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn breadcrumb_reanchoring(&self) -> bool {
         self.breadcrumb_reanchoring
     }

@@ -531,17 +531,23 @@ impl gpui::Element for BreadcrumbsRow {
         // Answering `MinContent` with the whole trail would stop the parent offering less.
         let mut style = Style::default();
         style.min_size.width = px(0.).into();
+        // Expanded the row must outgrow its parent, or the scroll container has nothing to scroll.
+        if expanded {
+            style.flex_shrink = 0.;
+        }
 
         let layout_id = window.request_measured_layout(
             style,
             move |known_dimensions, available_space, _window, _cx| {
-                let width = known_dimensions
-                    .width
-                    .unwrap_or(match available_space.width {
-                        AvailableSpace::Definite(available_width) => {
-                            if expanded {
-                                natural_width
-                            } else {
+                // Expanded ignores the offered width, including a resolved one: the whole point
+                // is to outgrow the container so it can be scrolled.
+                let width = if expanded {
+                    natural_width
+                } else {
+                    known_dimensions
+                        .width
+                        .unwrap_or(match available_space.width {
+                            AvailableSpace::Definite(available_width) => {
                                 let plan = plan_breadcrumb_layout(
                                     &widths,
                                     &kinds,
@@ -551,14 +557,14 @@ impl gpui::Element for BreadcrumbsRow {
                                 );
                                 breadcrumb_layout_plan_width(&widths, &plan, ellipsis_width)
                             }
-                        }
-                        AvailableSpace::MinContent => widths
-                            .last()
-                            .copied()
-                            .unwrap_or(ellipsis_width)
-                            .max(ellipsis_width),
-                        AvailableSpace::MaxContent => natural_width,
-                    });
+                            AvailableSpace::MinContent => widths
+                                .last()
+                                .copied()
+                                .unwrap_or(ellipsis_width)
+                                .max(ellipsis_width),
+                            AvailableSpace::MaxContent => natural_width,
+                        })
+                };
                 let height = known_dimensions.height.unwrap_or(line_height);
                 size(width, height)
             },
@@ -597,7 +603,7 @@ impl gpui::Element for BreadcrumbsRow {
                 .and_then(|segment| segment.target.clone())
             && let Some(editor) = self.editor.as_ref().and_then(WeakEntity::upgrade)
             // Reanchoring drops and re-shows the popover itself; dismissing mid-flight fights it.
-            && !editor.read(cx).breadcrumb_reanchoring()
+            && !editor.read(cx).breadcrumb_reanchoring
         {
             dismiss_orphaned_breadcrumb_popover(&editor, &target, cx);
         }
@@ -915,17 +921,22 @@ pub fn render_breadcrumb_text(
         expanded,
     };
 
-    let breadcrumbs_stack = div()
-        .id("breadcrumb-trail")
-        .min_w_0()
-        .overflow_x_scroll()
-        .when(multibuffer_header, |this| {
-            this.pl_2()
-                .border_l_1()
-                .border_color(cx.theme().colors().border.opacity(0.6))
-        })
-        .child(row)
-        .into_any_element();
+    let breadcrumbs_stack = if multibuffer_header {
+        div()
+            .min_w_0()
+            .pl_2()
+            .border_l_1()
+            .border_color(cx.theme().colors().border.opacity(0.6))
+            .child(row)
+            .into_any_element()
+    } else {
+        h_flex()
+            .id("breadcrumb-trail")
+            .min_w_0()
+            .overflow_x_scroll()
+            .child(row)
+            .into_any_element()
+    };
 
     let breadcrumbs = if let Some(prefix) = prefix {
         h_flex()
@@ -1191,5 +1202,71 @@ mod tests {
                 "a segment the layout could not keep must drop its navigation session"
             );
         });
+    }
+
+    fn breadcrumb_row_scroll_range(expanded: bool, cx: &mut gpui::TestAppContext) -> Pixels {
+        crate::editor_tests::init_test(cx, |_| {});
+        let scroll_handle = gpui::ScrollHandle::new();
+        let window = cx.add_window({
+            let scroll_handle = scroll_handle.clone();
+            move |_, _| ScrollProbe {
+                expanded,
+                scroll_handle,
+            }
+        });
+        cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+        scroll_handle.max_offset().x
+    }
+
+    struct ScrollProbe {
+        expanded: bool,
+        scroll_handle: gpui::ScrollHandle,
+    }
+
+    impl Render for ScrollProbe {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let segments = (0..12)
+                .map(|index| PreparedBreadcrumbSegment {
+                    kind: BreadcrumbSegmentKind::Middle,
+                    label: HighlightedText {
+                        text: format!("directory-with-a-long-name-{index}").into(),
+                        highlights: Vec::new(),
+                    },
+                    target: None,
+                    dirty_filename_style: false,
+                    icon: None,
+                    icon_color: Color::Muted,
+                    label_color: Color::Muted,
+                })
+                .collect();
+            let row = BreadcrumbsRow {
+                segments,
+                editor: None,
+                expanded: self.expanded,
+            };
+            // The shape `render_breadcrumb_text` builds for the toolbar.
+            h_flex().w(px(200.)).child(
+                h_flex()
+                    .id("breadcrumb-trail")
+                    .min_w_0()
+                    .overflow_x_scroll()
+                    .track_scroll(&self.scroll_handle)
+                    .child(row),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn test_expanded_breadcrumb_row_outgrows_its_container(cx: &mut gpui::TestAppContext) {
+        assert_eq!(
+            breadcrumb_row_scroll_range(false, cx),
+            px(0.),
+            "a collapsed row fits by dropping segments, so there is nothing to scroll"
+        );
+        assert!(
+            breadcrumb_row_scroll_range(true, cx) > px(0.),
+            "an expanded row must overflow its container for the scroll container to reach the tail"
+        );
     }
 }
