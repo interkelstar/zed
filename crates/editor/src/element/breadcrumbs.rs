@@ -128,6 +128,7 @@ struct BreadcrumbsRow {
     editor: Option<WeakEntity<Editor>>,
     /// Set by clicking the ellipsis: renders every segment instead of dropping any.
     expanded: bool,
+    file_outlives_symbols: bool,
 }
 
 const BREADCRUMB_SEGMENT_GROUP: &str = "breadcrumb-segment";
@@ -527,6 +528,7 @@ impl gpui::Element for BreadcrumbsRow {
         let kinds: Vec<BreadcrumbSegmentKind> = self.segments.iter().map(|s| s.kind).collect();
         let anchored_index = self.anchored_segment_index();
         let expanded = self.expanded;
+        let file_outlives_symbols = self.file_outlives_symbols;
 
         // Answering `MinContent` with the whole trail would stop the parent offering less.
         let mut style = Style::default();
@@ -554,6 +556,7 @@ impl gpui::Element for BreadcrumbsRow {
                                     ellipsis_width,
                                     available_width,
                                     anchored_index,
+                                    file_outlives_symbols,
                                 );
                                 breadcrumb_layout_plan_width(&widths, &plan, ellipsis_width)
                             }
@@ -592,6 +595,7 @@ impl gpui::Element for BreadcrumbsRow {
                     metrics.ellipsis_width,
                     bounds.size.width,
                     anchored_index,
+                    self.file_outlives_symbols,
                 )
             });
 
@@ -878,8 +882,8 @@ pub fn render_breadcrumb_text(
             .map(|(_, color)| color)
             .unwrap_or(Color::Muted);
 
-    let apply_dirty_filename_style =
-        !workspace::TabBarSettings::get_global(cx).show && active_item.is_dirty(cx);
+    let tab_bar_hidden = !workspace::TabBarSettings::get_global(cx).show;
+    let apply_dirty_filename_style = tab_bar_hidden && active_item.is_dirty(cx);
 
     let prepared_segments = segments
         .into_iter()
@@ -910,15 +914,19 @@ pub fn render_breadcrumb_text(
         })
         .collect();
 
-    let expanded = editor
-        .as_ref()
-        .and_then(WeakEntity::upgrade)
-        .is_some_and(|editor_entity| editor_entity.read(cx).breadcrumb_expanded());
+    let expanded = breadcrumb_row_is_expanded(
+        multibuffer_header,
+        editor
+            .as_ref()
+            .and_then(WeakEntity::upgrade)
+            .is_some_and(|editor_entity| editor_entity.read(cx).breadcrumb_expanded()),
+    );
 
     let row = BreadcrumbsRow {
         segments: prepared_segments,
         editor: editor.clone(),
         expanded,
+        file_outlives_symbols: tab_bar_hidden,
     };
 
     let breadcrumbs_stack = if multibuffer_header {
@@ -959,6 +967,7 @@ pub fn render_breadcrumb_text(
                 h_flex()
                     .h(rems_from_px(22.))
                     .px_1()
+                    // Dropping this lets the expanded row widen the toolbar instead of scrolling.
                     .min_w_0()
                     .child(breadcrumbs)
                     .when(!multibuffer_header && has_project_path, |this| {
@@ -997,6 +1006,11 @@ fn file_segment_symbol_target(
         item: None,
         is_active_segment,
     })
+}
+
+/// A multibuffer excerpt header has no scroll container, so an expanded row would overrun its neighbours.
+fn breadcrumb_row_is_expanded(multibuffer_header: bool, expanded: bool) -> bool {
+    !multibuffer_header && expanded
 }
 
 fn is_file_breadcrumb_segment(
@@ -1126,6 +1140,16 @@ mod tests {
     }
 
     #[test]
+    fn test_breadcrumb_row_is_expanded_stays_false_for_a_multibuffer_header() {
+        assert!(
+            !breadcrumb_row_is_expanded(true, true),
+            "a header row has no scroll container to contain an expanded trail"
+        );
+        assert!(breadcrumb_row_is_expanded(false, true));
+        assert!(!breadcrumb_row_is_expanded(false, false));
+    }
+
+    #[test]
     fn test_dirty_filename_text_style_only_changes_font_weight() {
         let mut base = gpui::TextStyle::default();
         base.color = gpui::red();
@@ -1244,15 +1268,20 @@ mod tests {
                 segments,
                 editor: None,
                 expanded: self.expanded,
+                file_outlives_symbols: false,
             };
-            // The shape `render_breadcrumb_text` builds for the toolbar.
-            h_flex().w(px(200.)).child(
-                h_flex()
-                    .id("breadcrumb-trail")
-                    .min_w_0()
-                    .overflow_x_scroll()
-                    .track_scroll(&self.scroll_handle)
-                    .child(row),
+            // Mirrors the real chain, clipping box and nested rows included.
+            h_flex().w(px(200.)).overflow_x_hidden().child(
+                h_flex().flex_grow_1().min_w_0().child(
+                    h_flex().min_w_0().child(
+                        h_flex()
+                            .id("breadcrumb-trail")
+                            .min_w_0()
+                            .overflow_x_scroll()
+                            .track_scroll(&self.scroll_handle)
+                            .child(row),
+                    ),
+                ),
             )
         }
     }

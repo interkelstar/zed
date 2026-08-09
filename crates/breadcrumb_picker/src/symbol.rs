@@ -372,10 +372,13 @@ pub(crate) fn render_breadcrumb_symbol_segment(
         ) {
             BreadcrumbSymbolMenuOutcome::ShowPicker(menu_items) => menu_items,
             BreadcrumbSymbolMenuOutcome::OutlineNotReady => {
-                // Kick the fetch and let the next click land on a settled UI.
+                // A silent click is worse than the modal: fetch, and still do something now.
                 editor_entity.update(cx, |editor, cx| {
                     editor.prefetch_breadcrumb_outline(buffer_id, cx);
                 });
+                if let Some(callback) = zed_actions::outline::TOGGLE_OUTLINE.get() {
+                    callback(editor_entity.to_any_view(), window, cx);
+                }
                 return None;
             }
             BreadcrumbSymbolMenuOutcome::ShowOutlineModal => {
@@ -568,6 +571,7 @@ mod tests {
 
         let (editor_window, editor) = build_test_editor(cx);
         let cx = &mut VisualTestContext::from_window(*editor_window, cx);
+        let buffer_id = BufferId::new(1).unwrap();
 
         let snapshot = editor.read_with(cx, |editor, cx| editor.buffer().read(cx).snapshot(cx));
         let items = vec![
@@ -576,11 +580,15 @@ mod tests {
             test_item(&snapshot, 2, "gamma"),
         ];
 
+        editor.update(cx, |editor, cx| {
+            editor.open_breadcrumb_symbol_navigation(buffer_id, None, cx);
+        });
+
         let picker = editor_window
             .update(cx, |_, window, cx| {
                 BreadcrumbSymbolDelegate::picker(
                     editor.downgrade(),
-                    BufferId::new(1).unwrap(),
+                    buffer_id,
                     None,
                     items,
                     None,
@@ -590,6 +598,9 @@ mod tests {
                 )
             })
             .unwrap();
+        editor.update(cx, |editor, cx| {
+            editor.watch_breadcrumb_symbol_dismissal(&picker, buffer_id, None, cx);
+        });
 
         let dismissed = Rc::new(Cell::new(false));
         let subscription = cx.update(|_, cx| {
@@ -615,6 +626,12 @@ mod tests {
             );
         });
         assert!(dismissed.get(), "confirming a row dismisses the popover");
+        editor.read_with(cx, |editor, _| {
+            assert!(
+                editor.breadcrumb_symbol_navigation().is_none(),
+                "the dismissal must clear the navigation session confirm just ended"
+            );
+        });
         drop(subscription);
     }
 
@@ -842,7 +859,8 @@ mod tests {
             let outcome = breadcrumb_symbol_menu_outcome(editor, buffer_id, None, cx);
             assert!(
                 matches!(outcome, BreadcrumbSymbolMenuOutcome::OutlineNotReady),
-                "the outline has not been fetched yet, so neither the picker nor the modal is correct"
+                "the outline has not been fetched yet, so the picker's items are not known; \
+                 the caller decides whether that means a prefetch-and-fall-back-to-modal"
             );
         });
     }

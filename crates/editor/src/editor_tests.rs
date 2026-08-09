@@ -644,6 +644,56 @@ fn test_breadcrumb_expanded_survives_selection_change_during_dropdown_session(
 }
 
 #[gpui::test]
+fn test_ending_a_symbol_dropdown_session_collapses_the_expanded_trail(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let buffer = cx.new(|cx| language::Buffer::local("fn main() {}", cx));
+    let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+    let editor = cx.add_window(|window, cx| build_editor(buffer, window, cx));
+    let buffer_id = BufferId::new(1).unwrap();
+
+    _ = editor.update(cx, |editor, _, cx| {
+        editor.expand_breadcrumb_trail(cx);
+        editor.open_breadcrumb_symbol_navigation(buffer_id, None, cx);
+        assert!(editor.breadcrumb_expanded());
+
+        editor.clear_breadcrumb_symbol_navigation(buffer_id, None, cx);
+
+        assert!(
+            !editor.breadcrumb_expanded(),
+            "the dropdown that kept the trail expanded just dismissed"
+        );
+    });
+}
+
+#[gpui::test]
+fn test_opening_symbol_dropdown_after_directory_clears_the_orphaned_state(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let buffer = cx.new(|cx| language::Buffer::local("fn main() {}", cx));
+    let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+    let editor = cx.add_window(|window, cx| build_editor(buffer, window, cx));
+    let worktree_id = project::WorktreeId::from_usize(0);
+    let buffer_id = BufferId::new(1).unwrap();
+
+    _ = editor.update(cx, |editor, _, cx| {
+        editor.open_breadcrumb_navigation(worktree_id, rel_path("src").into_arc(), cx);
+        assert!(editor.breadcrumb_navigation().is_some());
+
+        editor.open_breadcrumb_symbol_navigation(buffer_id, None, cx);
+
+        assert!(
+            editor.breadcrumb_navigation().is_none(),
+            "opening the second kind of dropdown must not leave the first one's state orphaned"
+        );
+        assert!(
+            editor.breadcrumb_symbol_navigation().is_some(),
+            "exactly one navigation state stays live"
+        );
+    });
+}
+
+#[gpui::test]
 fn test_undo_redo_with_empty_history_selections_does_not_panic(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 

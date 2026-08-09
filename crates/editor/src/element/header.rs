@@ -895,12 +895,15 @@ pub(crate) fn render_buffer_header(
                                         el.child(Icon::new(IconName::FileLock).color(Color::Muted))
                                     })
                                     .when_some(breadcrumbs, |then, breadcrumbs| {
-                                        then.child(render_breadcrumb_text(
-                                            breadcrumbs,
-                                            None,
-                                            editor_handle,
-                                            true,
-                                            cx,
+                                        // The toolbar's own breadcrumb bar stays in the UI font; only the header row matches the buffer.
+                                        then.child(div().font_buffer(cx).text_buffer(cx).child(
+                                            render_breadcrumb_text(
+                                                breadcrumbs,
+                                                None,
+                                                editor_handle,
+                                                true,
+                                                cx,
+                                            ),
                                         ))
                                     })
                             },

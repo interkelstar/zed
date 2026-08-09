@@ -1135,6 +1135,7 @@ pub struct Editor {
     breadcrumb_popover_handle: Option<Rc<dyn ErasedBreadcrumbPopoverHandle>>,
     breadcrumb_symbol_popover_handle: Option<Rc<dyn ErasedBreadcrumbPopoverHandle>>,
     breadcrumb_dismiss_subscription: Option<Subscription>,
+    breadcrumb_symbol_dismiss_subscription: Option<Subscription>,
     /// Suppresses [`Editor::clear_breadcrumb_navigation`] and [`Editor::clear_breadcrumb_symbol_navigation`] while the dropdown moves between segments.
     breadcrumb_reanchoring: bool,
     /// Waiting for the new active segment's `PopoverMenu` to register the shared handle.
@@ -2477,6 +2478,7 @@ impl Editor {
                 .map(|renderers| (renderers.symbol_popover_handle)()),
             breadcrumb_reanchoring: false,
             breadcrumb_dismiss_subscription: None,
+            breadcrumb_symbol_dismiss_subscription: None,
             breadcrumb_pending_reanchor: None,
             breadcrumb_expanded: false,
             focused_block: None,
@@ -11081,7 +11083,7 @@ impl Editor {
         active_item: Option<OutlineItem<Anchor>>,
         cx: &mut Context<Self>,
     ) {
-        self.breadcrumb_dismiss_subscription = Some(cx.subscribe(
+        self.breadcrumb_symbol_dismiss_subscription = Some(cx.subscribe(
             entity,
             move |editor, _, _: &gpui::DismissEvent, cx| {
                 editor.clear_breadcrumb_symbol_navigation(buffer_id, active_item.as_ref(), cx);
@@ -11099,6 +11101,10 @@ impl Editor {
         if let Some(handle) = &self.breadcrumb_popover_handle {
             handle.hide(cx);
         }
+        if let Some(handle) = &self.breadcrumb_symbol_popover_handle {
+            handle.hide(cx);
+        }
+        self.breadcrumb_symbol_navigation = None;
 
         let navigated = self
             .breadcrumb_navigation
@@ -11126,6 +11132,10 @@ impl Editor {
         if let Some(handle) = &self.breadcrumb_symbol_popover_handle {
             handle.hide(cx);
         }
+        if let Some(handle) = &self.breadcrumb_popover_handle {
+            handle.hide(cx);
+        }
+        self.breadcrumb_navigation = None;
 
         let navigated = self
             .breadcrumb_symbol_navigation
@@ -11282,6 +11292,7 @@ impl Editor {
                 navigation.worktree_id == worktree_id && &navigation.active_path == path
             });
         if is_current && self.breadcrumb_navigation.take().is_some() {
+            self.breadcrumb_expanded = false;
             cx.emit(EditorEvent::BreadcrumbsChanged);
         }
     }
@@ -11304,6 +11315,7 @@ impl Editor {
                         == active_item.map(|item| &item.range)
             });
         if is_current && self.breadcrumb_symbol_navigation.take().is_some() {
+            self.breadcrumb_expanded = false;
             cx.emit(EditorEvent::BreadcrumbsChanged);
         }
     }
