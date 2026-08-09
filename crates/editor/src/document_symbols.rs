@@ -3,7 +3,7 @@ use std::rc::Rc;
 
 use collections::HashMap;
 use futures::FutureExt;
-use futures::future::join_all;
+use futures::future::{Shared, join_all};
 use gpui::{App, Context, HighlightStyle, Task, Window};
 use itertools::Itertools as _;
 use language::language_settings::LanguageSettings;
@@ -133,6 +133,11 @@ impl Editor {
         self.prefetch_breadcrumb_outline_inner(buffer_id, false, cx);
     }
 
+    /// `Shared` lets a popover that opened before the outline was ready await this same completion instead of polling.
+    pub fn breadcrumb_outline_prefetch_task(&self) -> Shared<Task<()>> {
+        self.breadcrumb_outline_task.clone()
+    }
+
     /// Bypasses the version guard: the source changed without an edit, so the version still matches.
     pub(crate) fn refresh_breadcrumb_outline(
         &mut self,
@@ -160,16 +165,18 @@ impl Editor {
         }
 
         let items = self.buffer_outline_items(buffer_id, cx);
-        self.breadcrumb_outline_task = cx.spawn(async move |editor, cx| {
-            let Some(items) = items.await else {
-                return;
-            };
-            editor
-                .update(cx, |editor, _| {
-                    editor.store_breadcrumb_outline(buffer_id, version, items);
-                })
-                .ok();
-        });
+        self.breadcrumb_outline_task = cx
+            .spawn(async move |editor, cx| {
+                let Some(items) = items.await else {
+                    return;
+                };
+                editor
+                    .update(cx, |editor, _| {
+                        editor.store_breadcrumb_outline(buffer_id, version, items);
+                    })
+                    .ok();
+            })
+            .shared();
     }
 
     fn store_breadcrumb_outline(
@@ -187,9 +194,11 @@ impl Editor {
     }
 
     /// Avoids `buffer_outline_items`: called from inside the refresh task it would await, which deadlocks.
+    /// `version` is read before `items` was requested; a buffer that has since moved on drops `items` rather than storing it.
     pub(crate) fn set_breadcrumb_outline(
         &mut self,
         buffer_id: BufferId,
+        version: clock::Global,
         items: Vec<OutlineItem<text::Anchor>>,
         cx: &App,
     ) {
@@ -199,8 +208,10 @@ impl Editor {
         let Some(buffer) = self.buffer.read(cx).buffer(buffer_id) else {
             return;
         };
-        let version = buffer.read(cx).version();
-        self.breadcrumb_outline_task = Task::ready(());
+        if buffer.read(cx).version() != version {
+            return;
+        }
+        self.breadcrumb_outline_task = Task::ready(()).shared();
         self.store_breadcrumb_outline(buffer_id, version, items);
     }
 
@@ -230,7 +241,7 @@ impl Editor {
             .map(|(_, buffer)| buffer.remote_id())
     }
 
-    /// Converted outline items and their depths, cached by buffer id/version.
+    /// Converted outline items and their depths, cached for the buffer id/version they answer for.
     fn breadcrumb_converted_outline(
         &self,
         buffer_id: BufferId,
@@ -430,17 +441,20 @@ impl Editor {
                     .timer(LSP_REQUEST_DEBOUNCE_TIMEOUT)
                     .await;
 
-                let Some(tasks) = project
+                let Some((tasks, dispatch_versions)) = project
                     .update(cx, |project, cx| {
                         project.lsp_store().update(cx, |lsp_store, cx| {
-                            buffers_to_query
+                            let mut dispatch_versions = HashMap::default();
+                            let tasks = buffers_to_query
                                 .into_iter()
                                 .map(|buffer| {
                                     let buffer_id = buffer.read(cx).remote_id();
+                                    dispatch_versions.insert(buffer_id, buffer.read(cx).version());
                                     let task = lsp_store.fetch_document_symbols(&buffer, cx);
                                     async move { (buffer_id, task.await) }
                                 })
-                                .collect::<Vec<_>>()
+                                .collect::<Vec<_>>();
+                            (tasks, dispatch_versions)
                         })
                     })
                     .ok()
@@ -472,8 +486,9 @@ impl Editor {
                         if let Some(buffer_id) = refreshed_buffer_id
                             && let Some(items) =
                                 editor.lsp_document_symbols.get(&buffer_id).cloned()
+                            && let Some(version) = dispatch_versions.get(&buffer_id).cloned()
                         {
-                            editor.set_breadcrumb_outline(buffer_id, items, cx);
+                            editor.set_breadcrumb_outline(buffer_id, version, items, cx);
                         }
                         editor.refresh_outline_symbols_at_cursor(cx);
                     })
@@ -1124,7 +1139,14 @@ mod tests {
 
         // An empty outline at the version the response carries: the version guard would keep it.
         cx.update_editor(|editor, _window, cx| {
-            editor.set_breadcrumb_outline(buffer_id, Vec::new(), cx);
+            let version = editor
+                .buffer()
+                .read(cx)
+                .buffer(buffer_id)
+                .unwrap()
+                .read(cx)
+                .version();
+            editor.set_breadcrumb_outline(buffer_id, version, Vec::new(), cx);
             assert!(
                 editor
                     .breadcrumb_symbol_menu_items(buffer_id, None, cx)
@@ -1139,7 +1161,14 @@ mod tests {
                 .get(&buffer_id)
                 .cloned()
                 .unwrap_or_default();
-            editor.set_breadcrumb_outline(buffer_id, items, cx);
+            let version = editor
+                .buffer()
+                .read(cx)
+                .buffer(buffer_id)
+                .unwrap()
+                .read(cx)
+                .version();
+            editor.set_breadcrumb_outline(buffer_id, version, items, cx);
             assert_eq!(
                 editor
                     .breadcrumb_symbol_menu_items(buffer_id, None, cx)
@@ -1989,7 +2018,7 @@ mod tests {
                 .version()
         });
         editor.update(cx, |editor, cx| {
-            editor.set_breadcrumb_outline(buffer_b_id, Vec::new(), cx);
+            editor.set_breadcrumb_outline(buffer_b_id, buffer_b_version.clone(), Vec::new(), cx);
         });
 
         // Row 1 is the blank separator `build_multi` puts between excerpts; B starts at row 2.
@@ -2008,6 +2037,64 @@ mod tests {
                 editor.breadcrumb_outline_is_fresh(buffer_b_id, &buffer_b_version),
                 "a stale debounce timer left over from a previous buffer must not overwrite \
                  the cache for the buffer the cursor is actually on"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_set_breadcrumb_outline_drops_a_result_for_a_version_the_buffer_moved_past(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx, |_| {});
+
+        let mut cx = EditorLspTestContext::new_rust(lsp::ServerCapabilities::default(), cx).await;
+        cx.set_state("fn maˇin() {}\n");
+        cx.run_until_parked();
+
+        let buffer_id = cx.update_editor(|editor, _window, cx| {
+            editor
+                .buffer()
+                .read(cx)
+                .as_singleton()
+                .unwrap()
+                .read(cx)
+                .remote_id()
+        });
+
+        // Simulates the version a fetch captured right before it was dispatched.
+        let version_before_dispatch = cx.update_editor(|editor, _window, cx| {
+            let version = editor
+                .buffer()
+                .read(cx)
+                .buffer(buffer_id)
+                .unwrap()
+                .read(cx)
+                .version();
+            editor.set_breadcrumb_outline(buffer_id, version.clone(), Vec::new(), cx);
+            version
+        });
+
+        // The edit lands while that fetch is still in flight.
+        cx.update_editor(|editor, window, cx| {
+            editor.handle_input("z", window, cx);
+        });
+
+        let version_after_edit = cx.update_editor(|editor, _window, cx| {
+            editor
+                .buffer()
+                .read(cx)
+                .buffer(buffer_id)
+                .unwrap()
+                .read(cx)
+                .version()
+        });
+
+        cx.update_editor(|editor, _window, cx| {
+            editor.set_breadcrumb_outline(buffer_id, version_before_dispatch, Vec::new(), cx);
+            assert!(
+                !editor.breadcrumb_outline_is_fresh(buffer_id, &version_after_edit),
+                "a result for a version the buffer has since moved past must be dropped, \
+                 not stored as fresh for the buffer's current version"
             );
         });
     }

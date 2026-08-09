@@ -6,9 +6,42 @@ use std::rc::Rc;
 use editor::{
     BREADCRUMB_PICKER_RENDERERS, BreadcrumbPickerRenderers, ErasedBreadcrumbPopoverHandle,
 };
+use fuzzy::{StringMatch, StringMatchCandidate};
 use gpui::App;
 
 pub(crate) const MAX_BREADCRUMB_MENU_ENTRIES: usize = 200;
+
+/// Caps the empty-query listing like a typed filter, keeping `keep_candidate_id` displayed even if it would otherwise sort past the cap.
+pub(crate) fn cap_empty_query_matches(
+    candidates: &[StringMatchCandidate],
+    keep_candidate_id: Option<usize>,
+    cap: usize,
+) -> Vec<StringMatch> {
+    let to_match = |candidate: &StringMatchCandidate| StringMatch {
+        candidate_id: candidate.id,
+        string: candidate.string.clone(),
+        positions: Vec::new(),
+        score: 0.,
+    };
+
+    if candidates.len() <= cap {
+        return candidates.iter().map(to_match).collect();
+    }
+
+    let mut matches: Vec<StringMatch> = candidates.iter().take(cap).map(to_match).collect();
+    if let Some(keep_candidate_id) = keep_candidate_id
+        && !matches
+            .iter()
+            .any(|entry_match| entry_match.candidate_id == keep_candidate_id)
+        && let Some(keep_candidate) = candidates
+            .iter()
+            .find(|candidate| candidate.id == keep_candidate_id)
+    {
+        matches.pop();
+        matches.push(to_match(keep_candidate));
+    }
+    matches
+}
 
 pub fn init(_cx: &mut App) {
     BREADCRUMB_PICKER_RENDERERS
@@ -70,5 +103,51 @@ pub(crate) mod test_support {
                 cx,
             ));
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn candidates(count: usize) -> Vec<StringMatchCandidate> {
+        (0..count)
+            .map(|index| StringMatchCandidate::new(index, &format!("entry-{index}")))
+            .collect()
+    }
+
+    #[test]
+    fn test_cap_empty_query_matches_passes_through_under_the_cap() {
+        let candidates = candidates(5);
+        let matches = cap_empty_query_matches(&candidates, None, 10);
+        assert_eq!(matches.len(), 5);
+    }
+
+    #[test]
+    fn test_cap_empty_query_matches_caps_and_keeps_an_entry_past_the_cap() {
+        let candidates = candidates(10);
+        let matches = cap_empty_query_matches(&candidates, Some(9), 3);
+
+        assert_eq!(matches.len(), 3);
+        assert!(
+            matches
+                .iter()
+                .any(|entry_match| entry_match.candidate_id == 9),
+            "the entry past the cap must still be displayed"
+        );
+    }
+
+    #[test]
+    fn test_cap_empty_query_matches_without_a_kept_id_just_truncates() {
+        let candidates = candidates(10);
+        let matches = cap_empty_query_matches(&candidates, None, 3);
+
+        assert_eq!(
+            matches
+                .iter()
+                .map(|entry_match| entry_match.candidate_id)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2],
+        );
     }
 }

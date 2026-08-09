@@ -45,19 +45,21 @@ fn descend_single_child_directories(
     current
 }
 
-/// Shares `breadcrumb_directory_entries` so a directory hidden by settings is never a fold target.
+/// Applies the listing's own hidden-entry predicates directly to the worktree snapshot and stops after two entries.
 fn breadcrumb_directory_children(
-    project: Option<&Entity<Project>>,
     worktree: &Entity<project::Worktree>,
     path: &RelPath,
     cx: &App,
 ) -> Vec<(Arc<RelPath>, bool)> {
-    let Some(project) = project else {
-        return Vec::new();
-    };
-    breadcrumb_directory_entries(project, worktree, path, cx)
-        .into_iter()
-        .map(|entry| (entry.path, entry.is_dir))
+    let settings = BreadcrumbDirectoryListingSettings::get_global(cx);
+    worktree
+        .read(cx)
+        .snapshot()
+        .child_entries(path)
+        .filter(|entry| !settings.hide_gitignore || !entry.is_ignored)
+        .filter(|entry| !settings.hide_hidden || !entry.is_hidden)
+        .take(2)
+        .map(|entry| (entry.path.clone(), entry.is_dir()))
         .collect()
 }
 
@@ -114,7 +116,7 @@ pub struct BreadcrumbDirectoryDelegate {
     current_path: Arc<RelPath>,
     active_path: Option<Arc<RelPath>>,
     entries: Vec<BreadcrumbDirectoryEntry>,
-    /// Rebuilt only alongside `entries`, not on every keystroke; `update_matches` just clones the `Rc`.
+    /// Rebuilt only alongside `entries`; a typed query clones this `Rc`, an empty one still copies up to the cap.
     candidates: Rc<[StringMatchCandidate]>,
     matches: Vec<StringMatch>,
     query: String,
@@ -345,16 +347,16 @@ impl PickerDelegate for BreadcrumbDirectoryDelegate {
         self.query = query.clone();
 
         if query.is_empty() {
-            self.matches = self
-                .candidates
-                .iter()
-                .map(|candidate| StringMatch {
-                    candidate_id: candidate.id,
-                    string: candidate.string.clone(),
-                    positions: Vec::new(),
-                    score: 0.,
-                })
-                .collect();
+            let active_candidate_id = self.active_path.as_ref().and_then(|active_path| {
+                self.entries
+                    .iter()
+                    .position(|entry| active_path.starts_with(&entry.path))
+            });
+            self.matches = crate::cap_empty_query_matches(
+                &self.candidates,
+                active_candidate_id,
+                MAX_BREADCRUMB_MENU_ENTRIES,
+            );
             self.select_active_path();
             cx.notify();
             return Task::ready(());
@@ -418,11 +420,10 @@ impl PickerDelegate for BreadcrumbDirectoryDelegate {
         let Some(worktree) = self.worktree(cx) else {
             return;
         };
-        let project = self.project(cx);
         let auto_fold_dirs = BreadcrumbDirectoryListingSettings::get_global(cx).auto_fold_dirs;
         let resolved_path = if auto_fold_dirs {
             descend_single_child_directories(entry_path, |path| {
-                breadcrumb_directory_children(project.as_ref(), &worktree, path, cx)
+                breadcrumb_directory_children(&worktree, path, cx)
             })
         } else {
             entry_path
@@ -1542,6 +1543,80 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_select_parent_with_an_empty_query_steps_out_to_the_parent_directory(
+        cx: &mut TestAppContext,
+    ) {
+        use editor::MultiBuffer;
+        use editor::test::build_editor;
+        use project::{FakeFs, Project};
+        use serde_json::json;
+        use util::path;
+
+        init_test(cx);
+        bind_drill_navigation_keymap(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                "alpha": { "beta": { "child.txt": "" } },
+            }),
+        )
+        .await;
+        let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+        let worktree_id = project.update(cx, |project, cx| {
+            project.worktrees(cx).next().unwrap().read(cx).id()
+        });
+
+        let workspace_window =
+            cx.add_window(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let workspace = workspace_window.root(cx).unwrap();
+
+        let buffer = cx.new(|cx| language::Buffer::local("", cx));
+        let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+        let harness_window = cx.add_window(|window, cx| {
+            let editor = cx.new(|cx| build_editor(buffer, window, cx));
+            let picker = BreadcrumbDirectoryDelegate::picker(
+                editor.downgrade(),
+                workspace.downgrade(),
+                worktree_id,
+                util::rel_path::rel_path("alpha/beta").into_arc(),
+                None,
+                window,
+                cx,
+            );
+            Harness { picker, editor }
+        });
+        let (picker, editor) = harness_window
+            .read_with(cx, |harness, _| {
+                (harness.picker.clone(), harness.editor.clone())
+            })
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(*harness_window, cx);
+        cx.run_until_parked();
+
+        picker.update_in(cx, |picker, window, cx| {
+            window.focus(&picker.focus_handle(cx), cx);
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("left");
+        cx.run_until_parked();
+
+        editor.read_with(cx, |editor, _| {
+            let navigation = editor
+                .breadcrumb_navigation()
+                .expect("an empty query lets left call select_parent, which navigates");
+            assert_eq!(
+                navigation.active_path.as_unix_str(),
+                "alpha",
+                "left steps out to the parent of the directory the picker opened at"
+            );
+            assert!(navigation.navigated);
+        });
+    }
+
+    #[gpui::test]
     async fn test_update_matches_does_not_relist_entries(cx: &mut TestAppContext) {
         use editor::MultiBuffer;
         use editor::test::build_editor;
@@ -1752,6 +1827,88 @@ mod tests {
             assert!(
                 picker.delegate.matches.is_empty(),
                 "reload must drop matches whose candidate ids point into the entries just replaced"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_update_matches_caps_the_empty_query_display_and_keeps_the_active_entry(
+        cx: &mut TestAppContext,
+    ) {
+        use editor::MultiBuffer;
+        use editor::test::build_editor;
+        use project::{FakeFs, Project};
+        use util::path;
+
+        init_test(cx);
+
+        let entry_count = MAX_BREADCRUMB_MENU_ENTRIES + 50;
+        let mut alpha = serde_json::Map::new();
+        for index in 0..entry_count {
+            alpha.insert(
+                format!("file_{index:04}.txt"),
+                serde_json::Value::String(String::new()),
+            );
+        }
+        let mut root = serde_json::Map::new();
+        root.insert("alpha".to_string(), serde_json::Value::Object(alpha));
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root"), serde_json::Value::Object(root))
+            .await;
+        let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+        let worktree_id = project.update(cx, |project, cx| {
+            project.worktrees(cx).next().unwrap().read(cx).id()
+        });
+
+        let workspace_window =
+            cx.add_window(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let workspace = workspace_window.root(cx).unwrap();
+
+        let buffer = cx.new(|cx| language::Buffer::local("", cx));
+        let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+        let editor_window = cx.add_window(|window, cx| build_editor(buffer, window, cx));
+        let editor = editor_window.root(cx).unwrap();
+        let cx = &mut VisualTestContext::from_window(*editor_window, cx);
+
+        // The highest-numbered file sorts last, well past the cap.
+        let active_path =
+            util::rel_path::rel_path(&format!("alpha/file_{:04}.txt", entry_count - 1)).into_arc();
+
+        let picker = editor_window
+            .update(cx, |_, window, cx| {
+                BreadcrumbDirectoryDelegate::picker(
+                    editor.downgrade(),
+                    workspace.downgrade(),
+                    worktree_id,
+                    util::rel_path::rel_path("alpha").into_arc(),
+                    Some(active_path.clone()),
+                    window,
+                    cx,
+                )
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        picker.read_with(cx, |picker, _| {
+            assert_eq!(
+                picker.delegate.matches.len(),
+                MAX_BREADCRUMB_MENU_ENTRIES,
+                "the empty-query display is capped the same way a typed filter is"
+            );
+            assert!(
+                picker.delegate.matches.iter().any(|entry_match| {
+                    picker.delegate.entries[entry_match.candidate_id].path == active_path
+                }),
+                "the active entry stays among the displayed rows even though it sorts past the cap"
+            );
+            let selected = picker
+                .delegate
+                .entry_at(picker.delegate.selected_index)
+                .expect("a row is selected");
+            assert_eq!(
+                selected.path, active_path,
+                "the active entry is preselected"
             );
         });
     }

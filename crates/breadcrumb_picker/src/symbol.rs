@@ -17,7 +17,6 @@ use ui::{
     PopoverMenu, PopoverMenuHandle, prelude::*,
 };
 use util::rel_path::RelPath;
-use workspace::ItemHandle;
 
 use crate::MAX_BREADCRUMB_MENU_ENTRIES;
 
@@ -44,13 +43,16 @@ pub struct BreadcrumbSymbolDelegate {
     /// The segment this popover is anchored under; `None` is the file segment.
     target: Option<OutlineItem<Anchor>>,
     items: Vec<OutlineItem<Anchor>>,
-    /// Built once from `items` at construction; `update_matches` just clones the `Rc`.
+    /// Built once from `items`; a typed query clones this `Rc`, an empty one still copies up to the cap.
     candidates: Rc<[StringMatchCandidate]>,
     matches: Vec<StringMatch>,
     query: String,
     selected_index: usize,
     current_range: Option<Range<Anchor>>,
     parent_dir: Option<(WorktreeId, Arc<RelPath>)>,
+    /// The outline had not answered yet when the popover opened; cleared once `watch_outline_ready`'s task lands.
+    loading: bool,
+    _loading_task: Task<()>,
 }
 
 pub type BreadcrumbSymbolPicker = Picker<BreadcrumbSymbolDelegate>;
@@ -61,44 +63,110 @@ impl BreadcrumbSymbolDelegate {
         buffer_id: BufferId,
         target: Option<OutlineItem<Anchor>>,
         items: Vec<OutlineItem<Anchor>>,
+        loading: bool,
         current_range: Option<Range<Anchor>>,
         parent_dir: Option<(WorktreeId, Arc<RelPath>)>,
         window: &mut Window,
         cx: &mut App,
     ) -> Entity<BreadcrumbSymbolPicker> {
         cx.new(|cx| {
-            let selected_index = current_range
-                .as_ref()
-                .and_then(|range| items.iter().position(|item| &item.range == range))
-                .unwrap_or(0);
-            let candidates = items
-                .iter()
-                .enumerate()
-                .map(|(index, item)| {
-                    StringMatchCandidate::new(
-                        index,
-                        &flatten_text_for_single_line_display(&item.text),
-                    )
-                })
-                .collect::<Vec<_>>()
-                .into();
-            let delegate = Self {
-                editor,
+            let mut delegate = Self {
+                editor: editor.clone(),
                 buffer_id,
-                target,
-                items,
-                candidates,
+                target: target.clone(),
+                items: Vec::new(),
+                candidates: Vec::new().into(),
                 matches: Vec::new(),
                 query: String::new(),
-                selected_index,
+                selected_index: 0,
                 current_range,
                 parent_dir,
+                loading,
+                _loading_task: Task::ready(()),
             };
-            Picker::uniform_list(delegate, window, cx)
+            delegate.reset_items(items);
+            let mut picker = Picker::uniform_list(delegate, window, cx)
                 .popover()
                 .show_scrollbar(true)
-                .initial_width(rems(18.))
+                .initial_width(rems(18.));
+            if loading {
+                picker
+                    .delegate
+                    .watch_outline_ready(editor, buffer_id, target, window, cx);
+            }
+            picker
         })
+    }
+
+    /// Rebuilds `candidates` for new `items`, then rebuilds the empty-query display from them.
+    fn reset_items(&mut self, items: Vec<OutlineItem<Anchor>>) {
+        self.candidates = items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                StringMatchCandidate::new(index, &flatten_text_for_single_line_display(&item.text))
+            })
+            .collect::<Vec<_>>()
+            .into();
+        self.items = items;
+        self.apply_empty_query_matches();
+    }
+
+    /// Caps `matches` like a typed filter, preselecting `current_range` and keeping it displayed even past the cap.
+    fn apply_empty_query_matches(&mut self) {
+        let keep_candidate_id = self
+            .current_range
+            .as_ref()
+            .and_then(|range| self.items.iter().position(|item| &item.range == range));
+        self.matches = crate::cap_empty_query_matches(
+            &self.candidates,
+            keep_candidate_id,
+            MAX_BREADCRUMB_MENU_ENTRIES,
+        );
+        self.selected_index = self
+            .current_range
+            .as_ref()
+            .and_then(|range| {
+                self.matches.iter().position(|entry_match| {
+                    self.items
+                        .get(entry_match.candidate_id)
+                        .is_some_and(|item| &item.range == range)
+                })
+            })
+            .unwrap_or(0);
+    }
+
+    /// Waits for the prefetch the caller already kicked off, then refreshes the listing.
+    fn watch_outline_ready(
+        &mut self,
+        editor: WeakEntity<Editor>,
+        buffer_id: BufferId,
+        target: Option<OutlineItem<Anchor>>,
+        window: &mut Window,
+        cx: &mut Context<BreadcrumbSymbolPicker>,
+    ) {
+        let Ok(task) = editor.read_with(cx, |editor, _| editor.breadcrumb_outline_prefetch_task())
+        else {
+            return;
+        };
+        self._loading_task = cx.spawn_in(window, async move |picker, cx| {
+            task.await;
+            picker
+                .update_in(cx, |picker, window, cx| {
+                    let Some(items) = editor
+                        .read_with(cx, |editor, cx| {
+                            editor.breadcrumb_symbol_menu_items(buffer_id, target.as_ref(), cx)
+                        })
+                        .ok()
+                    else {
+                        return;
+                    };
+                    picker.delegate.loading = false;
+                    picker.delegate.reset_items(items);
+                    picker.refresh(window, cx);
+                })
+                .ok();
+        });
     }
 
     fn shows_current_marker(&self) -> bool {
@@ -141,6 +209,16 @@ impl PickerDelegate for BreadcrumbSymbolDelegate {
         "Search symbols…".into()
     }
 
+    fn no_matches_text(&self, _window: &mut Window, _cx: &mut App) -> Option<SharedString> {
+        Some(if !self.query.is_empty() {
+            "No matches".into()
+        } else if self.loading {
+            "Loading symbols…".into()
+        } else {
+            "No symbols".into()
+        })
+    }
+
     fn editor_position(&self) -> PickerEditorPosition {
         PickerEditorPosition::End
     }
@@ -158,21 +236,7 @@ impl PickerDelegate for BreadcrumbSymbolDelegate {
         self.query = query.clone();
 
         if query.is_empty() {
-            self.matches = self
-                .candidates
-                .iter()
-                .map(|candidate| StringMatch {
-                    candidate_id: candidate.id,
-                    string: candidate.string.clone(),
-                    positions: Vec::new(),
-                    score: 0.,
-                })
-                .collect();
-            self.selected_index = self
-                .current_range
-                .as_ref()
-                .and_then(|range| self.items.iter().position(|item| &item.range == range))
-                .unwrap_or(0);
+            self.apply_empty_query_matches();
             cx.notify();
             return Task::ready(());
         }
@@ -312,11 +376,13 @@ impl PickerDelegate for BreadcrumbSymbolDelegate {
     }
 }
 
-/// Decided once so the same click never flips between an empty popover and the outline modal.
+/// The popover always opens; this only decides what it shows, so a click never picks between an empty popover and the outline modal.
 enum BreadcrumbSymbolMenuOutcome {
-    ShowPicker(Vec<OutlineItem<Anchor>>),
-    ShowOutlineModal,
-    OutlineNotReady,
+    Ready(Vec<OutlineItem<Anchor>>),
+    /// The outline answered, and it is genuinely empty.
+    Empty,
+    /// The outline has not answered yet; the caller kicks a prefetch alongside this.
+    NotReady,
 }
 
 fn breadcrumb_symbol_menu_outcome(
@@ -327,12 +393,12 @@ fn breadcrumb_symbol_menu_outcome(
 ) -> BreadcrumbSymbolMenuOutcome {
     let menu_items = editor.breadcrumb_symbol_menu_items(buffer_id, target, cx);
     if !menu_items.is_empty() {
-        return BreadcrumbSymbolMenuOutcome::ShowPicker(menu_items);
+        return BreadcrumbSymbolMenuOutcome::Ready(menu_items);
     }
     if editor.breadcrumb_outline_ready(buffer_id, cx) {
-        BreadcrumbSymbolMenuOutcome::ShowOutlineModal
+        BreadcrumbSymbolMenuOutcome::Empty
     } else {
-        BreadcrumbSymbolMenuOutcome::OutlineNotReady
+        BreadcrumbSymbolMenuOutcome::NotReady
     }
 }
 
@@ -372,28 +438,19 @@ pub(crate) fn render_breadcrumb_symbol_segment(
     };
     menu.menu(move |window, cx| {
         let editor_entity = editor.upgrade()?;
-        let menu_items = match breadcrumb_symbol_menu_outcome(
+        let (menu_items, loading) = match breadcrumb_symbol_menu_outcome(
             editor_entity.read(cx),
             buffer_id,
             target.as_ref(),
             cx,
         ) {
-            BreadcrumbSymbolMenuOutcome::ShowPicker(menu_items) => menu_items,
-            BreadcrumbSymbolMenuOutcome::OutlineNotReady => {
-                // A silent click is worse than the modal: fetch, and still do something now.
+            BreadcrumbSymbolMenuOutcome::Ready(menu_items) => (menu_items, false),
+            BreadcrumbSymbolMenuOutcome::Empty => (Vec::new(), false),
+            BreadcrumbSymbolMenuOutcome::NotReady => {
                 editor_entity.update(cx, |editor, cx| {
                     editor.prefetch_breadcrumb_outline(buffer_id, cx);
                 });
-                if let Some(callback) = zed_actions::outline::TOGGLE_OUTLINE.get() {
-                    callback(editor_entity.to_any_view(), window, cx);
-                }
-                return None;
-            }
-            BreadcrumbSymbolMenuOutcome::ShowOutlineModal => {
-                if let Some(callback) = zed_actions::outline::TOGGLE_OUTLINE.get() {
-                    callback(editor_entity.to_any_view(), window, cx);
-                }
-                return None;
+                (Vec::new(), true)
             }
         };
 
@@ -406,6 +463,7 @@ pub(crate) fn render_breadcrumb_symbol_segment(
             buffer_id,
             target.clone(),
             menu_items,
+            loading,
             target.as_ref().map(|item| item.range.clone()),
             parent_dir.clone(),
             window,
@@ -488,6 +546,7 @@ mod tests {
                     BufferId::new(1).unwrap(),
                     None,
                     items,
+                    false,
                     Some(current_range),
                     None,
                     window,
@@ -540,6 +599,7 @@ mod tests {
                     BufferId::new(1).unwrap(),
                     None,
                     items,
+                    false,
                     None,
                     None,
                     window,
@@ -594,6 +654,7 @@ mod tests {
                     BufferId::new(1).unwrap(),
                     None,
                     items,
+                    false,
                     None,
                     None,
                     window,
@@ -652,6 +713,7 @@ mod tests {
                     buffer_id,
                     None,
                     items,
+                    false,
                     None,
                     None,
                     window,
@@ -716,6 +778,7 @@ mod tests {
                 BufferId::new(1).unwrap(),
                 None,
                 items,
+                false,
                 None,
                 None,
                 window,
@@ -781,6 +844,7 @@ mod tests {
                     buffer_id,
                     Some(target),
                     vec![test_item(&snapshot, 0, "alpha")],
+                    false,
                     None,
                     None,
                     window,
@@ -818,6 +882,7 @@ mod tests {
                     BufferId::new(1).unwrap(),
                     None,
                     Vec::new(),
+                    false,
                     None,
                     None,
                     window,
@@ -856,6 +921,7 @@ mod tests {
                 buffer_id,
                 Some(target),
                 vec![test_item(&snapshot, 0, "alpha")],
+                false,
                 None,
                 None,
                 window,
@@ -919,15 +985,15 @@ mod tests {
         editor.read_with(cx, |editor, cx| {
             let outcome = breadcrumb_symbol_menu_outcome(editor, buffer_id, None, cx);
             assert!(
-                matches!(outcome, BreadcrumbSymbolMenuOutcome::OutlineNotReady),
+                matches!(outcome, BreadcrumbSymbolMenuOutcome::NotReady),
                 "the outline has not been fetched yet, so the picker's items are not known; \
-                 the caller decides whether that means a prefetch-and-fall-back-to-modal"
+                 the caller kicks a prefetch and opens the popover in a loading state anyway"
             );
         });
     }
 
     #[gpui::test]
-    async fn test_breadcrumb_symbol_menu_outcome_falls_back_to_modal_when_genuinely_empty(
+    async fn test_breadcrumb_symbol_menu_outcome_is_empty_when_genuinely_empty(
         cx: &mut TestAppContext,
     ) {
         init_test(cx);
@@ -961,8 +1027,8 @@ mod tests {
         editor.read_with(cx, |editor, cx| {
             let outcome = breadcrumb_symbol_menu_outcome(editor, buffer_id, None, cx);
             assert!(
-                matches!(outcome, BreadcrumbSymbolMenuOutcome::ShowOutlineModal),
-                "a loaded outline with no items must fall back to the outline modal"
+                matches!(outcome, BreadcrumbSymbolMenuOutcome::Empty),
+                "a loaded outline with no items shows the popover's own empty state"
             );
         });
     }

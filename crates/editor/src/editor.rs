@@ -1183,10 +1183,10 @@ pub struct Editor {
     lsp_document_symbols: HashMap<BufferId, Vec<OutlineItem<text::Anchor>>>,
     refresh_outline_symbols_at_cursor_at_cursor_task: Task<()>,
     outline_symbols_at_cursor: Option<(BufferId, Vec<OutlineItem<Anchor>>)>,
-    breadcrumb_outline_task: Task<()>,
+    breadcrumb_outline_task: Shared<Task<()>>,
     breadcrumb_outline_debounce_task: Task<()>,
     breadcrumb_outline: Option<BreadcrumbOutline>,
-    /// `breadcrumb_outline` converted to multi-buffer anchors, cached by buffer id/version.
+    /// `breadcrumb_outline` converted to multi-buffer anchors for the buffer id/version it holds.
     breadcrumb_converted_outline_cache: RefCell<Option<ConvertedBreadcrumbOutline>>,
     #[cfg(any(test, feature = "test-support"))]
     breadcrumb_converted_outline_recomputes: Cell<usize>,
@@ -2514,7 +2514,7 @@ impl Editor {
             lsp_document_symbols: HashMap::default(),
             refresh_outline_symbols_at_cursor_at_cursor_task: Task::ready(()),
             outline_symbols_at_cursor: None,
-            breadcrumb_outline_task: Task::ready(()),
+            breadcrumb_outline_task: Task::ready(()).shared(),
             breadcrumb_outline_debounce_task: Task::ready(()),
             breadcrumb_outline: None,
             breadcrumb_converted_outline_cache: RefCell::new(None),
@@ -11096,7 +11096,6 @@ impl Editor {
         ));
     }
 
-    /// Do not call from `Entity::update` or `cx.listener`: `hide` below needs no lease held.
     pub fn open_breadcrumb_navigation(
         &mut self,
         worktree_id: WorktreeId,
@@ -11127,7 +11126,6 @@ impl Editor {
         cx.emit(EditorEvent::BreadcrumbsChanged);
     }
 
-    /// Do not call from `Entity::update` or `cx.listener`: `hide` below needs no lease held.
     pub fn open_breadcrumb_symbol_navigation(
         &mut self,
         buffer_id: BufferId,

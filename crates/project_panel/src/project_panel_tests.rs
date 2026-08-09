@@ -6974,6 +6974,101 @@ async fn test_manual_selection_cancels_pending_folded_reveal(cx: &mut gpui::Test
 }
 
 #[gpui::test]
+async fn test_reveal_entry_marks_the_revealed_component_within_a_folded_chain(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/root",
+        json!({
+            "a": {
+                "b": {
+                    "c": {
+                        "d": {}
+                    }
+                }
+            }
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs.clone(), ["/root".as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |mw, _| mw.workspace().clone())
+        .unwrap();
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+    cx.update(|_, cx| {
+        let settings = *ProjectPanelSettings::get_global(cx);
+        ProjectPanelSettings::override_global(
+            ProjectPanelSettings {
+                auto_fold_dirs: true,
+                ..settings
+            },
+            cx,
+        );
+    });
+
+    let panel = workspace.update_in(cx, ProjectPanel::new);
+    cx.run_until_parked();
+
+    assert_eq!(
+        visible_entries_as_strings(&panel, 0..20, cx),
+        &["v root", "    > a/b/c/d"],
+        "a single-child directory chain folds into one row before the reveal"
+    );
+
+    let worktree_id = panel.update(cx, |panel, cx| {
+        panel
+            .project
+            .read(cx)
+            .worktrees(cx)
+            .next()
+            .unwrap()
+            .read(cx)
+            .id()
+    });
+    let leaf_entry = find_project_entry(&panel, "root/a/b/c/d", cx).unwrap();
+    let middle_entry = find_project_entry(&panel, "root/a/b", cx).unwrap();
+
+    panel.update(cx, |panel, cx| {
+        panel.project.update(cx, |_, cx| {
+            cx.emit(project::Event::RevealInProjectPanel(middle_entry))
+        })
+    });
+    cx.run_until_parked();
+
+    panel.read_with(cx, |panel, _| {
+        let folded = panel
+            .state
+            .ancestors
+            .get(&leaf_entry)
+            .expect("the chain is still folded after revealing an entry inside it");
+        assert_eq!(
+            folded.active_ancestor(),
+            Some(middle_entry),
+            "the revealed entry, not the leaf the row is keyed by, must be the active component"
+        );
+        assert_eq!(
+            folded.active_index(),
+            1,
+            "the active index must point at \"b\"'s position within the joined \"a/b/c/d\" label"
+        );
+        assert_eq!(
+            panel.marked_entries,
+            vec![SelectedEntry {
+                worktree_id,
+                entry_id: leaf_entry,
+            }],
+            "the row itself stays keyed by the leaf; only the active component changes"
+        );
+    });
+}
+
+#[gpui::test]
 async fn test_basic_file_deletion_scenarios(cx: &mut gpui::TestAppContext) {
     init_test_with_editor(cx);
 

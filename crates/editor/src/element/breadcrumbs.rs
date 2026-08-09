@@ -130,6 +130,8 @@ struct BreadcrumbsRow {
     /// Set by clicking the ellipsis: renders every segment instead of dropping any.
     expanded: bool,
     file_outlives_symbols: bool,
+    /// An excerpt header row: its ellipsis must render as a plain marker, since it can never expand.
+    multibuffer_header: bool,
 }
 
 const BREADCRUMB_SEGMENT_GROUP: &str = "breadcrumb-segment";
@@ -392,7 +394,11 @@ impl BreadcrumbsRow {
 
     fn render_ellipsis(&self, position: usize, last_position: usize, cx: &App) -> gpui::AnyElement {
         let content = Label::new("⋯").color(Color::Placeholder).into_any_element();
-        let label = self.with_separator(position, last_position, content, true, cx);
+        let interactive = breadcrumb_ellipsis_is_interactive(self.multibuffer_header);
+        let label = self.with_separator(position, last_position, content, interactive, cx);
+        if !interactive {
+            return label;
+        }
         let Some(editor) = self.editor.clone() else {
             return label;
         };
@@ -928,6 +934,7 @@ pub fn render_breadcrumb_text(
         editor: editor.clone(),
         expanded,
         file_outlives_symbols: tab_bar_hidden,
+        multibuffer_header,
     };
 
     let breadcrumbs_stack = if multibuffer_header {
@@ -1012,6 +1019,11 @@ fn file_segment_symbol_target(
 /// A multibuffer excerpt header has no scroll container, so an expanded row would overrun its neighbours.
 fn breadcrumb_row_is_expanded(multibuffer_header: bool, expanded: bool) -> bool {
     !multibuffer_header && expanded
+}
+
+/// A header row can never expand (see `breadcrumb_row_is_expanded`), so only the main bar's ellipsis is live.
+fn breadcrumb_ellipsis_is_interactive(multibuffer_header: bool) -> bool {
+    !multibuffer_header
 }
 
 fn is_file_breadcrumb_segment(
@@ -1151,6 +1163,15 @@ mod tests {
     }
 
     #[test]
+    fn test_breadcrumb_ellipsis_is_interactive_only_off_a_multibuffer_header() {
+        assert!(
+            !breadcrumb_ellipsis_is_interactive(true),
+            "a header row's ellipsis can never expand it, so it must not offer to"
+        );
+        assert!(breadcrumb_ellipsis_is_interactive(false));
+    }
+
+    #[test]
     fn test_dirty_filename_text_style_only_changes_font_weight() {
         let mut base = gpui::TextStyle::default();
         base.color = gpui::red();
@@ -1270,6 +1291,7 @@ mod tests {
                 editor: None,
                 expanded: self.expanded,
                 file_outlives_symbols: false,
+                multibuffer_header: false,
             };
             // Mirrors the real chain, clipping box and nested rows included.
             h_flex().w(px(200.)).overflow_x_hidden().child(
