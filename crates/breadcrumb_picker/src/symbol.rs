@@ -44,6 +44,8 @@ pub struct BreadcrumbSymbolDelegate {
     /// The segment this popover is anchored under; `None` is the file segment.
     target: Option<OutlineItem<Anchor>>,
     items: Vec<OutlineItem<Anchor>>,
+    /// Built once from `items` at construction; `update_matches` just clones the `Rc`.
+    candidates: Rc<[StringMatchCandidate]>,
     matches: Vec<StringMatch>,
     query: String,
     selected_index: usize,
@@ -69,11 +71,23 @@ impl BreadcrumbSymbolDelegate {
                 .as_ref()
                 .and_then(|range| items.iter().position(|item| &item.range == range))
                 .unwrap_or(0);
+            let candidates = items
+                .iter()
+                .enumerate()
+                .map(|(index, item)| {
+                    StringMatchCandidate::new(
+                        index,
+                        &flatten_text_for_single_line_display(&item.text),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .into();
             let delegate = Self {
                 editor,
                 buffer_id,
                 target,
                 items,
+                candidates,
                 matches: Vec::new(),
                 query: String::new(),
                 selected_index,
@@ -142,21 +156,14 @@ impl PickerDelegate for BreadcrumbSymbolDelegate {
         cx: &mut Context<BreadcrumbSymbolPicker>,
     ) -> Task<()> {
         self.query = query.clone();
-        let candidates = self
-            .items
-            .iter()
-            .enumerate()
-            .map(|(index, item)| {
-                StringMatchCandidate::new(index, &flatten_text_for_single_line_display(&item.text))
-            })
-            .collect::<Vec<_>>();
 
         if query.is_empty() {
-            self.matches = candidates
-                .into_iter()
+            self.matches = self
+                .candidates
+                .iter()
                 .map(|candidate| StringMatch {
                     candidate_id: candidate.id,
-                    string: candidate.string,
+                    string: candidate.string.clone(),
                     positions: Vec::new(),
                     score: 0.,
                 })
@@ -170,6 +177,7 @@ impl PickerDelegate for BreadcrumbSymbolDelegate {
             return Task::ready(());
         }
 
+        let candidates = self.candidates.clone();
         let executor = cx.background_executor().clone();
         cx.spawn(async move |picker, cx| {
             let matches = fuzzy::match_strings(
@@ -561,6 +569,59 @@ mod tests {
             assert_eq!(
                 picker.delegate.selected_index, 0,
                 "filtering resets the selection to the top match"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_update_matches_reuses_cached_candidates(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let (editor_window, editor) = build_test_editor(cx);
+        let cx = &mut VisualTestContext::from_window(*editor_window, cx);
+
+        let snapshot = editor.read_with(cx, |editor, cx| editor.buffer().read(cx).snapshot(cx));
+        let items = vec![
+            test_item(&snapshot, 0, "alpha"),
+            test_item(&snapshot, 1, "beta"),
+            test_item(&snapshot, 2, "gamma"),
+        ];
+
+        let picker = editor_window
+            .update(cx, |_, window, cx| {
+                BreadcrumbSymbolDelegate::picker(
+                    editor.downgrade(),
+                    BufferId::new(1).unwrap(),
+                    None,
+                    items,
+                    None,
+                    None,
+                    window,
+                    cx,
+                )
+            })
+            .unwrap();
+
+        let candidates_before =
+            picker.read_with(cx, |picker, _| picker.delegate.candidates.clone());
+
+        picker
+            .update_in(cx, |picker, window, cx| {
+                picker
+                    .delegate
+                    .update_matches("gam".to_string(), window, cx)
+            })
+            .await;
+        picker
+            .update_in(cx, |picker, window, cx| {
+                picker.delegate.update_matches("ga".to_string(), window, cx)
+            })
+            .await;
+
+        picker.read_with(cx, |picker, _| {
+            assert!(
+                Rc::ptr_eq(&candidates_before, &picker.delegate.candidates),
+                "successive keystrokes must reuse the same candidate list, not rebuild it"
             );
         });
     }

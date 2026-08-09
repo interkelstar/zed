@@ -155,8 +155,6 @@ pub struct BreadcrumbDirectoryEntry {
     pub is_dir: bool,
     pub is_ignored: bool,
     pub git_summary: GitSummary,
-    /// Only ever set for files: computing the panel's ancestor-propagated severity per directory row is too costly here.
-    pub diagnostic_severity: Option<DiagnosticSeverity>,
 }
 
 pub fn breadcrumb_directory_entries(
@@ -167,7 +165,6 @@ pub fn breadcrumb_directory_entries(
 ) -> Vec<BreadcrumbDirectoryEntry> {
     let settings = BreadcrumbDirectoryListingSettings::get_global(cx);
     let worktree_snapshot = worktree.read(cx).snapshot();
-    let worktree_id = worktree_snapshot.id();
     let project_ref = project.read(cx);
     let repo_snapshots = project_ref.git_store().read(cx).display_repo_snapshots(cx);
     let mut entries = project::git_store::git_traversal::ChildEntriesGitIter::new(
@@ -192,26 +189,12 @@ pub fn breadcrumb_directory_entries(
         .into_iter()
         .filter_map(|entry| {
             let name = entry.path.file_name()?.to_string();
-            let diagnostic_severity = (!entry.is_dir())
-                .then(|| {
-                    breadcrumb_diagnostic_severity(
-                        project_ref,
-                        &ProjectPath {
-                            worktree_id,
-                            path: entry.path.clone(),
-                        },
-                        settings.show_diagnostics,
-                        cx,
-                    )
-                })
-                .flatten();
             Some(BreadcrumbDirectoryEntry {
                 name: name.into(),
                 path: entry.path.clone(),
                 is_dir: entry.is_dir(),
                 is_ignored: entry.is_ignored,
                 git_summary: entry.git_summary,
-                diagnostic_severity,
             })
         })
         .collect()
@@ -738,21 +721,30 @@ mod tests {
         });
         cx.run_until_parked();
 
-        let entries =
-            cx.update(|cx| breadcrumb_directory_entries(&project, &worktree, RelPath::empty(), cx));
+        // Entries no longer carry a severity; rows resolve it live from this helper instead.
+        let severity_for = |name: &'static str, cx: &mut TestAppContext| {
+            let worktree_id = worktree.read_with(cx, |worktree, _| worktree.id());
+            cx.update(|cx| {
+                let settings = BreadcrumbDirectoryListingSettings::get_global(cx);
+                breadcrumb_diagnostic_severity(
+                    project.read(cx),
+                    &ProjectPath {
+                        worktree_id,
+                        path: util::rel_path::rel_path(name).into_arc(),
+                    },
+                    settings.show_diagnostics,
+                    cx,
+                )
+            })
+        };
+
         assert_eq!(
-            entries
-                .iter()
-                .find(|entry| entry.name.as_ref() == "error.txt")
-                .and_then(|entry| entry.diagnostic_severity),
-            Some(DiagnosticSeverity::ERROR),
+            severity_for("error.txt", cx),
+            Some(DiagnosticSeverity::ERROR)
         );
         assert_eq!(
-            entries
-                .iter()
-                .find(|entry| entry.name.as_ref() == "warning.txt")
-                .and_then(|entry| entry.diagnostic_severity),
-            Some(DiagnosticSeverity::WARNING),
+            severity_for("warning.txt", cx),
+            Some(DiagnosticSeverity::WARNING)
         );
 
         cx.update(|cx| {
@@ -765,21 +757,13 @@ mod tests {
                 });
             });
         });
-        let entries =
-            cx.update(|cx| breadcrumb_directory_entries(&project, &worktree, RelPath::empty(), cx));
         assert_eq!(
-            entries
-                .iter()
-                .find(|entry| entry.name.as_ref() == "error.txt")
-                .and_then(|entry| entry.diagnostic_severity),
+            severity_for("error.txt", cx),
             Some(DiagnosticSeverity::ERROR),
             "errors still surface under `errors`",
         );
         assert_eq!(
-            entries
-                .iter()
-                .find(|entry| entry.name.as_ref() == "warning.txt")
-                .and_then(|entry| entry.diagnostic_severity),
+            severity_for("warning.txt", cx),
             None,
             "warnings are filtered out under `errors`",
         );
@@ -794,12 +778,9 @@ mod tests {
                 });
             });
         });
-        let entries =
-            cx.update(|cx| breadcrumb_directory_entries(&project, &worktree, RelPath::empty(), cx));
-        assert!(
-            entries
-                .iter()
-                .all(|entry| entry.diagnostic_severity.is_none()),
+        assert_eq!(
+            severity_for("error.txt", cx),
+            None,
             "`off` suppresses diagnostics entirely",
         );
     }

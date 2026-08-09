@@ -1936,4 +1936,79 @@ mod tests {
             );
         });
     }
+
+    #[gpui::test]
+    async fn test_stale_outline_debounce_does_not_evict_a_different_buffers_fresh_outline(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx, |_| {});
+
+        let (editor, cx) = cx.add_window_view(|window, cx| {
+            let multi_buffer = MultiBuffer::build_multi(
+                [
+                    ("fn one() {}\n", vec![Point::row_range(0..1)]),
+                    ("fn two() {}\n", vec![Point::row_range(0..1)]),
+                ],
+                cx,
+            );
+            Editor::new(crate::EditorMode::full(), multi_buffer, None, window, cx)
+        });
+        cx.run_until_parked();
+
+        let (buffer_a_id, buffer_b_id) = editor.read_with(cx, |editor, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let mut buffer_ids = snapshot
+                .excerpts()
+                .map(|excerpt| excerpt.context.start.buffer_id);
+            (buffer_ids.next().unwrap(), buffer_ids.next().unwrap())
+        });
+
+        // Without a resolved language, buffer A's debounce would answer `None` and never touch the cache.
+        editor.update(cx, |editor, cx| {
+            let buffer_a = editor.buffer().read(cx).buffer(buffer_a_id).unwrap();
+            buffer_a.update(cx, |buffer, cx| {
+                buffer.set_language(Some(language::PLAIN_TEXT.clone()), cx)
+            });
+        });
+        cx.run_until_parked();
+
+        editor.update_in(cx, |editor, window, cx| {
+            editor.change_selections(Default::default(), window, cx, |selections| {
+                selections.select_ranges([Point::new(0, 0)..Point::new(0, 0)]);
+            });
+        });
+
+        // Buffer B is already fresh, as if it had been fetched moments ago.
+        let buffer_b_version = editor.read_with(cx, |editor, cx| {
+            editor
+                .buffer()
+                .read(cx)
+                .buffer(buffer_b_id)
+                .unwrap()
+                .read(cx)
+                .version()
+        });
+        editor.update(cx, |editor, cx| {
+            editor.set_breadcrumb_outline(buffer_b_id, Vec::new(), cx);
+        });
+
+        // Row 1 is the blank separator `build_multi` puts between excerpts; B starts at row 2.
+        editor.update_in(cx, |editor, window, cx| {
+            editor.change_selections(Default::default(), window, cx, |selections| {
+                selections.select_ranges([Point::new(2, 0)..Point::new(2, 0)]);
+            });
+        });
+
+        cx.executor()
+            .advance_clock(LSP_REQUEST_DEBOUNCE_TIMEOUT * 2);
+        cx.run_until_parked();
+
+        editor.read_with(cx, |editor, _cx| {
+            assert!(
+                editor.breadcrumb_outline_is_fresh(buffer_b_id, &buffer_b_version),
+                "a stale debounce timer left over from a previous buffer must not overwrite \
+                 the cache for the buffer the cursor is actually on"
+            );
+        });
+    }
 }

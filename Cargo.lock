@@ -2456,6 +2456,7 @@ dependencies = [
  "git",
  "gpui",
  "language",
+ "lsp",
  "menu",
  "picker",
  "project",

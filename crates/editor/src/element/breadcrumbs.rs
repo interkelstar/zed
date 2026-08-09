@@ -19,7 +19,8 @@ pub(crate) use outline::outline_parents;
 pub use outline::{child_outline_indices, sibling_outline_indices, top_level_outline_indices};
 use path::breadcrumb_path_is_navigable;
 pub use path::{
-    BreadcrumbDirectoryEntry, BreadcrumbDirectoryListingSettings, breadcrumb_directory_entries,
+    BreadcrumbDirectoryEntry, BreadcrumbDirectoryListingSettings, breadcrumb_diagnostic_severity,
+    breadcrumb_directory_entries,
 };
 pub(crate) use path::{breadcrumb_path_segments, breadcrumb_segment_copy_path};
 

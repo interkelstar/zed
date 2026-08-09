@@ -106,8 +106,9 @@ pub use editor_settings::{
 pub use element::{
     BREADCRUMB_PICKER_RENDERERS, BreadcrumbDirectoryEntry, BreadcrumbDirectoryListingSettings,
     BreadcrumbPickerRenderers, CursorLayout, EditorElement, ErasedBreadcrumbPopoverHandle,
-    HighlightedRange, HighlightedRangeLine, PointForPosition, breadcrumb_directory_entries,
-    file_status_label_color, flatten_text_for_single_line_display, render_breadcrumb_text,
+    HighlightedRange, HighlightedRangeLine, PointForPosition, breadcrumb_diagnostic_severity,
+    breadcrumb_directory_entries, file_status_label_color, flatten_text_for_single_line_display,
+    render_breadcrumb_text,
 };
 pub use git::blame::BlameRenderer;
 pub use git::{
@@ -3785,19 +3786,23 @@ impl Editor {
         // Full editors only, and debounced like `refresh_document_symbols`: every keystroke lands here.
         if self.mode().is_full()
             && let Some((_, buffer)) = multi_buffer_snapshot.anchor_to_buffer_anchor(cursor)
-            && !self.breadcrumb_outline_is_fresh(buffer.remote_id(), buffer.version())
         {
-            let buffer_id = buffer.remote_id();
-            self.breadcrumb_outline_debounce_task = cx.spawn(async move |editor, cx| {
-                cx.background_executor()
-                    .timer(LSP_REQUEST_DEBOUNCE_TIMEOUT)
-                    .await;
-                editor
-                    .update(cx, |editor, cx| {
-                        editor.prefetch_breadcrumb_outline(buffer_id, cx);
-                    })
-                    .ok();
-            });
+            if self.breadcrumb_outline_is_fresh(buffer.remote_id(), buffer.version()) {
+                // Cancels a timer armed for a different buffer, which could otherwise evict this one's outline.
+                self.breadcrumb_outline_debounce_task = Task::ready(());
+            } else {
+                let buffer_id = buffer.remote_id();
+                self.breadcrumb_outline_debounce_task = cx.spawn(async move |editor, cx| {
+                    cx.background_executor()
+                        .timer(LSP_REQUEST_DEBOUNCE_TIMEOUT)
+                        .await;
+                    editor
+                        .update(cx, |editor, cx| {
+                            editor.prefetch_breadcrumb_outline(buffer_id, cx);
+                        })
+                        .ok();
+                });
+            }
         }
 
         if !self.lsp_data_enabled() {

@@ -8,9 +8,9 @@ pub(crate) use breadcrumbs::outline_parents;
 pub use breadcrumbs::render_breadcrumb_text;
 pub use breadcrumbs::{
     BREADCRUMB_PICKER_RENDERERS, BreadcrumbDirectoryEntry, BreadcrumbDirectoryListingSettings,
-    BreadcrumbPickerRenderers, ErasedBreadcrumbPopoverHandle, breadcrumb_directory_entries,
-    child_outline_indices, flatten_text_for_single_line_display, sibling_outline_indices,
-    top_level_outline_indices,
+    BreadcrumbPickerRenderers, ErasedBreadcrumbPopoverHandle, breadcrumb_diagnostic_severity,
+    breadcrumb_directory_entries, child_outline_indices, flatten_text_for_single_line_display,
+    sibling_outline_indices, top_level_outline_indices,
 };
 #[cfg(test)]
 pub(crate) use header::StickyHeader;

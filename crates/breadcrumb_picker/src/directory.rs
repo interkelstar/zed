@@ -3,16 +3,17 @@ use std::sync::Arc;
 
 use editor::{
     BreadcrumbDirectoryEntry, BreadcrumbDirectoryListingSettings, Editor,
-    ErasedBreadcrumbPopoverHandle, breadcrumb_directory_entries,
+    ErasedBreadcrumbPopoverHandle, breadcrumb_diagnostic_severity, breadcrumb_directory_entries,
 };
 use fuzzy::{StringMatch, StringMatchCandidate};
 use gpui::{
     AnyElement, App, Context, DismissEvent, Entity, MouseButton, ParentElement, Styled, Task,
     WeakEntity, Window, div, rems,
 };
+use language::DiagnosticSeverity;
 use picker::{Picker, PickerDelegate, PickerEditorPosition};
 use project::{Project, ProjectPath, WorktreeId};
-use settings::Settings;
+use settings::{Settings, ShowDiagnostics};
 use ui::{
     ButtonLike, ButtonSize, ButtonStyle, Color, HighlightedLabel, Icon, IconSize, ListItem,
     ListItemSpacing, PopoverMenu, PopoverMenuHandle, prelude::*,
@@ -44,16 +45,19 @@ fn descend_single_child_directories(
     current
 }
 
+/// Shares `breadcrumb_directory_entries` so a directory hidden by settings is never a fold target.
 fn breadcrumb_directory_children(
+    project: Option<&Entity<Project>>,
     worktree: &Entity<project::Worktree>,
     path: &RelPath,
     cx: &App,
 ) -> Vec<(Arc<RelPath>, bool)> {
-    worktree
-        .read(cx)
-        .snapshot()
-        .child_entries(path)
-        .map(|entry| (entry.path.clone(), entry.is_dir()))
+    let Some(project) = project else {
+        return Vec::new();
+    };
+    breadcrumb_directory_entries(project, worktree, path, cx)
+        .into_iter()
+        .map(|entry| (entry.path, entry.is_dir))
         .collect()
 }
 
@@ -78,8 +82,8 @@ fn breadcrumb_entry_label_color(
     editor::items::entry_git_aware_label_color(git_summary, entry.is_ignored, is_active_file)
 }
 
-fn breadcrumb_entry_icon_color(entry: &BreadcrumbDirectoryEntry) -> Color {
-    editor::items::entry_diagnostic_aware_icon_decoration_and_color(entry.diagnostic_severity)
+fn breadcrumb_entry_icon_color(diagnostic_severity: Option<DiagnosticSeverity>) -> Color {
+    editor::items::entry_diagnostic_aware_icon_decoration_and_color(diagnostic_severity)
         .map(|(_, color)| color)
         .unwrap_or(Color::Muted)
 }
@@ -110,6 +114,8 @@ pub struct BreadcrumbDirectoryDelegate {
     current_path: Arc<RelPath>,
     active_path: Option<Arc<RelPath>>,
     entries: Vec<BreadcrumbDirectoryEntry>,
+    /// Rebuilt only alongside `entries`, not on every keystroke; `update_matches` just clones the `Rc`.
+    candidates: Rc<[StringMatchCandidate]>,
     matches: Vec<StringMatch>,
     query: String,
     selected_index: usize,
@@ -155,6 +161,7 @@ impl BreadcrumbDirectoryDelegate {
                 current_path,
                 active_path,
                 entries: Vec::new(),
+                candidates: Vec::new().into(),
                 matches: Vec::new(),
                 query: String::new(),
                 selected_index: 0,
@@ -187,10 +194,18 @@ impl BreadcrumbDirectoryDelegate {
     fn reload_entries(&mut self, cx: &App) {
         let (Some(project), Some(worktree)) = (self.project(cx), self.worktree(cx)) else {
             self.entries = Vec::new();
+            self.candidates = Vec::new().into();
             self.matches.clear();
             return;
         };
         self.entries = breadcrumb_directory_entries(&project, &worktree, &self.current_path, cx);
+        self.candidates = self
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| StringMatchCandidate::new(index, &entry.name))
+            .collect::<Vec<_>>()
+            .into();
         // `matches` holds candidate_id/positions into the entries just replaced above.
         self.matches.clear();
 
@@ -252,6 +267,28 @@ impl BreadcrumbDirectoryDelegate {
     fn entry_at(&self, index: usize) -> Option<&BreadcrumbDirectoryEntry> {
         self.entries.get(self.matches.get(index)?.candidate_id)
     }
+
+    /// Resolved per row, not for the whole listing, so opening a huge directory stays cheap.
+    fn row_diagnostic_severity(
+        &self,
+        entry: &BreadcrumbDirectoryEntry,
+        show_diagnostics: ShowDiagnostics,
+        cx: &App,
+    ) -> Option<DiagnosticSeverity> {
+        if entry.is_dir {
+            return None;
+        }
+        let project = self.project(cx)?;
+        breadcrumb_diagnostic_severity(
+            project.read(cx),
+            &ProjectPath {
+                worktree_id: self.worktree_id,
+                path: entry.path.clone(),
+            },
+            show_diagnostics,
+            cx,
+        )
+    }
 }
 
 impl PickerDelegate for BreadcrumbDirectoryDelegate {
@@ -306,19 +343,14 @@ impl PickerDelegate for BreadcrumbDirectoryDelegate {
         cx: &mut Context<BreadcrumbDirectoryPicker>,
     ) -> Task<()> {
         self.query = query.clone();
-        let candidates = self
-            .entries
-            .iter()
-            .enumerate()
-            .map(|(index, entry)| StringMatchCandidate::new(index, &entry.name))
-            .collect::<Vec<_>>();
 
         if query.is_empty() {
-            self.matches = candidates
-                .into_iter()
+            self.matches = self
+                .candidates
+                .iter()
                 .map(|candidate| StringMatch {
                     candidate_id: candidate.id,
-                    string: candidate.string,
+                    string: candidate.string.clone(),
                     positions: Vec::new(),
                     score: 0.,
                 })
@@ -328,6 +360,7 @@ impl PickerDelegate for BreadcrumbDirectoryDelegate {
             return Task::ready(());
         }
 
+        let candidates = self.candidates.clone();
         let executor = cx.background_executor().clone();
         cx.spawn(async move |picker, cx| {
             let matches = fuzzy::match_strings(
@@ -385,10 +418,11 @@ impl PickerDelegate for BreadcrumbDirectoryDelegate {
         let Some(worktree) = self.worktree(cx) else {
             return;
         };
+        let project = self.project(cx);
         let auto_fold_dirs = BreadcrumbDirectoryListingSettings::get_global(cx).auto_fold_dirs;
         let resolved_path = if auto_fold_dirs {
             descend_single_child_directories(entry_path, |path| {
-                breadcrumb_directory_children(&worktree, path, cx)
+                breadcrumb_directory_children(project.as_ref(), &worktree, path, cx)
             })
         } else {
             entry_path
@@ -473,8 +507,10 @@ impl PickerDelegate for BreadcrumbDirectoryDelegate {
             }
             BreadcrumbEntryIconSource::None => None,
         };
+        let diagnostic_severity =
+            self.row_diagnostic_severity(entry, listing_settings.show_diagnostics, cx);
         let icon = icon_path.map(Icon::from_path).map(|icon| {
-            icon.color(breadcrumb_entry_icon_color(entry))
+            icon.color(breadcrumb_entry_icon_color(diagnostic_severity))
                 .size(IconSize::Small)
                 .into_any_element()
         });
@@ -670,7 +706,6 @@ mod tests {
             is_dir: false,
             is_ignored: false,
             git_summary,
-            diagnostic_severity: None,
         }
     }
 
@@ -691,14 +726,15 @@ mod tests {
 
     #[test]
     fn test_breadcrumb_entry_icon_color_follows_diagnostic_severity() {
-        let mut entry = test_entry(git::status::GitSummary::UNCHANGED);
-        assert_eq!(breadcrumb_entry_icon_color(&entry), Color::Muted);
-
-        entry.diagnostic_severity = Some(language::DiagnosticSeverity::WARNING);
-        assert_eq!(breadcrumb_entry_icon_color(&entry), Color::Warning);
-
-        entry.diagnostic_severity = Some(language::DiagnosticSeverity::ERROR);
-        assert_eq!(breadcrumb_entry_icon_color(&entry), Color::Error);
+        assert_eq!(breadcrumb_entry_icon_color(None), Color::Muted);
+        assert_eq!(
+            breadcrumb_entry_icon_color(Some(DiagnosticSeverity::WARNING)),
+            Color::Warning
+        );
+        assert_eq!(
+            breadcrumb_entry_icon_color(Some(DiagnosticSeverity::ERROR)),
+            Color::Error
+        );
     }
 
     #[test]
@@ -1335,6 +1371,81 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_auto_fold_does_not_descend_into_a_directory_the_settings_hide(
+        cx: &mut TestAppContext,
+    ) {
+        use editor::MultiBuffer;
+        use editor::test::build_editor;
+        use project::{FakeFs, Project};
+        use serde_json::json;
+        use settings::SettingsStore;
+        use util::path;
+
+        init_test(cx);
+        cx.update(|cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings
+                        .project_panel
+                        .get_or_insert_default()
+                        .hide_gitignore = Some(true);
+                });
+            });
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                ".gitignore": "b\n",
+                "a": { "b": { "c.txt": "" } },
+            }),
+        )
+        .await;
+        let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+        let worktree_id = project.update(cx, |project, cx| {
+            project.worktrees(cx).next().unwrap().read(cx).id()
+        });
+
+        let workspace_window =
+            cx.add_window(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let workspace = workspace_window.root(cx).unwrap();
+
+        let buffer = cx.new(|cx| language::Buffer::local("", cx));
+        let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+        let editor_window = cx.add_window(|window, cx| build_editor(buffer, window, cx));
+        let editor = editor_window.root(cx).unwrap();
+        let cx = &mut VisualTestContext::from_window(*editor_window, cx);
+
+        let browser = editor_window
+            .update(cx, |_, window, cx| {
+                BreadcrumbDirectoryDelegate::picker(
+                    editor.downgrade(),
+                    workspace.downgrade(),
+                    worktree_id,
+                    RelPath::empty().into(),
+                    None,
+                    window,
+                    cx,
+                )
+            })
+            .unwrap();
+        confirm_breadcrumb_row(&browser, "a", cx);
+        editor.read_with(cx, |editor, _| {
+            assert_eq!(
+                editor
+                    .breadcrumb_navigation()
+                    .expect("navigate_breadcrumb_to set a session")
+                    .active_path
+                    .as_unix_str(),
+                "a",
+                "b is gitignored and hidden, so the listing shows a as a leaf; auto-fold must \
+                 not land somewhere the listing would never have shown"
+            );
+        });
+    }
+
+    #[gpui::test]
     async fn test_select_parent_and_child_only_drill_with_an_empty_query(cx: &mut TestAppContext) {
         use editor::MultiBuffer;
         use editor::test::build_editor;
@@ -1394,18 +1505,19 @@ mod tests {
         });
 
         picker.update_in(cx, |picker, window, cx| {
+            window.focus(&picker.focus_handle(cx), cx);
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("right");
+        cx.run_until_parked();
+        editor.read_with(cx, |editor, _| {
             assert!(
-                picker.delegate.select_child(window, cx).is_some(),
+                editor.breadcrumb_navigation().is_some(),
                 "an empty query lets right drill into the selected directory"
             );
         });
-        editor.read_with(cx, |editor, _| {
-            assert!(editor.breadcrumb_navigation().is_some());
-        });
 
-        picker.update_in(cx, |picker, window, cx| {
-            window.focus(&picker.focus_handle(cx), cx);
-        });
         cx.simulate_keystrokes("b e t a");
         cx.run_until_parked();
         picker.update(cx, |picker, cx| {
@@ -1502,6 +1614,78 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_update_matches_reuses_cached_candidates(cx: &mut TestAppContext) {
+        use editor::MultiBuffer;
+        use editor::test::build_editor;
+        use project::{FakeFs, Project};
+        use serde_json::json;
+        use util::path;
+
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                "alpha": { "one.txt": "", "two.txt": "" },
+            }),
+        )
+        .await;
+        let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+        let worktree_id = project.update(cx, |project, cx| {
+            project.worktrees(cx).next().unwrap().read(cx).id()
+        });
+
+        let workspace_window =
+            cx.add_window(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let workspace = workspace_window.root(cx).unwrap();
+
+        let buffer = cx.new(|cx| language::Buffer::local("", cx));
+        let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+        let editor_window = cx.add_window(|window, cx| build_editor(buffer, window, cx));
+        let editor = editor_window.root(cx).unwrap();
+        let cx = &mut VisualTestContext::from_window(*editor_window, cx);
+
+        let picker = editor_window
+            .update(cx, |_, window, cx| {
+                BreadcrumbDirectoryDelegate::picker(
+                    editor.downgrade(),
+                    workspace.downgrade(),
+                    worktree_id,
+                    util::rel_path::rel_path("alpha").into_arc(),
+                    None,
+                    window,
+                    cx,
+                )
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        let candidates_before =
+            picker.read_with(cx, |picker, _| picker.delegate.candidates.clone());
+
+        picker
+            .update_in(cx, |picker, window, cx| {
+                picker
+                    .delegate
+                    .update_matches("one".to_string(), window, cx)
+            })
+            .await;
+        picker
+            .update_in(cx, |picker, window, cx| {
+                picker.delegate.update_matches("on".to_string(), window, cx)
+            })
+            .await;
+
+        picker.read_with(cx, |picker, _| {
+            assert!(
+                std::rc::Rc::ptr_eq(&candidates_before, &picker.delegate.candidates),
+                "successive keystrokes must reuse the same candidate list, not rebuild it"
+            );
+        });
+    }
+
+    #[gpui::test]
     async fn test_reload_entries_clears_stale_matches(cx: &mut TestAppContext) {
         use editor::MultiBuffer;
         use editor::test::build_editor;
@@ -1568,6 +1752,139 @@ mod tests {
             assert!(
                 picker.delegate.matches.is_empty(),
                 "reload must drop matches whose candidate ids point into the entries just replaced"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_row_diagnostic_severity_is_resolved_per_row_not_at_listing_time(
+        cx: &mut TestAppContext,
+    ) {
+        use editor::MultiBuffer;
+        use editor::test::build_editor;
+        use language::{Diagnostic, DiagnosticEntry, DiagnosticSourceKind};
+        use lsp::{DiagnosticSeverity as LspDiagnosticSeverity, LanguageServerId};
+        use project::{FakeFs, Project};
+        use serde_json::json;
+        use std::path::Path;
+        use text::{PointUtf16, Unclipped};
+        use util::path;
+
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                "dir": {},
+                "flagged.txt": "",
+            }),
+        )
+        .await;
+        let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+        let worktree_id = project.update(cx, |project, cx| {
+            project.worktrees(cx).next().unwrap().read(cx).id()
+        });
+
+        let workspace_window =
+            cx.add_window(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let workspace = workspace_window.root(cx).unwrap();
+
+        let buffer = cx.new(|cx| language::Buffer::local("", cx));
+        let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+        let editor_window = cx.add_window(|window, cx| build_editor(buffer, window, cx));
+        let editor = editor_window.root(cx).unwrap();
+        let cx = &mut VisualTestContext::from_window(*editor_window, cx);
+
+        let picker = editor_window
+            .update(cx, |_, window, cx| {
+                BreadcrumbDirectoryDelegate::picker(
+                    editor.downgrade(),
+                    workspace.downgrade(),
+                    worktree_id,
+                    RelPath::empty().into(),
+                    None,
+                    window,
+                    cx,
+                )
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        picker.read_with(cx, |picker, cx| {
+            let entry = picker
+                .delegate
+                .entries
+                .iter()
+                .find(|entry| entry.name.as_ref() == "flagged.txt")
+                .expect("flagged.txt is listed");
+            assert_eq!(
+                picker
+                    .delegate
+                    .row_diagnostic_severity(entry, ShowDiagnostics::All, cx),
+                None,
+                "nothing reported yet"
+            );
+        });
+
+        let lsp_store = project.read_with(cx, |project, _| project.lsp_store());
+        lsp_store.update(cx, |lsp_store, cx| {
+            lsp_store
+                .update_diagnostic_entries(
+                    LanguageServerId(0),
+                    Path::new(path!("/root/flagged.txt")).to_owned(),
+                    None,
+                    None,
+                    vec![DiagnosticEntry {
+                        range: Unclipped(PointUtf16::new(0, 0))..Unclipped(PointUtf16::new(0, 1)),
+                        diagnostic: Diagnostic {
+                            severity: LspDiagnosticSeverity::ERROR,
+                            is_primary: true,
+                            message: "boom".to_string(),
+                            source_kind: DiagnosticSourceKind::Pushed,
+                            ..Diagnostic::default()
+                        },
+                    }],
+                    cx,
+                )
+                .unwrap();
+        });
+        cx.run_until_parked();
+
+        // No `reload_entries` call between the reads: the row still picks up the new diagnostic.
+        picker.read_with(cx, |picker, cx| {
+            let entry = picker
+                .delegate
+                .entries
+                .iter()
+                .find(|entry| entry.name.as_ref() == "flagged.txt")
+                .expect("flagged.txt is listed");
+            assert_eq!(
+                picker
+                    .delegate
+                    .row_diagnostic_severity(entry, ShowDiagnostics::All, cx),
+                Some(DiagnosticSeverity::ERROR),
+            );
+            assert_eq!(
+                picker
+                    .delegate
+                    .row_diagnostic_severity(entry, ShowDiagnostics::Off, cx),
+                None,
+                "off suppresses diagnostics regardless of what is reported"
+            );
+
+            let dir_entry = picker
+                .delegate
+                .entries
+                .iter()
+                .find(|entry| entry.name.as_ref() == "dir")
+                .expect("dir is listed");
+            assert_eq!(
+                picker
+                    .delegate
+                    .row_diagnostic_severity(dir_entry, ShowDiagnostics::All, cx),
+                None,
+                "directories never carry a severity"
             );
         });
     }
