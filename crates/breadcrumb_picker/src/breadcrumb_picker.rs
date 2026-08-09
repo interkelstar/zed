@@ -28,18 +28,32 @@ pub(crate) fn cap_empty_query_matches(
         return candidates.iter().map(to_match).collect();
     }
 
-    let mut matches: Vec<StringMatch> = candidates.iter().take(cap).map(to_match).collect();
-    if let Some(keep_candidate_id) = keep_candidate_id
-        && !matches
-            .iter()
-            .any(|entry_match| entry_match.candidate_id == keep_candidate_id)
-        && let Some(keep_candidate) = candidates
-            .iter()
-            .find(|candidate| candidate.id == keep_candidate_id)
-    {
-        matches.pop();
-        matches.push(to_match(keep_candidate));
-    }
+    let keep_candidate = keep_candidate_id
+        .and_then(|keep_candidate_id| {
+            candidates
+                .iter()
+                .find(|candidate| candidate.id == keep_candidate_id)
+        })
+        .filter(|keep_candidate| {
+            candidates
+                .iter()
+                .take(cap)
+                .all(|candidate| candidate.id != keep_candidate.id)
+        });
+
+    let Some(keep_candidate) = keep_candidate else {
+        return candidates.iter().take(cap).map(to_match).collect();
+    };
+
+    // Room for the kept entry comes from the tail; it is then reinserted in sorted order.
+    let mut matches: Vec<StringMatch> = candidates
+        .iter()
+        .take(cap.saturating_sub(1))
+        .map(to_match)
+        .collect();
+    let insert_at =
+        matches.partition_point(|entry_match| entry_match.candidate_id < keep_candidate.id);
+    matches.insert(insert_at, to_match(keep_candidate));
     matches
 }
 
@@ -128,12 +142,12 @@ mod tests {
         let candidates = candidates(10);
         let matches = cap_empty_query_matches(&candidates, Some(9), 3);
 
-        assert_eq!(matches.len(), 3);
-        assert!(
+        assert_eq!(
             matches
                 .iter()
-                .any(|entry_match| entry_match.candidate_id == 9),
-            "the entry past the cap must still be displayed"
+                .map(|entry_match| entry_match.candidate_id)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 9],
         );
     }
 
@@ -148,6 +162,22 @@ mod tests {
                 .map(|entry_match| entry_match.candidate_id)
                 .collect::<Vec<_>>(),
             vec![0, 1, 2],
+        );
+    }
+
+    #[test]
+    fn test_cap_empty_query_matches_drops_only_the_boundary_entry() {
+        let candidates = candidates(300);
+        let matches = cap_empty_query_matches(&candidates, Some(250), 200);
+
+        let mut expected: Vec<usize> = (0..199).collect();
+        expected.push(250);
+        assert_eq!(
+            matches
+                .iter()
+                .map(|entry_match| entry_match.candidate_id)
+                .collect::<Vec<_>>(),
+            expected,
         );
     }
 }

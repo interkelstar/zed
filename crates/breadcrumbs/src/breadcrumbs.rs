@@ -51,16 +51,24 @@ impl Render for Breadcrumbs {
             return element.into_any_element();
         };
 
-        let Some((segments, _)) = active_item.breadcrumbs(cx) else {
+        let Some((segments, font)) = active_item.breadcrumbs(cx) else {
             return element.into_any_element();
         };
 
         let prefix_element = active_item.breadcrumb_prefix(window, cx);
 
-        if let Some(render_fn) = cx.try_global::<RenderBreadcrumbText>() {
-            (render_fn.0)(segments, prefix_element, active_item.as_ref(), false, cx)
-        } else {
-            element.into_any_element()
+        let Some(render_fn) = cx.try_global::<RenderBreadcrumbText>() else {
+            return element.into_any_element();
+        };
+        let content = (render_fn.0)(segments, prefix_element, active_item.as_ref(), false, cx);
+        match font {
+            Some(font) => div()
+                .flex_grow_1()
+                .min_w_0()
+                .font(font)
+                .child(content)
+                .into_any_element(),
+            None => content,
         }
     }
 }

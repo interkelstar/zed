@@ -170,7 +170,7 @@ impl BreadcrumbDirectoryDelegate {
                 show_icons: false,
                 _expand_task: gpui::Task::ready(()),
             };
-            // `Picker::uniform_list` below runs an initial `update_matches("")`, which now only filters.
+            // `Picker::uniform_list` below runs an initial `update_matches("")`, which also caps and can reorder.
             delegate.reload_entries(cx);
             let mut picker = Picker::uniform_list(delegate, window, cx)
                 .popover()
@@ -1525,8 +1525,6 @@ mod tests {
             assert_eq!(picker.query(cx), "beta");
         });
 
-        // A non-empty query leaves left/right for the caret: a swallowed key would leave the
-        // typed letter appended at the end instead of landing where the caret actually is.
         cx.simulate_keystrokes("left");
         cx.simulate_keystrokes("z");
         cx.run_until_parked();

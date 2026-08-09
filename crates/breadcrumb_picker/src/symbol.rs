@@ -109,7 +109,10 @@ impl BreadcrumbSymbolDelegate {
             .collect::<Vec<_>>()
             .into();
         self.items = items;
-        self.apply_empty_query_matches();
+        // A non-empty query keeps whatever `matches` it already has; `update_matches`'s refresh re-runs the filter.
+        if self.query.is_empty() {
+            self.apply_empty_query_matches();
+        }
     }
 
     /// Caps `matches` like a typed filter, preselecting `current_range` and keeping it displayed even past the cap.
@@ -210,10 +213,10 @@ impl PickerDelegate for BreadcrumbSymbolDelegate {
     }
 
     fn no_matches_text(&self, _window: &mut Window, _cx: &mut App) -> Option<SharedString> {
-        Some(if !self.query.is_empty() {
-            "No matches".into()
-        } else if self.loading {
+        Some(if self.loading {
             "Loading symbols…".into()
+        } else if !self.query.is_empty() {
+            "No matches".into()
         } else {
             "No symbols".into()
         })
@@ -412,7 +415,6 @@ pub(crate) fn render_breadcrumb_symbol_segment(
     label: gpui::AnyElement,
     index: usize,
 ) -> gpui::AnyElement {
-    // `ButtonLike` stops propagation, keeping this click off the outline toggle behind it.
     let trigger = ButtonLike::new(("breadcrumb-symbol", index))
         .style(ButtonStyle::Transparent)
         .size(ui::ButtonSize::None)
@@ -1029,6 +1031,100 @@ mod tests {
             assert!(
                 matches!(outcome, BreadcrumbSymbolMenuOutcome::Empty),
                 "a loaded outline with no items shows the popover's own empty state"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_breadcrumb_symbol_picker_fills_in_once_the_outline_resolves(
+        cx: &mut TestAppContext,
+    ) {
+        use editor::test::editor_lsp_test_context::EditorLspTestContext;
+
+        init_test(cx);
+
+        let mut lsp_cx =
+            EditorLspTestContext::new_rust(lsp::ServerCapabilities::default(), cx).await;
+        lsp_cx.set_state("struct Foo {}\n\nimpl Foo {\n    fn baˇr() {}\n}\n");
+        lsp_cx.run_until_parked();
+
+        let editor = lsp_cx.editor.clone();
+        let buffer_id = lsp_cx.update_editor(|editor, _window, cx| {
+            editor
+                .buffer()
+                .read(cx)
+                .as_singleton()
+                .unwrap()
+                .read(cx)
+                .remote_id()
+        });
+        lsp_cx.update_editor(|editor, _window, cx| {
+            editor.prefetch_breadcrumb_outline(buffer_id, cx);
+        });
+
+        let cx: &mut VisualTestContext = &mut lsp_cx;
+
+        let picker = cx.update(|window, cx| {
+            BreadcrumbSymbolDelegate::picker(
+                editor.downgrade(),
+                buffer_id,
+                None,
+                Vec::new(),
+                true,
+                None,
+                None,
+                window,
+                cx,
+            )
+        });
+
+        picker.read_with(cx, |picker, _| {
+            assert_eq!(
+                picker.delegate.match_count(),
+                0,
+                "the outline has not answered yet"
+            );
+        });
+        let loading_placeholder = cx.update(|window, cx| {
+            picker.update(cx, |picker, cx| picker.delegate.no_matches_text(window, cx))
+        });
+        assert_eq!(loading_placeholder, Some("Loading symbols…".into()));
+
+        // `refresh` later reads `picker.query`, not the delegate's field, so it must be set here too.
+        picker.update_in(cx, |picker, window, cx| {
+            picker.set_query("struct", window, cx);
+        });
+        picker.read_with(cx, |picker, _| {
+            assert_eq!(
+                picker.delegate.match_count(),
+                0,
+                "a query typed before the outline answers has nothing to filter yet"
+            );
+        });
+        let still_loading_placeholder = cx.update(|window, cx| {
+            picker.update(cx, |picker, cx| picker.delegate.no_matches_text(window, cx))
+        });
+        assert_eq!(
+            still_loading_placeholder,
+            Some("Loading symbols…".into()),
+            "loading wins over the typed query's own empty result"
+        );
+
+        cx.run_until_parked();
+
+        picker.read_with(cx, |picker, _| {
+            assert!(!picker.delegate.loading);
+            assert_eq!(
+                picker.delegate.match_count(),
+                1,
+                "the still-typed query filters the now-real symbols instead of listing all of them"
+            );
+            assert!(
+                picker
+                    .delegate
+                    .item_at(0)
+                    .is_some_and(|item| item.text.contains("struct")),
+                "the one match left is the struct, not the impl block"
             );
         });
     }

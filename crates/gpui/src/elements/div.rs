@@ -16,15 +16,15 @@
 //! constructed by combining these two systems into an all-in-one element.
 
 use crate::{
-    Action, AnyDrag, AnyElement, AnyTooltip, AnyView, App, Bounds, ClickEvent, DispatchPhase,
-    Display, Element, ElementId, Entity, EntityId, ExternalDragPayload, ExternalDragPayloadSource,
-    FocusHandle, Global, GlobalElementId, Hitbox, HitboxBehavior, HitboxId, InspectorElementId,
-    IntoElement, IsZero, KeyContext, KeyDownEvent, KeyUpEvent, KeyboardButton, KeyboardClickEvent,
-    LayoutId, ModifiersChangedEvent, MouseButton, MouseClickEvent, MouseDownEvent, MouseExitEvent,
-    MouseMoveEvent, MousePressureEvent, MouseUpEvent, OngoingScroll, Overflow, ParentElement,
-    PinchEvent, Pixels, Point, Render, ScrollWheelEvent, SharedString, Size, Style,
-    StyleRefinement, Styled, Task, TooltipId, Visibility, Window, WindowControlArea, point, px,
-    size,
+    Action, AnyDrag, AnyElement, AnyTooltip, AnyView, App, Bounds, ClickEvent, DefiniteLength,
+    DispatchPhase, Display, Edges, Element, ElementId, Entity, EntityId, ExternalDragPayload,
+    ExternalDragPayloadSource, FocusHandle, Global, GlobalElementId, Hitbox, HitboxBehavior,
+    HitboxId, InspectorElementId, IntoElement, IsZero, KeyContext, KeyDownEvent, KeyUpEvent,
+    KeyboardButton, KeyboardClickEvent, LayoutId, ModifiersChangedEvent, MouseButton,
+    MouseClickEvent, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MousePressureEvent,
+    MouseUpEvent, OngoingScroll, Overflow, ParentElement, PinchEvent, Pixels, Point, Render,
+    ScrollWheelEvent, SharedString, Size, Style, StyleRefinement, Styled, Task, TooltipId,
+    Visibility, Window, WindowControlArea, point, px, size,
 };
 use collections::HashMap;
 use gpui_util::ResultExt;
@@ -2324,14 +2324,21 @@ impl Interactivity {
             }
 
             let rem_size = window.rem_size();
-            // Taffy lays the box out with the padding snapped to the device pixel
-            // grid (`to_taffy`); recomputed unsnapped, e.g. py_1 at a fractional
-            // rem size, it exceeds `bounds` and leaves the box scrollable by the
-            // sub-pixel difference.
-            let padding = style
-                .padding
-                .to_pixels(bounds.size.into(), rem_size)
-                .map(|edge| window.pixel_snap(*edge));
+            // Only absolute padding is device-pixel-snapped in `to_taffy`; a percentage is not.
+            let raw_padding = style.padding.to_pixels(bounds.size.into(), rem_size);
+            let snap_if_absolute = |source: DefiniteLength, value: Pixels| {
+                if matches!(source, DefiniteLength::Absolute(_)) {
+                    window.pixel_snap(value)
+                } else {
+                    value
+                }
+            };
+            let padding = Edges {
+                top: snap_if_absolute(style.padding.top, raw_padding.top),
+                right: snap_if_absolute(style.padding.right, raw_padding.right),
+                bottom: snap_if_absolute(style.padding.bottom, raw_padding.bottom),
+                left: snap_if_absolute(style.padding.left, raw_padding.left),
+            };
             let padding_size = size(padding.left + padding.right, padding.top + padding.bottom);
             // The floating point values produced by Taffy and ours often vary
             // slightly after ~5 decimal places. This can lead to cases where after
@@ -4220,7 +4227,7 @@ mod tests {
     use super::*;
     use crate::{
         AnyWindowHandle, AppContext as _, Context, InputEvent, Keystroke, MouseMoveEvent,
-        TestAppContext, canvas, util::FluentBuilder as _,
+        TestAppContext, canvas, relative, util::FluentBuilder as _,
     };
     use std::{cell::Cell, rc::Weak};
 
@@ -5043,5 +5050,48 @@ mod tests {
             .unwrap();
 
         assert_eq!(scroll_handle.max_offset().y, px(0.));
+    }
+
+    #[gpui::test]
+    fn test_percentage_padding_is_not_device_pixel_snapped(cx: &mut TestAppContext) {
+        struct PercentPaddedContainer {
+            scroll_handle: ScrollHandle,
+        }
+
+        impl Render for PercentPaddedContainer {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                // 9.2%-of-height padding resolves to 4.6px a side, unsnapped, on top of a
+                // 45px child that does not shrink to fit; device-pixel-snapping that padding
+                // instead, as the old blanket snap did, would undercount the overflow below.
+                div().size_full().child(
+                    div()
+                        .id("container")
+                        .flex()
+                        .flex_col()
+                        .h(px(50.))
+                        .w(px(100.))
+                        .py(relative(0.092))
+                        .overflow_y_scroll()
+                        .track_scroll(&self.scroll_handle)
+                        .child(div().flex_shrink_0().w_full().h(px(45.))),
+                )
+            }
+        }
+
+        let scroll_handle = ScrollHandle::new();
+        let window: AnyWindowHandle = cx
+            .add_window({
+                let scroll_handle = scroll_handle.clone();
+                move |_, _| PercentPaddedContainer { scroll_handle }
+            })
+            .into();
+        cx.update_window(window, |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+
+        assert_eq!(scroll_handle.max_offset().y, px(4.2));
     }
 }

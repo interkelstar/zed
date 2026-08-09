@@ -1082,10 +1082,8 @@ impl Item for Editor {
     // In a non-singleton case, the breadcrumbs are actually shown on sticky file headers of the multibuffer.
     fn breadcrumbs(&self, cx: &App) -> Option<(Vec<HighlightedText>, Option<Font>)> {
         if self.buffer.read(cx).is_singleton() {
-            let font = theme_settings::ThemeSettings::get_global(cx)
-                .buffer_font
-                .clone();
-            Some((self.breadcrumbs_inner(cx)?, Some(font)))
+            // The toolbar's own breadcrumb bar deliberately stays in the UI font.
+            Some((self.breadcrumbs_inner(cx)?, None))
         } else {
             None
         }
