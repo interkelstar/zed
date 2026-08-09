@@ -2076,7 +2076,7 @@ impl Editor {
             };
 
             let task = editor.update(wcx, |ed, cx| ed.buffer_outline_items(remote_id, cx))?;
-            let outline_items: Vec<OutlineItem<text::Anchor>> = task.await;
+            let outline_items: Vec<OutlineItem<text::Anchor>> = task.await.unwrap_or_default();
 
             let multi_snapshot = editor_snapshot.buffer();
             let buffer_range = |range: &Range<_>| {

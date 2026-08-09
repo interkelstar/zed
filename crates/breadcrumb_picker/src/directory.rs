@@ -629,6 +629,8 @@ mod tests {
     use std::cell::RefCell;
     use workspace::Workspace;
 
+    use crate::test_support::{Harness, bind_drill_navigation_keymap};
+
     fn confirm_breadcrumb_row(
         picker: &Entity<BreadcrumbDirectoryPicker>,
         path: &str,
@@ -993,16 +995,6 @@ mod tests {
             cx.add_window(|window, cx| Workspace::test_new(project.clone(), window, cx));
         let workspace = workspace_window.root(cx).unwrap();
 
-        struct Harness {
-            picker: Entity<BreadcrumbDirectoryPicker>,
-            editor: Entity<Editor>,
-        }
-        impl Render for Harness {
-            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-                self.picker.clone()
-            }
-        }
-
         let buffer = cx.new(|cx| language::Buffer::local("", cx));
         let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
         let harness_window = cx.add_window(|window, cx| {
@@ -1342,33 +1334,6 @@ mod tests {
         });
     }
 
-    /// Binds the same context strings the default keymaps use.
-    fn bind_drill_navigation_keymap(cx: &mut TestAppContext) {
-        use settings::KeymapFile;
-
-        cx.update(|cx| {
-            cx.bind_keys(KeymapFile::load_panic_on_failure(
-                r#"[
-                    {
-                        "context": "Editor",
-                        "bindings": {
-                            "left": "editor::MoveLeft",
-                            "right": "editor::MoveRight"
-                        }
-                    },
-                    {
-                        "context": "BreadcrumbPicker > Editor",
-                        "bindings": {
-                            "left": "menu::SelectParent",
-                            "right": "menu::SelectChild"
-                        }
-                    }
-                ]"#,
-                cx,
-            ));
-        });
-    }
-
     #[gpui::test]
     async fn test_select_parent_and_child_only_drill_with_an_empty_query(cx: &mut TestAppContext) {
         use editor::MultiBuffer;
@@ -1396,16 +1361,6 @@ mod tests {
         let workspace_window =
             cx.add_window(|window, cx| Workspace::test_new(project.clone(), window, cx));
         let workspace = workspace_window.root(cx).unwrap();
-
-        struct Harness {
-            picker: Entity<BreadcrumbDirectoryPicker>,
-            editor: Entity<Editor>,
-        }
-        impl Render for Harness {
-            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-                self.picker.clone()
-            }
-        }
 
         let buffer = cx.new(|cx| language::Buffer::local("", cx));
         let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));

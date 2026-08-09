@@ -51,8 +51,6 @@ impl Render for Breadcrumbs {
             return element.into_any_element();
         };
 
-        // The font the item reports is deliberately ignored: the bar reads as UI chrome, not as
-        // code, so it renders in the UI font.
         let Some((segments, _)) = active_item.breadcrumbs(cx) else {
             return element.into_any_element();
         };

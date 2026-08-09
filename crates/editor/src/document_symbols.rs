@@ -40,13 +40,14 @@ impl Editor {
     /// Returns all document outline items for a buffer, using LSP or
     /// tree-sitter based on the `document_symbols` setting.
     /// External consumers (outline modal, outline panel, breadcrumbs) should use this.
+    /// `None` means the source could not answer yet, distinct from `Some(vec![])`.
     pub fn buffer_outline_items(
         &self,
         buffer_id: BufferId,
         cx: &mut Context<Self>,
-    ) -> Task<Vec<OutlineItem<text::Anchor>>> {
+    ) -> Task<Option<Vec<OutlineItem<text::Anchor>>>> {
         let Some(buffer) = self.buffer.read(cx).buffer(buffer_id) else {
-            return Task::ready(Vec::new());
+            return Task::ready(None);
         };
 
         if lsp_symbols_enabled(buffer.read(cx), cx) {
@@ -55,25 +56,24 @@ impl Editor {
                 refresh_task.await;
                 editor
                     .read_with(cx, |editor, _| {
-                        editor
-                            .lsp_document_symbols
-                            .get(&buffer_id)
-                            .cloned()
-                            .unwrap_or_default()
+                        editor.lsp_document_symbols.get(&buffer_id).cloned()
                     })
                     .ok()
-                    .unwrap_or_default()
+                    .flatten()
             })
         } else {
             let buffer_snapshot = buffer.read(cx).snapshot();
+            if buffer_snapshot.language().is_none() {
+                return Task::ready(None);
+            }
             let syntax = cx.theme().syntax().clone();
             cx.background_executor().spawn(async move {
                 // Not `snapshot.outline(..)`: it builds a fuzzy-match string per item that every caller here drops.
-                buffer_snapshot.outline_items_containing(
+                Some(buffer_snapshot.outline_items_containing(
                     0..buffer_snapshot.len(),
                     true,
                     Some(&syntax),
-                )
+                ))
             })
         }
     }
@@ -161,7 +161,9 @@ impl Editor {
 
         let items = self.buffer_outline_items(buffer_id, cx);
         self.breadcrumb_outline_task = cx.spawn(async move |editor, cx| {
-            let items = items.await;
+            let Some(items) = items.await else {
+                return;
+            };
             editor
                 .update(cx, |editor, _| {
                     editor.store_breadcrumb_outline(buffer_id, version, items);
@@ -170,7 +172,6 @@ impl Editor {
         });
     }
 
-    /// The converted cache keys off the stored version, so an unchanged version has to drop it.
     fn store_breadcrumb_outline(
         &mut self,
         buffer_id: BufferId,
@@ -185,7 +186,7 @@ impl Editor {
         self.breadcrumb_converted_outline_cache.replace(None);
     }
 
-    /// For a source holding the items already: `buffer_outline_items` would await its own task.
+    /// Avoids `buffer_outline_items`: called from inside the refresh task it would await, which deadlocks.
     pub(crate) fn set_breadcrumb_outline(
         &mut self,
         buffer_id: BufferId,
@@ -203,7 +204,11 @@ impl Editor {
         self.store_breadcrumb_outline(buffer_id, version, items);
     }
 
-    fn breadcrumb_outline_is_fresh(&self, buffer_id: BufferId, version: &clock::Global) -> bool {
+    pub(crate) fn breadcrumb_outline_is_fresh(
+        &self,
+        buffer_id: BufferId,
+        version: &clock::Global,
+    ) -> bool {
         self.breadcrumb_outline
             .as_ref()
             .is_some_and(|outline| outline.buffer_id == buffer_id && &outline.version == version)
@@ -217,7 +222,6 @@ impl Editor {
         self.breadcrumb_outline_is_fresh(buffer_id, &buffer.read(cx).version())
     }
 
-    /// The buffer the cursor is currently in: `breadcrumb_outline` caches only that one buffer.
     pub(crate) fn breadcrumb_cursor_buffer_id(&self, cx: &App) -> Option<BufferId> {
         let cursor = self.selections.newest_anchor().head();
         let snapshot = self.buffer().read(cx).snapshot(cx);
@@ -610,18 +614,18 @@ mod tests {
     };
 
     use futures::StreamExt as _;
-    use gpui::{App, TestAppContext};
+    use gpui::{App, AppContext as _, Entity, TestAppContext, VisualTestContext};
     use multi_buffer::ToPoint;
     use settings::{DocumentSymbols, SettingsStore};
-    use text::Point;
+    use text::{BufferId, Point};
     use util::path;
     use workspace::item::{Item, ItemEvent};
     use zed_actions::editor::MoveDown;
 
     use crate::{
-        Editor, LSP_REQUEST_DEBOUNCE_TIMEOUT,
+        Editor, LSP_REQUEST_DEBOUNCE_TIMEOUT, MultiBuffer,
         editor_tests::{init_test, update_test_language_settings},
-        test::editor_lsp_test_context::EditorLspTestContext,
+        test::{build_editor, editor_lsp_test_context::EditorLspTestContext},
     };
 
     fn outline_symbol_names(editor: &Editor) -> Vec<&str> {
@@ -1860,6 +1864,75 @@ mod tests {
             assert!(
                 editor.breadcrumb_converted_outline_recomputes.get() > recomputes_before_edit,
                 "a new outline version (from an edit) must invalidate the cache"
+            );
+        });
+    }
+
+    fn build_unlanguaged_editor(
+        cx: &mut TestAppContext,
+    ) -> (gpui::WindowHandle<Editor>, Entity<Editor>, BufferId) {
+        let buffer = cx.new(|cx| language::Buffer::local("fn main() {}\n", cx));
+        let buffer_id = buffer.read_with(cx, |buffer, _| buffer.remote_id());
+        let multi_buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+        let editor_window = cx.add_window(|window, cx| build_editor(multi_buffer, window, cx));
+        let editor = editor_window.root(cx).unwrap();
+        (editor_window, editor, buffer_id)
+    }
+
+    #[gpui::test]
+    async fn test_prefetch_breadcrumb_outline_leaves_cache_untouched_without_a_language(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx, |_| {});
+
+        let (editor_window, editor, buffer_id) = build_unlanguaged_editor(cx);
+        let cx = &mut VisualTestContext::from_window(*editor_window, cx);
+
+        editor.update(cx, |editor, cx| {
+            editor.prefetch_breadcrumb_outline(buffer_id, cx);
+        });
+        cx.run_until_parked();
+
+        editor.read_with(cx, |editor, cx| {
+            assert!(
+                !editor.breadcrumb_outline_ready(buffer_id, cx),
+                "a buffer with no resolved language has not actually answered, so it must not be cached as ready"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_prefetch_breadcrumb_outline_caches_a_genuinely_empty_answer(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx, |_| {});
+
+        let (editor_window, editor, buffer_id) = build_unlanguaged_editor(cx);
+        let cx = &mut VisualTestContext::from_window(*editor_window, cx);
+
+        // No outline query configured: this language answers, but with nothing.
+        editor.update(cx, |editor, cx| {
+            let buffer = editor.buffer().read(cx).as_singleton().unwrap().clone();
+            buffer.update(cx, |buffer, cx| {
+                buffer.set_language(Some(language::PLAIN_TEXT.clone()), cx)
+            });
+        });
+        cx.run_until_parked();
+
+        editor.update(cx, |editor, cx| {
+            editor.prefetch_breadcrumb_outline(buffer_id, cx);
+        });
+        cx.run_until_parked();
+
+        editor.read_with(cx, |editor, cx| {
+            assert!(
+                editor.breadcrumb_outline_ready(buffer_id, cx),
+                "a resolved language with no outline query must still be cached as ready"
+            );
+            assert!(
+                editor
+                    .breadcrumb_symbol_menu_items(buffer_id, None, cx)
+                    .is_empty()
             );
         });
     }

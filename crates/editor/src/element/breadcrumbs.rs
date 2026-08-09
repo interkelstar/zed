@@ -296,7 +296,7 @@ impl BreadcrumbsRow {
                         if let Some(path) = path {
                             cx.write_to_clipboard(ClipboardItem::new_string(path));
                         }
-                        // Otherwise the container's own handler below overwrites this with the file path.
+                        // Otherwise the ancestor container's handler runs later in the bubble phase and overwrites this.
                         cx.stop_propagation();
                     })
                     .child(content)

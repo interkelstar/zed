@@ -3442,7 +3442,7 @@ impl OutlinePanel {
                     let Some(outline_task) = outline_task else {
                         return;
                     };
-                    let fetched_outlines = outline_task.await;
+                    let fetched_outlines = outline_task.await.unwrap_or_default();
                     let outlines_with_children = fetched_outlines
                         .array_windows::<2>()
                         .filter_map(|[current, next]| {

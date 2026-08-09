@@ -3783,6 +3783,7 @@ impl Editor {
         // Full editors only, and debounced like `refresh_document_symbols`: every keystroke lands here.
         if self.mode().is_full()
             && let Some((_, buffer)) = multi_buffer_snapshot.anchor_to_buffer_anchor(cursor)
+            && !self.breadcrumb_outline_is_fresh(buffer.remote_id(), buffer.version())
         {
             let buffer_id = buffer.remote_id();
             self.breadcrumb_outline_debounce_task = cx.spawn(async move |editor, cx| {

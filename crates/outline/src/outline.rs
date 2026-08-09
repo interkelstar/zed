@@ -84,6 +84,7 @@ fn outline_for_editor(
 
     Some(cx.background_executor().spawn(async move {
         task.await
+            .unwrap_or_default()
             .into_iter()
             .filter_map(|item| {
                 Some(OutlineItem {

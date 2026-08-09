@@ -415,9 +415,11 @@ mod tests {
     use editor::MultiBuffer;
     use editor::MultiBufferSnapshot;
     use editor::test::build_editor;
-    use gpui::{Focusable, Render, TestAppContext, VisualTestContext};
+    use gpui::{Focusable, TestAppContext, VisualTestContext};
     use std::cell::Cell;
     use text::Point;
+
+    use crate::test_support::{Harness, bind_drill_navigation_keymap};
 
     fn init_test(cx: &mut TestAppContext) {
         cx.update(|cx| {
@@ -623,16 +625,6 @@ mod tests {
         let buffer = cx.new(|cx| language::Buffer::local("alpha\nbeta\ngamma\n", cx));
         let multi_buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
 
-        struct Harness {
-            picker: Entity<BreadcrumbSymbolPicker>,
-            editor: Entity<Editor>,
-        }
-        impl Render for Harness {
-            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-                self.picker.clone()
-            }
-        }
-
         let harness_window = cx.add_window(|window, cx| {
             let editor = cx.new(|cx| build_editor(multi_buffer.clone(), window, cx));
             let snapshot = editor.read(cx).buffer().read(cx).snapshot(cx);
@@ -768,33 +760,6 @@ mod tests {
         });
     }
 
-    /// Binds the same context strings the default keymaps use.
-    fn bind_drill_navigation_keymap(cx: &mut TestAppContext) {
-        use settings::KeymapFile;
-
-        cx.update(|cx| {
-            cx.bind_keys(KeymapFile::load_panic_on_failure(
-                r#"[
-                    {
-                        "context": "Editor",
-                        "bindings": {
-                            "left": "editor::MoveLeft",
-                            "right": "editor::MoveRight"
-                        }
-                    },
-                    {
-                        "context": "BreadcrumbPicker > Editor",
-                        "bindings": {
-                            "left": "menu::SelectParent",
-                            "right": "menu::SelectChild"
-                        }
-                    }
-                ]"#,
-                cx,
-            ));
-        });
-    }
-
     #[gpui::test]
     async fn test_select_parent_and_child_do_not_drill_with_a_query(cx: &mut TestAppContext) {
         init_test(cx);
@@ -803,16 +768,6 @@ mod tests {
         let buffer = cx.new(|cx| language::Buffer::local("alpha\nbeta\ngamma\n", cx));
         let multi_buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
         let buffer_id = BufferId::new(1).unwrap();
-
-        struct Harness {
-            picker: Entity<BreadcrumbSymbolPicker>,
-            editor: Entity<Editor>,
-        }
-        impl Render for Harness {
-            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-                self.picker.clone()
-            }
-        }
 
         let harness_window = cx.add_window(|window, cx| {
             let editor = cx.new(|cx| build_editor(multi_buffer.clone(), window, cx));
@@ -909,6 +864,15 @@ mod tests {
                 .read(cx)
                 .remote_id()
         });
+
+        // A resolved language with no outline query still answers, just with nothing.
+        editor.update(cx, |editor, cx| {
+            let buffer = editor.buffer().read(cx).as_singleton().unwrap().clone();
+            buffer.update(cx, |buffer, cx| {
+                buffer.set_language(Some(language::PLAIN_TEXT.clone()), cx)
+            });
+        });
+        cx.run_until_parked();
 
         editor.update(cx, |editor, cx| {
             editor.prefetch_breadcrumb_outline(buffer_id, cx);
