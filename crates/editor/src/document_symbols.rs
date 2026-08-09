@@ -130,15 +130,32 @@ impl Editor {
     }
 
     pub fn prefetch_breadcrumb_outline(&mut self, buffer_id: BufferId, cx: &mut Context<Self>) {
+        self.prefetch_breadcrumb_outline_inner(buffer_id, false, cx);
+    }
+
+    /// Bypasses the version guard: the source changed without an edit, so the version still matches.
+    pub(crate) fn refresh_breadcrumb_outline(
+        &mut self,
+        buffer_id: BufferId,
+        cx: &mut Context<Self>,
+    ) {
+        self.prefetch_breadcrumb_outline_inner(buffer_id, true, cx);
+    }
+
+    fn prefetch_breadcrumb_outline_inner(
+        &mut self,
+        buffer_id: BufferId,
+        force_refresh: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.mode().is_full() {
+            return;
+        }
         let Some(buffer) = self.buffer.read(cx).buffer(buffer_id) else {
             return;
         };
         let version = buffer.read(cx).version();
-        if self
-            .breadcrumb_outline
-            .as_ref()
-            .is_some_and(|outline| outline.buffer_id == buffer_id && outline.version == version)
-        {
+        if !force_refresh && self.breadcrumb_outline_is_fresh(buffer_id, &version) {
             return;
         }
 
@@ -147,14 +164,49 @@ impl Editor {
             let items = items.await;
             editor
                 .update(cx, |editor, _| {
-                    editor.breadcrumb_outline = Some(BreadcrumbOutline {
-                        buffer_id,
-                        version,
-                        items,
-                    });
+                    editor.store_breadcrumb_outline(buffer_id, version, items);
                 })
                 .ok();
         });
+    }
+
+    /// The converted cache keys off the stored version, so an unchanged version has to drop it.
+    fn store_breadcrumb_outline(
+        &mut self,
+        buffer_id: BufferId,
+        version: clock::Global,
+        items: Vec<OutlineItem<text::Anchor>>,
+    ) {
+        self.breadcrumb_outline = Some(BreadcrumbOutline {
+            buffer_id,
+            version,
+            items,
+        });
+        self.breadcrumb_converted_outline_cache.replace(None);
+    }
+
+    /// For a source holding the items already: `buffer_outline_items` would await its own task.
+    pub(crate) fn set_breadcrumb_outline(
+        &mut self,
+        buffer_id: BufferId,
+        items: Vec<OutlineItem<text::Anchor>>,
+        cx: &App,
+    ) {
+        if !self.mode().is_full() {
+            return;
+        }
+        let Some(buffer) = self.buffer.read(cx).buffer(buffer_id) else {
+            return;
+        };
+        let version = buffer.read(cx).version();
+        self.breadcrumb_outline_task = Task::ready(());
+        self.store_breadcrumb_outline(buffer_id, version, items);
+    }
+
+    fn breadcrumb_outline_is_fresh(&self, buffer_id: BufferId, version: &clock::Global) -> bool {
+        self.breadcrumb_outline
+            .as_ref()
+            .is_some_and(|outline| outline.buffer_id == buffer_id && &outline.version == version)
     }
 
     /// Whether an outline is cached for `buffer_id`: "not fetched yet" versus "genuinely empty".
@@ -162,10 +214,16 @@ impl Editor {
         let Some(buffer) = self.buffer.read(cx).buffer(buffer_id) else {
             return false;
         };
-        let version = buffer.read(cx).version();
-        self.breadcrumb_outline
-            .as_ref()
-            .is_some_and(|outline| outline.buffer_id == buffer_id && outline.version == version)
+        self.breadcrumb_outline_is_fresh(buffer_id, &buffer.read(cx).version())
+    }
+
+    /// The buffer the cursor is currently in: `breadcrumb_outline` caches only that one buffer.
+    pub(crate) fn breadcrumb_cursor_buffer_id(&self, cx: &App) -> Option<BufferId> {
+        let cursor = self.selections.newest_anchor().head();
+        let snapshot = self.buffer().read(cx).snapshot(cx);
+        snapshot
+            .anchor_to_buffer_anchor(cursor)
+            .map(|(_, buffer)| buffer.remote_id())
     }
 
     /// Converted outline items and their depths, cached by buffer id/version.
@@ -402,7 +460,17 @@ impl Editor {
                                 }
                             }
                         }
+                        // The regular debounced prefetch would skip this: the version hasn't changed.
+                        let refreshed_buffer_id = editor
+                            .breadcrumb_cursor_buffer_id(cx)
+                            .filter(|buffer_id| highlighted_results.contains_key(buffer_id));
                         editor.lsp_document_symbols.extend(highlighted_results);
+                        if let Some(buffer_id) = refreshed_buffer_id
+                            && let Some(items) =
+                                editor.lsp_document_symbols.get(&buffer_id).cloned()
+                        {
+                            editor.set_breadcrumb_outline(buffer_id, items, cx);
+                        }
                         editor.refresh_outline_symbols_at_cursor(cx);
                     })
                     .ok();
@@ -976,6 +1044,9 @@ mod tests {
             buffer_id
         });
 
+        // The cursor-driven prefetch is debounced like `refresh_document_symbols`.
+        cx.background_executor
+            .advance_clock(LSP_REQUEST_DEBOUNCE_TIMEOUT + Duration::from_millis(100));
         cx.run_until_parked();
 
         cx.update_editor(|editor, _window, cx| {
@@ -986,6 +1057,93 @@ mod tests {
                     .map(|item| item.text.as_str())
                     .collect::<Vec<_>>(),
                 vec!["fn main"]
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_breadcrumb_outline_replaces_a_poisoned_empty_cache_once_lsp_symbols_land(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx, |_| {});
+
+        update_test_language_settings(cx, &|settings| {
+            settings.defaults.document_symbols = Some(DocumentSymbols::On);
+        });
+
+        let mut cx = EditorLspTestContext::new_rust(
+            lsp::ServerCapabilities {
+                document_symbol_provider: Some(lsp::OneOf::Left(true)),
+                ..lsp::ServerCapabilities::default()
+            },
+            cx,
+        )
+        .await;
+        let mut symbol_request = cx
+            .set_request_handler::<lsp::request::DocumentSymbolRequest, _, _>(
+                move |_, _, _| async move {
+                    Ok(Some(lsp::DocumentSymbolResponse::Nested(vec![
+                        nested_symbol(
+                            "main",
+                            lsp::SymbolKind::FUNCTION,
+                            lsp_range(0, 0, 2, 1),
+                            lsp_range(0, 3, 0, 7),
+                            Vec::new(),
+                        ),
+                    ])))
+                },
+            );
+
+        cx.set_state("fn maˇin() {\n    let x = 1;\n}\n");
+        assert!(symbol_request.next().await.is_some());
+        cx.run_until_parked();
+
+        let buffer_id = cx.update_editor(|editor, _window, cx| {
+            let buffer_id = editor
+                .buffer()
+                .read(cx)
+                .as_singleton()
+                .unwrap()
+                .read(cx)
+                .remote_id();
+            assert_eq!(
+                editor
+                    .breadcrumb_symbol_menu_items(buffer_id, None, cx)
+                    .iter()
+                    .map(|item| item.text.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["fn main"],
+                "the landing LSP response must reach the breadcrumb outline on its own"
+            );
+            buffer_id
+        });
+
+        // An empty outline at the version the response carries: the version guard would keep it.
+        cx.update_editor(|editor, _window, cx| {
+            editor.set_breadcrumb_outline(buffer_id, Vec::new(), cx);
+            assert!(
+                editor
+                    .breadcrumb_symbol_menu_items(buffer_id, None, cx)
+                    .is_empty(),
+                "the poisoned cache reports no symbols even though the LSP already has them"
+            );
+        });
+
+        cx.update_editor(|editor, _window, cx| {
+            let items = editor
+                .lsp_document_symbols
+                .get(&buffer_id)
+                .cloned()
+                .unwrap_or_default();
+            editor.set_breadcrumb_outline(buffer_id, items, cx);
+            assert_eq!(
+                editor
+                    .breadcrumb_symbol_menu_items(buffer_id, None, cx)
+                    .iter()
+                    .map(|item| item.text.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["fn main"],
+                "storing at an unchanged version must replace both the outline and its conversion"
             );
         });
     }

@@ -40,11 +40,11 @@ impl EventEmitter<ToolbarItemEvent> for Breadcrumbs {}
 
 impl Render for Breadcrumbs {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The trail's own scroll container lives in `render_breadcrumb_text`.
         let element = h_flex()
             .id("breadcrumb-container")
             .flex_grow_1()
             .h_8()
-            .overflow_x_scroll()
             .text_ui(cx);
 
         let Some(active_item) = self.active_item.as_ref() else {

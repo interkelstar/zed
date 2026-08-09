@@ -1483,8 +1483,7 @@ impl<D: PickerDelegate> Picker<D> {
             )
             .with_sizing_behavior(sizing_behavior)
             .flex_grow_1()
-            // Rounded, as fractional padding makes a list that fits its rows scrollable by 1px.
-            .py((window.rem_size() * 0.25).round())
+            .py(window.rem_size() * 0.25)
             .track_scroll(&scroll_handle)
             .into_any_element(),
             ElementContainer::List(state) => list(

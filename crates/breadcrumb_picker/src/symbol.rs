@@ -768,55 +768,101 @@ mod tests {
         });
     }
 
+    /// Binds the same context strings the default keymaps use.
+    fn bind_drill_navigation_keymap(cx: &mut TestAppContext) {
+        use settings::KeymapFile;
+
+        cx.update(|cx| {
+            cx.bind_keys(KeymapFile::load_panic_on_failure(
+                r#"[
+                    {
+                        "context": "Editor",
+                        "bindings": {
+                            "left": "editor::MoveLeft",
+                            "right": "editor::MoveRight"
+                        }
+                    },
+                    {
+                        "context": "BreadcrumbPicker > Editor",
+                        "bindings": {
+                            "left": "menu::SelectParent",
+                            "right": "menu::SelectChild"
+                        }
+                    }
+                ]"#,
+                cx,
+            ));
+        });
+    }
+
     #[gpui::test]
     async fn test_select_parent_and_child_do_not_drill_with_a_query(cx: &mut TestAppContext) {
         init_test(cx);
+        bind_drill_navigation_keymap(cx);
 
-        let (editor_window, editor) = build_test_editor(cx);
-        let cx = &mut VisualTestContext::from_window(*editor_window, cx);
-
-        let snapshot = editor.read_with(cx, |editor, cx| editor.buffer().read(cx).snapshot(cx));
-        let target = test_item(&snapshot, 0, "alpha");
+        let buffer = cx.new(|cx| language::Buffer::local("alpha\nbeta\ngamma\n", cx));
+        let multi_buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
         let buffer_id = BufferId::new(1).unwrap();
 
-        let picker = editor_window
-            .update(cx, |_, window, cx| {
-                BreadcrumbSymbolDelegate::picker(
-                    editor.downgrade(),
-                    buffer_id,
-                    Some(target),
-                    vec![test_item(&snapshot, 0, "alpha")],
-                    None,
-                    None,
-                    window,
-                    cx,
-                )
+        struct Harness {
+            picker: Entity<BreadcrumbSymbolPicker>,
+            editor: Entity<Editor>,
+        }
+        impl Render for Harness {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                self.picker.clone()
+            }
+        }
+
+        let harness_window = cx.add_window(|window, cx| {
+            let editor = cx.new(|cx| build_editor(multi_buffer.clone(), window, cx));
+            let snapshot = editor.read(cx).buffer().read(cx).snapshot(cx);
+            let target = test_item(&snapshot, 0, "alpha");
+            let picker = BreadcrumbSymbolDelegate::picker(
+                editor.downgrade(),
+                buffer_id,
+                Some(target),
+                vec![test_item(&snapshot, 0, "alpha")],
+                None,
+                None,
+                window,
+                cx,
+            );
+            Harness { picker, editor }
+        });
+        let (picker, _editor) = harness_window
+            .read_with(cx, |harness, _| {
+                (harness.picker.clone(), harness.editor.clone())
             })
             .unwrap();
+        let cx = &mut VisualTestContext::from_window(*harness_window, cx);
+        cx.run_until_parked();
 
-        picker
-            .update_in(cx, |picker, window, cx| {
-                picker
-                    .delegate
-                    .update_matches("alpha".to_string(), window, cx)
-            })
-            .await;
-
-        let parent_result = picker.update_in(cx, |picker, window, cx| {
-            picker.delegate.select_parent(window, cx)
+        picker.update_in(cx, |picker, window, cx| {
+            window.focus(&picker.focus_handle(cx), cx);
         });
-        assert!(
-            parent_result.is_none(),
-            "a non-empty query leaves left for the query editor's caret, even with a target set"
-        );
-
-        let child_result = picker.update_in(cx, |picker, window, cx| {
-            picker.delegate.select_child(window, cx)
+        cx.run_until_parked();
+        cx.simulate_keystrokes("a l p h a");
+        cx.run_until_parked();
+        picker.update(cx, |picker, cx| {
+            assert_eq!(picker.query(cx), "alpha");
         });
-        assert!(
-            child_result.is_none(),
-            "a non-empty query leaves right for the query editor's caret"
-        );
+
+        // A non-empty query leaves left/right for the caret, even with a target set: a swallowed
+        // key would leave the typed letter appended at the end instead of landing at the caret.
+        cx.simulate_keystrokes("left");
+        cx.simulate_keystrokes("z");
+        cx.run_until_parked();
+        picker.update(cx, |picker, cx| {
+            assert_eq!(picker.query(cx), "alphza");
+        });
+
+        cx.simulate_keystrokes("right");
+        cx.simulate_keystrokes("y");
+        cx.run_until_parked();
+        picker.update(cx, |picker, cx| {
+            assert_eq!(picker.query(cx), "alphzay");
+        });
     }
 
     #[gpui::test]

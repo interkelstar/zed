@@ -296,6 +296,8 @@ impl BreadcrumbsRow {
                         if let Some(path) = path {
                             cx.write_to_clipboard(ClipboardItem::new_string(path));
                         }
+                        // Otherwise the container's own handler below overwrites this with the file path.
+                        cx.stop_propagation();
                     })
                     .child(content)
                     .into_any_element()
@@ -424,7 +426,6 @@ impl BreadcrumbsRow {
     }
 }
 
-/// Gathers the primitives `breadcrumb_segment_copy_path` needs from the live editor and project state.
 fn resolve_breadcrumb_segment_copy_path(
     target: &BreadcrumbSegmentTarget,
     editor: &Editor,
@@ -442,8 +443,11 @@ fn resolve_breadcrumb_segment_copy_path(
         BreadcrumbSegmentTarget::Symbol {
             item: Some(item), ..
         } => {
+            // Buffer coordinates, not multibuffer: expanded diff hunks shift multibuffer rows.
             let snapshot = editor.buffer().read(cx).snapshot(cx);
-            Some(item.range.start.to_point(&snapshot).row + 1)
+            snapshot
+                .anchor_to_buffer_anchor(item.range.start)
+                .map(|(anchor, buffer)| text::ToPoint::to_point(&anchor, buffer).row + 1)
         }
         _ => None,
     };
@@ -592,6 +596,8 @@ impl gpui::Element for BreadcrumbsRow {
                 .get(anchored_index)
                 .and_then(|segment| segment.target.clone())
             && let Some(editor) = self.editor.as_ref().and_then(WeakEntity::upgrade)
+            // Reanchoring drops and re-shows the popover itself; dismissing mid-flight fights it.
+            && !editor.read(cx).breadcrumb_reanchoring()
         {
             dismiss_orphaned_breadcrumb_popover(&editor, &target, cx);
         }
@@ -910,7 +916,9 @@ pub fn render_breadcrumb_text(
     };
 
     let breadcrumbs_stack = div()
+        .id("breadcrumb-trail")
         .min_w_0()
+        .overflow_x_scroll()
         .when(multibuffer_header, |this| {
             this.pl_2()
                 .border_l_1()

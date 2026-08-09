@@ -1182,6 +1182,7 @@ pub struct Editor {
     refresh_outline_symbols_at_cursor_at_cursor_task: Task<()>,
     outline_symbols_at_cursor: Option<(BufferId, Vec<OutlineItem<Anchor>>)>,
     breadcrumb_outline_task: Task<()>,
+    breadcrumb_outline_debounce_task: Task<()>,
     breadcrumb_outline: Option<BreadcrumbOutline>,
     /// `breadcrumb_outline` converted to multi-buffer anchors, cached by buffer id/version.
     breadcrumb_converted_outline_cache: RefCell<Option<ConvertedBreadcrumbOutline>>,
@@ -2511,6 +2512,7 @@ impl Editor {
             refresh_outline_symbols_at_cursor_at_cursor_task: Task::ready(()),
             outline_symbols_at_cursor: None,
             breadcrumb_outline_task: Task::ready(()),
+            breadcrumb_outline_debounce_task: Task::ready(()),
             breadcrumb_outline: None,
             breadcrumb_converted_outline_cache: RefCell::new(None),
             #[cfg(any(test, feature = "test-support"))]
@@ -3778,9 +3780,21 @@ impl Editor {
         let cursor = self.selections.newest_anchor().head();
         let multi_buffer_snapshot = self.buffer().read(cx).snapshot(cx);
 
-        // Before the LSP gate below: the breadcrumb outline is wanted either way.
-        if let Some((_, buffer)) = multi_buffer_snapshot.anchor_to_buffer_anchor(cursor) {
-            self.prefetch_breadcrumb_outline(buffer.remote_id(), cx);
+        // Full editors only, and debounced like `refresh_document_symbols`: every keystroke lands here.
+        if self.mode().is_full()
+            && let Some((_, buffer)) = multi_buffer_snapshot.anchor_to_buffer_anchor(cursor)
+        {
+            let buffer_id = buffer.remote_id();
+            self.breadcrumb_outline_debounce_task = cx.spawn(async move |editor, cx| {
+                cx.background_executor()
+                    .timer(LSP_REQUEST_DEBOUNCE_TIMEOUT)
+                    .await;
+                editor
+                    .update(cx, |editor, cx| {
+                        editor.prefetch_breadcrumb_outline(buffer_id, cx);
+                    })
+                    .ok();
+            });
         }
 
         if !self.lsp_data_enabled() {
@@ -9759,6 +9773,9 @@ impl Editor {
                 self.refresh_selected_text_highlights(&self.display_snapshot(cx), true, window, cx);
                 self.colorize_brackets(true, cx);
                 jsx_tag_auto_close::refresh_enabled_in_any_buffer(self, multibuffer, cx);
+                if self.breadcrumb_cursor_buffer_id(cx) == Some(*buffer_id) {
+                    self.refresh_breadcrumb_outline(*buffer_id, cx);
+                }
 
                 cx.emit(EditorEvent::Reparsed(*buffer_id));
             }
@@ -9770,6 +9787,9 @@ impl Editor {
                     self.registered_buffers.remove(&buffer_id);
                 }
                 jsx_tag_auto_close::refresh_enabled_in_any_buffer(self, multibuffer, cx);
+                if self.breadcrumb_cursor_buffer_id(cx) == Some(*buffer_id) {
+                    self.refresh_breadcrumb_outline(*buffer_id, cx);
+                }
                 cx.emit(EditorEvent::Reparsed(*buffer_id));
                 self.update_edit_prediction_settings(cx);
                 cx.notify();
@@ -11194,7 +11214,6 @@ impl Editor {
         self.breadcrumb_pending_reanchor
     }
 
-    #[cfg(any(test, feature = "test-support"))]
     pub fn breadcrumb_reanchoring(&self) -> bool {
         self.breadcrumb_reanchoring
     }

@@ -185,7 +185,6 @@ pub(crate) fn plan_breadcrumb_layout(
     breadcrumb_layout_plan_from_dropped(&dropped)
 }
 
-/// `None` when not expanded; width is deliberately not a parameter, so expansion never drops a segment.
 pub(crate) fn breadcrumb_layout_plan_for_expansion(
     expanded: bool,
     segment_count: usize,

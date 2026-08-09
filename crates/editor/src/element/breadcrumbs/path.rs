@@ -67,7 +67,6 @@ pub(crate) fn breadcrumb_path_segments(
     (labels, targets)
 }
 
-/// Pure by design: resolving the abs paths and symbol line against live state happens at the call site.
 pub(crate) fn breadcrumb_segment_copy_path(
     target: &BreadcrumbSegmentTarget,
     worktree_abs_path: Option<PathBuf>,
