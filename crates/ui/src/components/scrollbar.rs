@@ -233,6 +233,7 @@ impl<T: ScrollableHandle> UniformListDecoration for ScrollbarStateWrapper<T> {
     ) -> gpui::AnyElement {
         ScrollbarElement {
             origin: -scroll_offset,
+            compensate_parent_scroll: false,
             state: self.0.clone(),
         }
         .into_any()
@@ -368,6 +369,8 @@ pub struct Scrollbars<T: ScrollableHandle = ScrollHandle> {
     scrollable_handle: Handle<T>,
     visibility: Point<ReservedSpace>,
     style: Option<ScrollbarStyle>,
+    thumb_thickness: Option<Pixels>,
+    thumb_inset: Option<Pixels>,
     track_color: Option<Hsla>,
     border: bool,
 }
@@ -395,6 +398,8 @@ impl Scrollbars {
             tracked_entity: None,
             visibility: show_along.apply_to(Default::default(), ReservedSpace::Thumb),
             style: None,
+            thumb_thickness: None,
+            thumb_inset: None,
             track_color: None,
             border: false,
         }
@@ -438,6 +443,8 @@ impl<ScrollHandle: ScrollableHandle> Scrollbars<ScrollHandle> {
             track_color,
             border,
             style,
+            thumb_thickness,
+            thumb_inset,
             ..
         } = self;
 
@@ -450,6 +457,8 @@ impl<ScrollHandle: ScrollableHandle> Scrollbars<ScrollHandle> {
             border,
             get_visibility,
             style,
+            thumb_thickness,
+            thumb_inset,
         }
     }
 
@@ -460,6 +469,13 @@ impl<ScrollHandle: ScrollableHandle> Scrollbars<ScrollHandle> {
 
     pub fn style(mut self, style: ScrollbarStyle) -> Self {
         self.style = Some(style);
+        self
+    }
+
+    /// Override the thumb's cross-axis thickness and its inset from the track edges.
+    pub fn thumb_geometry(mut self, thickness: Pixels, inset: Pixels) -> Self {
+        self.thumb_thickness = Some(thickness);
+        self.thumb_inset = Some(inset);
         self
     }
 
@@ -624,6 +640,8 @@ struct ScrollbarState<T: ScrollableHandle = ScrollHandle> {
     track_color: Option<TrackColors>,
     show_state: VisibilityState,
     style: ScrollbarStyle,
+    thumb_thickness: Option<Pixels>,
+    thumb_inset: Option<Pixels>,
     mouse_in_parent: bool,
     last_prepaint_state: Option<ScrollbarPrepaintState>,
     _auto_hide_task: Option<Task<()>>,
@@ -650,6 +668,8 @@ impl<T: ScrollableHandle> ScrollbarState<T> {
             show_behavior,
             get_visibility: config.get_visibility,
             style: config.style.unwrap_or_default(),
+            thumb_thickness: config.thumb_thickness,
+            thumb_inset: config.thumb_inset,
             show_state: VisibilityState::from_behavior(show_behavior),
             mouse_in_parent: true,
             last_prepaint_state: None,
@@ -735,7 +755,16 @@ impl<T: ScrollableHandle> ScrollbarState<T> {
     }
 
     fn space_to_reserve(&self) -> Pixels {
-        self.style.to_pixels() + 2 * SCROLLBAR_PADDING
+        self.thumb_thickness() + 2 * self.thumb_inset()
+    }
+
+    fn thumb_thickness(&self) -> Pixels {
+        self.thumb_thickness
+            .unwrap_or_else(|| self.style.to_pixels())
+    }
+
+    fn thumb_inset(&self) -> Pixels {
+        self.thumb_inset.unwrap_or(SCROLLBAR_PADDING)
     }
 
     fn handle_to_track<Handle: ScrollableHandle>(&self) -> Option<&Handle> {
@@ -901,12 +930,16 @@ impl<T: ScrollableHandle> Render for ScrollbarState<T> {
         ScrollbarElement {
             state: cx.entity(),
             origin: Default::default(),
+            // When the handle is ours, the parent div scrolls its children, us
+            // included; the offset is read back in prepaint, after clamping.
+            compensate_parent_scroll: !self.manually_added,
         }
     }
 }
 
 struct ScrollbarElement<T: ScrollableHandle> {
     origin: Point<Pixels>,
+    compensate_parent_scroll: bool,
     state: Entity<ScrollbarState<T>>,
 }
 
@@ -1137,6 +1170,9 @@ impl<T: ScrollableHandle> Element for ScrollbarElement<T> {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
+        if self.compensate_parent_scroll {
+            self.origin = -self.state.read(cx).scroll_handle().offset();
+        }
         let prepaint_state =
             self.state
                 .read(cx)
@@ -1146,7 +1182,8 @@ impl<T: ScrollableHandle> Element for ScrollbarElement<T> {
                     thumbs: {
                         let state = self.state.read(cx);
                         let thumb_ranges = state.thumb_ranges().collect::<SmallVec<[_; 2]>>();
-                        let width = state.style.to_pixels();
+                        let width = state.thumb_thickness();
+                        let inset = state.thumb_inset();
                         let track_color = state.track_color.as_ref();
 
                         let additional_padding = if thumb_ranges.len() == 2 {
@@ -1169,7 +1206,7 @@ impl<T: ScrollableHandle> Element for ScrollbarElement<T> {
                                     bounds.size.apply_along(axis.invert(), |_| {
                                         width
                                             + match state.style {
-                                                ScrollbarStyle::Regular => 2 * SCROLLBAR_PADDING,
+                                                ScrollbarStyle::Regular => 2 * inset,
                                                 ScrollbarStyle::Editor => Pixels::ZERO,
                                             }
                                     }),
@@ -1181,9 +1218,7 @@ impl<T: ScrollableHandle> Element for ScrollbarElement<T> {
                                 // Rounded style needs a bit of padding, whereas for editor scrollbars,
                                 // we want the full length of the track
                                 let thumb_container_bounds = match state.style {
-                                    ScrollbarStyle::Regular => {
-                                        scroll_track_bounds.dilate(-SCROLLBAR_PADDING)
-                                    }
+                                    ScrollbarStyle::Regular => scroll_track_bounds.dilate(-inset),
                                     ScrollbarStyle::Editor if has_border => scroll_track_bounds
                                         .extend(match axis {
                                             ScrollbarAxis::Horizontal => Edges {
@@ -1229,7 +1264,12 @@ impl<T: ScrollableHandle> Element for ScrollbarElement<T> {
                                         } else {
                                             thumb_bounds
                                         },
-                                        HitboxBehavior::BlockMouseExceptScroll,
+                                        // A faded-out overlay scrollbar must not eat clicks.
+                                        if state.visible() || state.is_dragging() {
+                                            HitboxBehavior::BlockMouseExceptScroll
+                                        } else {
+                                            HitboxBehavior::Normal
+                                        },
                                     ),
                                     track_config: track_color
                                         .filter(|_| needs_scroll_track)
@@ -1239,7 +1279,11 @@ impl<T: ScrollableHandle> Element for ScrollbarElement<T> {
                             })
                             .collect()
                     },
-                    parent_bounds_hitbox: window.insert_hitbox(bounds, HitboxBehavior::Normal),
+                    // Scroll-compensated like the thumbs, so hover tracks the geometry the user sees.
+                    parent_bounds_hitbox: window.insert_hitbox(
+                        Bounds::new(self.origin + bounds.origin, bounds.size),
+                        HitboxBehavior::Normal,
+                    ),
                 });
         if prepaint_state
             .as_ref()
@@ -1444,10 +1488,10 @@ impl<T: ScrollableHandle> Element for ScrollbarElement<T> {
                 move |event: &MouseDownEvent, phase, window, cx| {
                     state.update(cx, |state, cx| {
                         let Some(scrollbar_layout) = (phase == capture_phase
-                            && event.button == MouseButton::Left)
-                            .then(|| state.hit_for_position(&event.position))
-                            .flatten()
-                        else {
+                            && event.button == MouseButton::Left
+                            && (state.visible() || state.is_dragging()))
+                        .then(|| state.hit_for_position(&event.position))
+                        .flatten() else {
                             return;
                         };
 
@@ -1545,11 +1589,16 @@ impl<T: ScrollableHandle> Element for ScrollbarElement<T> {
                     }
 
                     state.update(cx, |state, cx| {
-                        if state.is_dragging() {
+                        let was_dragging = state.is_dragging();
+                        if was_dragging {
                             state.scroll_handle().drag_ended();
                         }
 
                         if !state.parent_hovered(window) {
+                            // A drag can end outside the parent; lingering `Dragging` would block auto-hide.
+                            if was_dragging {
+                                state.set_thumb_state(ThumbState::Inactive, window, cx);
+                            }
                             state.schedule_auto_hide(window, cx);
                             return;
                         }

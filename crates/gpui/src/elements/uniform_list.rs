@@ -8,7 +8,7 @@ use crate::{
     AnyElement, App, AvailableSpace, Bounds, ContentMask, Element, ElementId, Entity,
     GlobalElementId, Hitbox, InspectorElementId, InteractiveElement, Interactivity, IntoElement,
     IsZero, LayoutId, ListSizingBehavior, Overflow, Pixels, Point, ScrollHandle, Size,
-    StyleRefinement, Styled, Window, point, px, size,
+    StyleRefinement, Styled, Window, point, px, size, util::round_stroke_to_device_pixel,
 };
 use smallvec::SmallVec;
 use std::{cell::RefCell, cmp, ops::Range, rc::Rc, usize};
@@ -340,10 +340,13 @@ impl Element for UniformList {
         let style = self
             .interactivity
             .compute_style(global_id, None, window, cx);
-        let border = style.border_widths.to_pixels(window.rem_size());
-        let padding = style
-            .padding
-            .to_pixels(bounds.size.into(), window.rem_size());
+        // Snap like `to_taffy` does, so `padded_bounds` agrees with the laid-out box.
+        let scale_factor = window.scale_factor();
+        let border = style
+            .border_widths
+            .to_pixels(window.rem_size())
+            .map(|edge| px(round_stroke_to_device_pixel(edge.0, scale_factor) / scale_factor));
+        let padding = window.snap_absolute_padding(style.padding, bounds.size);
 
         let padded_bounds = Bounds::from_corners(
             bounds.origin + point(border.left + padding.left, border.top + padding.top),
