@@ -888,6 +888,7 @@ impl Item for Editor {
     fn deactivated(&mut self, _: &mut Window, cx: &mut Context<Self>) {
         let selection = self.selections.newest_anchor();
         self.push_to_nav_history(selection.head(), None, true, false, cx);
+        self.cancel_breadcrumb_reanchor(cx);
     }
 
     fn workspace_deactivated(&mut self, _: &mut Window, cx: &mut Context<Self>) {
@@ -1094,17 +1095,8 @@ impl Item for Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
-        (!TabBarSettings::get_global(cx).show && ItemSettings::get_global(cx).file_icons)
-            .then(|| {
-                path_for_buffer(&self.buffer, 0, true, cx)
-                    .and_then(|path| FileIcons::get_icon(Path::new(&*path), cx))
-            })
-            .flatten()
-            .map(|icon_path| Icon::from_path(icon_path).into_any_element())
-    }
-
-    fn breadcrumb_cancel_reanchor(&mut self, cx: &mut Context<Self>) {
-        self.cancel_breadcrumb_reanchor(cx);
+        let (icon_path, color) = self.breadcrumb_prefix_icon(cx)?;
+        Some(Icon::from_path(icon_path).color(color).into_any_element())
     }
 
     fn added_to_workspace(
@@ -1615,6 +1607,18 @@ fn clip_ranges<'a>(
 impl EventEmitter<SearchEvent> for Editor {}
 
 impl Editor {
+    // The tab-bar-hidden bar renders its one file icon here, so the tint must match the segment path.
+    pub(crate) fn breadcrumb_prefix_icon(&self, cx: &App) -> Option<(SharedString, Color)> {
+        if TabBarSettings::get_global(cx).show || !ItemSettings::get_global(cx).file_icons {
+            return None;
+        }
+        let icon_path = path_for_buffer(&self.buffer, 0, true, cx)
+            .and_then(|path| FileIcons::get_icon(Path::new(&*path), cx))?;
+        let project_path = self.active_project_path(cx);
+        let color = crate::element::bar_file_icon_color(self.project(), project_path.as_ref(), cx);
+        Some((icon_path, color))
+    }
+
     pub fn update_restoration_data(
         &self,
         cx: &mut Context<Self>,

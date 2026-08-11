@@ -2,6 +2,7 @@ use super::*;
 // use crate::undo::tests::{build_create_operation, build_rename_operation};
 use collections::HashSet;
 use editor::{Editor, MultiBufferOffset};
+use fs::RemoveOptions;
 use git::{
     Oid,
     repository::{InitialGraphCommitData, LogSource, RepoPath},
@@ -6863,118 +6864,237 @@ async fn test_selection_restored_when_creation_cancelled(cx: &mut gpui::TestAppC
     );
 }
 
-#[gpui::test]
-async fn test_pending_folded_reveal_drops_when_entry_no_longer_exists(
+async fn setup_reveal_cancellation_panel(
     cx: &mut gpui::TestAppContext,
+) -> (
+    Arc<FakeFs>,
+    Entity<Project>,
+    Entity<ProjectPanel>,
+    VisualTestContext,
 ) {
     init_test_with_editor(cx);
+    cx.update(|cx| {
+        cx.update_global::<SettingsStore, _>(|store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.project.worktree.file_scan_exclusions = Some(Vec::new());
+                let project_panel = settings.project_panel.get_or_insert_default();
+                project_panel.auto_reveal_entries = Some(true);
+                // The pending-reveal machinery these tests exercise only arms when folding is on.
+                project_panel.auto_fold_dirs = Some(true);
+            });
+        })
+    });
 
     let fs = FakeFs::new(cx.executor());
     fs.insert_tree(
-        "/src",
+        "/project_root",
         json!({
-            "test": {
-                "first.rs": "// First Rust file",
-            }
+            ".git": {},
+            ".gitignore": "ignored.py\nignored_dir\n",
+            "ignored_dir": {
+                "sub": {}
+            },
+            "tracked.py": "# Tracked file",
+            "ignored.py": "# Ignored file",
         }),
     )
     .await;
 
-    let project = Project::test(fs.clone(), ["/src".as_ref()], cx).await;
+    let project = Project::test(fs.clone(), ["/project_root".as_ref()], cx).await;
     let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
     let workspace = window
         .read_with(cx, |mw, _| mw.workspace().clone())
         .unwrap();
-    let cx = &mut VisualTestContext::from_window(window.into(), cx);
-    let panel = workspace.update_in(cx, ProjectPanel::new);
+    let mut cx = VisualTestContext::from_window(window.into(), cx);
+    let panel = workspace.update_in(&mut cx, ProjectPanel::new);
     cx.run_until_parked();
-
-    let worktree_id = panel.update(cx, |panel, cx| {
-        panel
-            .project
-            .read(cx)
-            .worktrees(cx)
-            .next()
-            .unwrap()
-            .read(cx)
-            .id()
-    });
-
-    // Simulate a reveal that got queued for an entry that has since been
-    // deleted from the project (e.g. the file was removed before the fold
-    // state describing its chain caught up).
-    panel.update_in(cx, |panel, window, cx| {
-        panel.pending_folded_reveal = Some(SelectedEntry {
-            worktree_id,
-            entry_id: ProjectEntryId::from_usize(999_999),
-        });
-        panel.pending_folded_reveal_attempts = 2;
-        panel.update_visible_entries(None, false, false, window, cx);
-    });
-    cx.run_until_parked();
-
-    panel.update(cx, |panel, _| {
-        assert_eq!(
-            panel.pending_folded_reveal, None,
-            "a reveal target that no longer exists in the project must be dropped, not requeued"
-        );
-        assert_eq!(panel.pending_folded_reveal_attempts, 0);
-    });
+    (fs, project, panel, cx)
 }
 
 #[gpui::test]
 async fn test_manual_selection_cancels_pending_folded_reveal(cx: &mut gpui::TestAppContext) {
-    init_test_with_editor(cx);
+    let (_fs, project, panel, mut cx) = setup_reveal_cancellation_panel(cx).await;
+    let cx = &mut cx;
 
-    let fs = FakeFs::new(cx.executor());
-    fs.insert_tree(
-        "/src",
-        json!({
-            "first.rs": "// First Rust file",
-            "second.rs": "// Second Rust file",
-        }),
-    )
-    .await;
+    let worktree_id =
+        cx.update(|_, cx| project.read(cx).worktrees(cx).next().unwrap().read(cx).id());
+    let tracked_entry = find_project_entry(&panel, "project_root/tracked.py", cx).unwrap();
+    let git_dir_entry = find_project_entry(&panel, "project_root/.git", cx).unwrap();
+    let ignored_dir_entry = find_project_entry(&panel, "project_root/ignored_dir", cx).unwrap();
 
-    let project = Project::test(fs.clone(), ["/src".as_ref()], cx).await;
-    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
-    let workspace = window
-        .read_with(cx, |mw, _| mw.workspace().clone())
-        .unwrap();
-    let cx = &mut VisualTestContext::from_window(window.into(), cx);
-    let panel = workspace.update_in(cx, ProjectPanel::new);
-    cx.run_until_parked();
-
-    let worktree_id = panel.update(cx, |panel, cx| {
-        panel
-            .project
-            .read(cx)
-            .worktrees(cx)
-            .next()
-            .unwrap()
-            .read(cx)
-            .id()
+    panel.update_in(cx, |panel, window, cx| {
+        panel.select_first(&SelectFirst, window, cx);
     });
-    let first_entry = find_project_entry(&panel, "src/first.rs", cx).unwrap();
+    panel.update(cx, |panel, cx| {
+        panel.project.update(cx, |_, cx| {
+            cx.emit(project::Event::RevealInProjectPanel(tracked_entry))
+        })
+    });
+    panel.update_in(cx, |panel, window, cx| {
+        assert!(
+            panel.pending_reveal_task.is_some(),
+            "the reveal must still be in flight when the user selects"
+        );
+        panel.select_next(&SelectNext, window, cx);
+        assert_eq!(
+            panel.selection,
+            Some(SelectedEntry {
+                worktree_id,
+                entry_id: git_dir_entry,
+            }),
+            "select_next must move from the root to the next visible entry"
+        );
+        assert!(
+            panel.pending_reveal_task.is_none(),
+            "an explicit selection must drop the in-flight reveal task"
+        );
+    });
 
+    // The state after a finished expansion has armed the target but its rebuild has not landed.
     panel.update_in(cx, |panel, window, cx| {
         panel.pending_folded_reveal = Some(SelectedEntry {
             worktree_id,
-            entry_id: first_entry,
+            entry_id: tracked_entry,
         });
         panel.select_next(&SelectNext, window, cx);
-    });
-
-    panel.update(cx, |panel, _| {
+        assert_eq!(
+            panel.selection,
+            Some(SelectedEntry {
+                worktree_id,
+                entry_id: ignored_dir_entry,
+            })
+        );
         assert_eq!(
             panel.pending_folded_reveal, None,
-            "an explicit user selection must cancel an outstanding folded reveal"
+            "an explicit selection must clear the armed reveal target"
+        );
+    });
+
+    cx.run_until_parked();
+    panel.update(cx, |panel, _| {
+        assert_eq!(panel.pending_folded_reveal, None);
+        assert!(panel.pending_reveal_task.is_none());
+    });
+}
+
+#[gpui::test]
+async fn test_ignored_entry_auto_reveal_cancels_pending_folded_reveal(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (_fs, project, panel, mut cx) = setup_reveal_cancellation_panel(cx).await;
+    let cx = &mut cx;
+
+    let worktree_id =
+        cx.update(|_, cx| project.read(cx).worktrees(cx).next().unwrap().read(cx).id());
+    let ignored_file_entry = find_project_entry(&panel, "project_root/ignored.py", cx).unwrap();
+    let ignored_dir_entry = find_project_entry(&panel, "project_root/ignored_dir", cx).unwrap();
+
+    panel.update(cx, |panel, cx| {
+        panel.project.update(cx, |_, cx| {
+            cx.emit(project::Event::RevealInProjectPanel(ignored_dir_entry))
+        })
+    });
+    panel.update(cx, |panel, cx| {
+        assert!(
+            panel.pending_reveal_task.is_some(),
+            "the reveal must still be in flight when the auto reveal arrives"
+        );
+        panel.project.update(cx, |_, cx| {
+            cx.emit(project::Event::ActiveEntryChanged(Some(ignored_file_entry)))
+        })
+    });
+    panel.update(cx, |panel, _| {
+        assert_eq!(
+            panel.selection,
+            Some(SelectedEntry {
+                worktree_id,
+                entry_id: ignored_file_entry,
+            }),
+            "the ignored-entry early return is an explicit selection"
+        );
+        assert_eq!(panel.pending_folded_reveal, None);
+        assert!(panel.pending_reveal_task.is_none());
+    });
+
+    cx.run_until_parked();
+    panel.update(cx, |panel, _| {
+        assert_eq!(panel.pending_folded_reveal, None);
+        assert!(panel.pending_reveal_task.is_none());
+        assert_eq!(
+            panel.marked_entries,
+            vec![SelectedEntry {
+                worktree_id,
+                entry_id: ignored_file_entry,
+            }],
+            "the cancelled reveal must not re-mark its own target"
         );
     });
 }
 
 #[gpui::test]
-async fn test_reveal_entry_marks_the_revealed_component_within_a_folded_chain(
+async fn test_deleted_reveal_target_cancels_pending_folded_reveal(cx: &mut gpui::TestAppContext) {
+    let (fs, project, panel, mut cx) = setup_reveal_cancellation_panel(cx).await;
+    let cx = &mut cx;
+
+    let worktree_id =
+        cx.update(|_, cx| project.read(cx).worktrees(cx).next().unwrap().read(cx).id());
+    let root_entry = find_project_entry(&panel, "project_root", cx).unwrap();
+    let ignored_dir_entry = find_project_entry(&panel, "project_root/ignored_dir", cx).unwrap();
+
+    panel.update_in(cx, |panel, window, cx| {
+        panel.select_first(&SelectFirst, window, cx);
+    });
+    panel.update(cx, |panel, cx| {
+        panel.project.update(cx, |_, cx| {
+            cx.emit(project::Event::RevealInProjectPanel(ignored_dir_entry))
+        })
+    });
+    // Supersede the reveal's own rebuild so its deferred selection update cannot mask
+    // whether the arming task ran after the deletion.
+    panel.update_in(cx, |panel, window, cx| {
+        assert!(panel.pending_reveal_task.is_some());
+        panel.update_visible_entries(None, false, false, window, cx);
+    });
+    fs.remove_dir(
+        "/project_root/ignored_dir".as_ref(),
+        RemoveOptions {
+            recursive: true,
+            ignore_if_not_exists: false,
+        },
+    )
+    .await
+    .unwrap();
+    cx.run_until_parked();
+
+    panel.update(cx, |panel, _| {
+        assert_eq!(
+            panel.pending_folded_reveal, None,
+            "a deleted reveal target must be dropped, not requeued"
+        );
+        assert!(panel.pending_reveal_task.is_none());
+        assert_eq!(
+            panel.selection,
+            Some(SelectedEntry {
+                worktree_id,
+                entry_id: root_entry,
+            }),
+            "a reveal whose target vanished must not move the selection"
+        );
+    });
+    assert_eq!(
+        visible_entries_as_strings(&panel, 0..10, cx),
+        &[
+            "v project_root  <== selected",
+            "    > .git",
+            "      .gitignore",
+            "      ignored.py",
+            "      tracked.py",
+        ]
+    );
+}
+
+#[gpui::test]
+async fn test_reveal_entry_activates_the_revealed_component_within_a_folded_chain(
     cx: &mut gpui::TestAppContext,
 ) {
     init_test(cx);
@@ -6983,11 +7103,11 @@ async fn test_reveal_entry_marks_the_revealed_component_within_a_folded_chain(
     fs.insert_tree(
         "/root",
         json!({
-            "a": {
-                "b": {
-                    "c": {
-                        "d": {}
-                    }
+            ".git": {},
+            ".gitignore": "ignored\n",
+            "x": {
+                "ignored": {
+                    "sub": {}
                 }
             }
         }),
@@ -7017,22 +7137,132 @@ async fn test_reveal_entry_marks_the_revealed_component_within_a_folded_chain(
 
     assert_eq!(
         visible_entries_as_strings(&panel, 0..20, cx),
-        &["v root", "    > a/b/c/d"],
+        &[
+            "v root",
+            "    > .git",
+            "    > x/ignored",
+            "      .gitignore"
+        ],
+        "the gitignored dir folds with its parent while its own children are unscanned"
+    );
+    assert_eq!(
+        find_project_entry(&panel, "root/x/ignored/sub", cx),
+        None,
+        "the chain below the reveal target must not exist before the expansion lands"
+    );
+
+    let worktree_id =
+        cx.update(|_, cx| project.read(cx).worktrees(cx).next().unwrap().read(cx).id());
+    let revealed_entry = find_project_entry(&panel, "root/x/ignored", cx).unwrap();
+
+    panel.update(cx, |panel, cx| {
+        panel.project.update(cx, |_, cx| {
+            cx.emit(project::Event::RevealInProjectPanel(revealed_entry))
+        })
+    });
+    cx.run_until_parked();
+
+    let leaf_entry = find_project_entry(&panel, "root/x/ignored/sub", cx)
+        .expect("revealing the dir must have loaded its children");
+    panel.read_with(cx, |panel, _| {
+        let folded = panel
+            .state
+            .ancestors
+            .get(&leaf_entry)
+            .expect("the chain is folded around the leaf the expansion uncovered");
+        assert_eq!(
+            folded.active_ancestor(),
+            Some(revealed_entry),
+            "the revealed entry, not the leaf the row is keyed by, must be the active component"
+        );
+        assert_eq!(
+            folded.active_index(),
+            1,
+            "the active index must point at \"ignored\"'s position within the joined \"x/ignored/sub\" label"
+        );
+        assert_eq!(
+            panel.selection,
+            Some(SelectedEntry {
+                worktree_id,
+                entry_id: leaf_entry,
+            }),
+            "the selection must land on the row keyed by the leaf"
+        );
+        assert_eq!(
+            panel.marked_entries,
+            vec![SelectedEntry {
+                worktree_id,
+                entry_id: leaf_entry,
+            }],
+            "the row itself stays keyed by the leaf; only the active component changes"
+        );
+        assert_eq!(
+            panel.resolve_entry(leaf_entry),
+            revealed_entry,
+            "actions on the folded row must resolve to the revealed component"
+        );
+    });
+    assert_eq!(
+        visible_entries_as_strings(&panel, 0..20, cx),
+        &[
+            "v root",
+            "    > .git",
+            "    > x/ignored/sub  <== selected  <== marked",
+            "      .gitignore",
+        ]
+    );
+}
+
+#[gpui::test]
+async fn test_reveal_entry_activates_the_revealed_component_within_a_plain_folded_chain(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/root",
+        json!({
+            "x": {
+                "y": {
+                    "z": {}
+                }
+            }
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs.clone(), ["/root".as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |mw, _| mw.workspace().clone())
+        .unwrap();
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+    cx.update(|_, cx| {
+        let settings = *ProjectPanelSettings::get_global(cx);
+        ProjectPanelSettings::override_global(
+            ProjectPanelSettings {
+                auto_fold_dirs: true,
+                ..settings
+            },
+            cx,
+        );
+    });
+
+    let panel = workspace.update_in(cx, ProjectPanel::new);
+    cx.run_until_parked();
+
+    assert_eq!(
+        visible_entries_as_strings(&panel, 0..20, cx),
+        &["v root", "    > x/y/z"],
         "a single-child directory chain folds into one row before the reveal"
     );
 
-    let worktree_id = panel.update(cx, |panel, cx| {
-        panel
-            .project
-            .read(cx)
-            .worktrees(cx)
-            .next()
-            .unwrap()
-            .read(cx)
-            .id()
-    });
-    let leaf_entry = find_project_entry(&panel, "root/a/b/c/d", cx).unwrap();
-    let middle_entry = find_project_entry(&panel, "root/a/b", cx).unwrap();
+    let worktree_id =
+        cx.update(|_, cx| project.read(cx).worktrees(cx).next().unwrap().read(cx).id());
+    let leaf_entry = find_project_entry(&panel, "root/x/y/z", cx).unwrap();
+    let middle_entry = find_project_entry(&panel, "root/x/y", cx).unwrap();
 
     panel.update(cx, |panel, cx| {
         panel.project.update(cx, |_, cx| {
@@ -7055,15 +7285,112 @@ async fn test_reveal_entry_marks_the_revealed_component_within_a_folded_chain(
         assert_eq!(
             folded.active_index(),
             1,
-            "the active index must point at \"b\"'s position within the joined \"a/b/c/d\" label"
+            "the active index must point at \"y\"'s position within the joined \"x/y/z\" label"
         );
         assert_eq!(
-            panel.marked_entries,
-            vec![SelectedEntry {
+            panel.selection,
+            Some(SelectedEntry {
                 worktree_id,
                 entry_id: leaf_entry,
-            }],
-            "the row itself stays keyed by the leaf; only the active component changes"
+            }),
+            "the selection must land on the row keyed by the leaf"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_reveal_without_auto_fold_dirs_skips_the_second_rebuild(
+    cx: &mut gpui::TestAppContext,
+) {
+    init_test_with_editor(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/root",
+        json!({
+            "dir": {
+                "file.txt": "",
+            }
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs.clone(), ["/root".as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |mw, _| mw.workspace().clone())
+        .unwrap();
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    let panel = workspace.update_in(cx, ProjectPanel::new);
+    cx.run_until_parked();
+
+    let worktree_id =
+        cx.update(|_, cx| project.read(cx).worktrees(cx).next().unwrap().read(cx).id());
+    let file_entry = find_project_entry(&panel, "root/dir/file.txt", cx).unwrap();
+
+    panel.update(cx, |panel, cx| {
+        panel.project.update(cx, |_, cx| {
+            cx.emit(project::Event::RevealInProjectPanel(file_entry))
+        })
+    });
+    panel.update(cx, |panel, _| {
+        assert!(
+            panel.pending_reveal_task.is_none(),
+            "with auto_fold_dirs off a reveal must not arm the second rebuild"
+        );
+        assert_eq!(panel.pending_folded_reveal, None);
+    });
+
+    cx.run_until_parked();
+    panel.update(cx, |panel, _| {
+        assert_eq!(
+            panel.selection,
+            Some(SelectedEntry {
+                worktree_id,
+                entry_id: file_entry,
+            }),
+            "the single rebuild must be enough to select the revealed entry"
+        );
+        assert!(panel.pending_reveal_task.is_none());
+    });
+}
+
+#[gpui::test]
+async fn test_active_entry_cleared_cancels_pending_folded_reveal(cx: &mut gpui::TestAppContext) {
+    let (_fs, project, panel, mut cx) = setup_reveal_cancellation_panel(cx).await;
+    let cx = &mut cx;
+
+    let worktree_id =
+        cx.update(|_, cx| project.read(cx).worktrees(cx).next().unwrap().read(cx).id());
+    let ignored_dir_entry = find_project_entry(&panel, "project_root/ignored_dir", cx).unwrap();
+
+    panel.update(cx, |panel, cx| {
+        panel.project.update(cx, |_, cx| {
+            cx.emit(project::Event::RevealInProjectPanel(ignored_dir_entry))
+        })
+    });
+    panel.update(cx, |panel, cx| {
+        assert!(
+            panel.pending_reveal_task.is_some(),
+            "the reveal must still be in flight when the active editor closes"
+        );
+        // The state after a finished expansion has armed the target but its rebuild has not landed.
+        panel.pending_folded_reveal = Some(SelectedEntry {
+            worktree_id,
+            entry_id: ignored_dir_entry,
+        });
+        panel.project.update(cx, |_, cx| {
+            cx.emit(project::Event::ActiveEntryChanged(None))
+        })
+    });
+    panel.update(cx, |panel, _| {
+        assert_eq!(
+            panel.pending_folded_reveal, None,
+            "closing the active editor must disarm the reveal target"
+        );
+        assert!(
+            panel.pending_reveal_task.is_none(),
+            "closing the active editor must drop the in-flight reveal task"
         );
     });
 }

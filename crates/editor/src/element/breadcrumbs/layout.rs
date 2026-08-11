@@ -38,16 +38,19 @@ pub(crate) fn align_symbol_segments(
 
 const MAX_BREADCRUMB_SEGMENTS_HARD_CAP: usize = 64;
 
+/// The cap is display-only, so an expanded row bypasses it: expansion must reveal every segment.
 pub(crate) fn hard_cap_breadcrumb_middle_segments(
     mut segments: Vec<HighlightedText>,
     mut symbol_segments: Vec<Option<BreadcrumbSegmentTarget>>,
     mut kinds: Vec<BreadcrumbSegmentKind>,
     mut file_segment_index: usize,
+    expanded: bool,
 ) -> (
     Vec<HighlightedText>,
     Vec<Option<BreadcrumbSegmentTarget>>,
     Vec<BreadcrumbSegmentKind>,
     usize,
+    Option<usize>,
 ) {
     let middle_start = kinds
         .iter()
@@ -57,10 +60,10 @@ pub(crate) fn hard_cap_breadcrumb_middle_segments(
         .rposition(|kind| *kind == BreadcrumbSegmentKind::Middle)
         .map(|index| index + 1);
     let (Some(middle_start), Some(middle_end)) = (middle_start, middle_end) else {
-        return (segments, symbol_segments, kinds, file_segment_index);
+        return (segments, symbol_segments, kinds, file_segment_index, None);
     };
-    if middle_end - middle_start <= MAX_BREADCRUMB_SEGMENTS_HARD_CAP {
-        return (segments, symbol_segments, kinds, file_segment_index);
+    if expanded || middle_end - middle_start <= MAX_BREADCRUMB_SEGMENTS_HARD_CAP {
+        return (segments, symbol_segments, kinds, file_segment_index, None);
     }
 
     let half = MAX_BREADCRUMB_SEGMENTS_HARD_CAP / 2;
@@ -83,7 +86,13 @@ pub(crate) fn hard_cap_breadcrumb_middle_segments(
     // `File` always follows every `Middle` segment, so this splice can only shift its index left.
     file_segment_index -= (splice_end - splice_start) - 1;
 
-    (segments, symbol_segments, kinds, file_segment_index)
+    (
+        segments,
+        symbol_segments,
+        kinds,
+        file_segment_index,
+        Some(splice_start),
+    )
 }
 
 /// `visible` and `ellipses` together partition `0..segment_count`.
@@ -191,19 +200,6 @@ pub(crate) fn plan_breadcrumb_layout(
     breadcrumb_layout_plan_from_dropped(&dropped)
 }
 
-pub(crate) fn breadcrumb_layout_plan_for_expansion(
-    expanded: bool,
-    segment_count: usize,
-) -> Option<BreadcrumbLayoutPlan> {
-    if !expanded {
-        return None;
-    }
-    Some(BreadcrumbLayoutPlan {
-        visible: (0..segment_count).collect(),
-        ellipses: Vec::new(),
-    })
-}
-
 pub(crate) fn breadcrumb_layout_plan_width(
     widths: &[Pixels],
     plan: &BreadcrumbLayoutPlan,
@@ -290,15 +286,42 @@ mod tests {
 
         let kinds = classify_breadcrumb_segment_kinds(segments.len(), 99, true);
 
-        let (segments, symbol_segments, kinds, file_segment_index) =
-            hard_cap_breadcrumb_middle_segments(segments, symbol_segments, kinds, 99);
+        let (capped_segments, capped_symbol_segments, capped_kinds, file_segment_index, cap_index) =
+            hard_cap_breadcrumb_middle_segments(
+                segments.clone(),
+                symbol_segments.clone(),
+                kinds.clone(),
+                99,
+                false,
+            );
 
         // 67 = root (1) + capped middle (32 prefix + 1 "⋯" + 32 suffix) + file (1).
-        assert_eq!(segments.len(), 67);
-        assert_eq!(symbol_segments.len(), segments.len());
-        assert_eq!(kinds.len(), segments.len());
+        assert_eq!(capped_segments.len(), 67);
+        assert_eq!(capped_symbol_segments.len(), capped_segments.len());
+        assert_eq!(capped_kinds.len(), capped_segments.len());
         assert_eq!(file_segment_index, 66);
-        assert_eq!(kinds[file_segment_index], BreadcrumbSegmentKind::File);
+        assert_eq!(
+            capped_kinds[file_segment_index],
+            BreadcrumbSegmentKind::File
+        );
+        assert_eq!(
+            cap_index,
+            Some(33),
+            "the pseudo-segment sits after the root and the 32 kept prefix segments"
+        );
+        assert_eq!(capped_segments[33].text.as_ref(), "⋯");
+
+        let (segments, symbol_segments, kinds, file_segment_index, cap_index) =
+            hard_cap_breadcrumb_middle_segments(segments, symbol_segments, kinds, 99, true);
+        assert_eq!(
+            segments.len(),
+            100,
+            "an expanded row bypasses the cap so expansion reveals every segment"
+        );
+        assert_eq!(symbol_segments.len(), 100);
+        assert_eq!(kinds.len(), 100);
+        assert_eq!(file_segment_index, 99);
+        assert_eq!(cap_index, None);
     }
 
     #[test]
@@ -312,13 +335,14 @@ mod tests {
         let symbol_segments = vec![None; segments.len()];
         let kinds = classify_breadcrumb_segment_kinds(segments.len(), 3, true);
 
-        let (segments, symbol_segments, kinds, file_segment_index) =
-            hard_cap_breadcrumb_middle_segments(segments, symbol_segments, kinds, 3);
+        let (segments, symbol_segments, kinds, file_segment_index, cap_index) =
+            hard_cap_breadcrumb_middle_segments(segments, symbol_segments, kinds, 3, false);
 
         assert_eq!(segments.len(), 6);
         assert_eq!(symbol_segments.len(), 6);
         assert_eq!(kinds.len(), 6);
         assert_eq!(file_segment_index, 3);
+        assert_eq!(cap_index, None);
     }
 
     fn sample_breadcrumb_widths_and_kinds() -> (Vec<Pixels>, Vec<BreadcrumbSegmentKind>) {
@@ -338,35 +362,24 @@ mod tests {
     }
 
     #[test]
-    fn test_plan_breadcrumb_layout_everything_fits() {
+    fn test_plan_breadcrumb_layout_drops_middle_before_root_before_file_before_outer_symbols() {
         let (widths, kinds) = sample_breadcrumb_widths_and_kinds();
         let total: Pixels = widths.iter().fold(Pixels::ZERO, |sum, w| sum + *w);
 
-        let plan = plan_breadcrumb_layout(&widths, &kinds, px(20.), total, None, false);
-
-        assert_eq!(plan.visible, (0..widths.len()).collect::<Vec<_>>());
-        assert!(plan.ellipses.is_empty());
-    }
-
-    #[test]
-    fn test_plan_breadcrumb_layout_drops_middle_before_root_before_file_before_outer_symbols() {
-        let (widths, kinds) = sample_breadcrumb_widths_and_kinds();
-
-        let plan = plan_breadcrumb_layout(&widths, &kinds, px(20.), px(380.), None, false);
-        assert_eq!(plan.visible, vec![0, 5, 6, 7]);
-        assert_eq!(plan.ellipses, vec![1..5]);
-
-        let plan = plan_breadcrumb_layout(&widths, &kinds, px(20.), px(340.), None, false);
-        assert_eq!(plan.visible, vec![5, 6, 7]);
-        assert_eq!(plan.ellipses, vec![0..5]);
-
-        let plan = plan_breadcrumb_layout(&widths, &kinds, px(20.), px(230.), None, false);
-        assert_eq!(plan.visible, vec![6, 7]);
-        assert_eq!(plan.ellipses, vec![0..6]);
-
-        let plan = plan_breadcrumb_layout(&widths, &kinds, px(20.), px(140.), None, false);
-        assert_eq!(plan.visible, vec![7]);
-        assert_eq!(plan.ellipses, vec![0..7]);
+        let cases = [
+            (total, (0..widths.len()).collect::<Vec<_>>(), Vec::new()),
+            (px(380.), vec![0, 5, 6, 7], vec![1..5]),
+            (px(340.), vec![5, 6, 7], vec![0..5]),
+            (px(230.), vec![6, 7], vec![0..6]),
+            (px(140.), vec![7], vec![0..7]),
+            // Degenerate width: the last segment always survives.
+            (px(1.), vec![7], vec![0..7]),
+        ];
+        for (available, visible, ellipses) in cases {
+            let plan = plan_breadcrumb_layout(&widths, &kinds, px(20.), available, None, false);
+            assert_eq!(plan.visible, visible, "available width {available:?}");
+            assert_eq!(plan.ellipses, ellipses, "available width {available:?}");
+        }
     }
 
     /// Hidden tab bar: the bar holds the only copy of the file name, so it outlives the symbols.
@@ -384,16 +397,7 @@ mod tests {
     }
 
     #[test]
-    fn test_plan_breadcrumb_layout_degenerate_case_always_keeps_the_last_segment() {
-        let (widths, kinds) = sample_breadcrumb_widths_and_kinds();
-
-        let plan = plan_breadcrumb_layout(&widths, &kinds, px(20.), px(1.), None, false);
-        assert_eq!(plan.visible, vec![7]);
-        assert_eq!(plan.ellipses, vec![0..7]);
-    }
-
-    #[test]
-    fn test_plan_breadcrumb_layout_single_segment_never_collapses() {
+    fn test_plan_breadcrumb_layout_boundary_inputs() {
         let plan = plan_breadcrumb_layout(
             &[px(500.)],
             &[BreadcrumbSegmentKind::File],
@@ -402,27 +406,12 @@ mod tests {
             None,
             false,
         );
-        assert_eq!(plan.visible, vec![0]);
+        assert_eq!(plan.visible, vec![0], "a single segment never collapses");
         assert!(plan.ellipses.is_empty());
-    }
 
-    #[test]
-    fn test_plan_breadcrumb_layout_empty_input() {
         let plan = plan_breadcrumb_layout(&[], &[], px(20.), px(500.), None, false);
         assert!(plan.visible.is_empty());
         assert!(plan.ellipses.is_empty());
-    }
-
-    #[test]
-    fn test_breadcrumb_layout_plan_for_expansion_keeps_every_segment() {
-        let plan = breadcrumb_layout_plan_for_expansion(true, 5).unwrap();
-        assert_eq!(plan.visible, vec![0, 1, 2, 3, 4]);
-        assert!(plan.ellipses.is_empty());
-    }
-
-    #[test]
-    fn test_breadcrumb_layout_plan_for_expansion_defers_when_not_expanded() {
-        assert!(breadcrumb_layout_plan_for_expansion(false, 5).is_none());
     }
 
     #[test]

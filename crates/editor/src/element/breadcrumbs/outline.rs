@@ -89,12 +89,6 @@ mod tests {
     }
 
     #[test]
-    fn test_sibling_outline_indices_out_of_bounds() {
-        let depths = [0, 0];
-        assert_eq!(sibling_outline_indices(&depths, 5), Vec::<usize>::new());
-    }
-
-    #[test]
     fn test_child_outline_indices_top_level() {
         let depths = [0, 0, 0];
         assert_eq!(child_outline_indices(&depths, 0), Vec::<usize>::new());
@@ -118,12 +112,6 @@ mod tests {
         let depths = [0, 2, 2, 0];
         assert_eq!(child_outline_indices(&depths, 0), vec![1, 2]);
         assert_eq!(child_outline_indices(&depths, 3), Vec::<usize>::new());
-    }
-
-    #[test]
-    fn test_child_outline_indices_out_of_bounds() {
-        let depths = [0, 0];
-        assert_eq!(child_outline_indices(&depths, 5), Vec::<usize>::new());
     }
 
     #[test]

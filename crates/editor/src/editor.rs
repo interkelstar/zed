@@ -21,7 +21,8 @@ pub mod display_map;
 mod document_colors;
 mod document_links;
 mod document_symbols;
-use document_symbols::{BreadcrumbOutline, ConvertedBreadcrumbOutline};
+use document_symbols::BreadcrumbOutline;
+use element::BreadcrumbState;
 mod editor_settings;
 mod element;
 mod fold;
@@ -238,8 +239,6 @@ use settings::{
 };
 use smallvec::{SmallVec, smallvec};
 use snippet::Snippet;
-#[cfg(any(test, feature = "test-support"))]
-use std::cell::Cell;
 use std::{
     any::{Any, TypeId},
     borrow::Cow,
@@ -1131,17 +1130,7 @@ pub struct Editor {
     in_project_search: bool,
     previous_search_ranges: Option<Arc<[Range<Anchor>]>>,
     breadcrumb_header: Option<String>,
-    breadcrumb_navigation: Option<BreadcrumbNavigation>,
-    breadcrumb_symbol_navigation: Option<BreadcrumbSymbolNavigation>,
-    breadcrumb_popover_handle: Option<Rc<dyn ErasedBreadcrumbPopoverHandle>>,
-    breadcrumb_symbol_popover_handle: Option<Rc<dyn ErasedBreadcrumbPopoverHandle>>,
-    breadcrumb_dismiss_subscription: Option<Subscription>,
-    breadcrumb_symbol_dismiss_subscription: Option<Subscription>,
-    /// Suppresses [`Editor::clear_breadcrumb_navigation`] and [`Editor::clear_breadcrumb_symbol_navigation`] while the dropdown moves between segments.
-    breadcrumb_reanchoring: bool,
-    /// Waiting for the new active segment's `PopoverMenu` to register the shared handle.
-    breadcrumb_pending_reanchor: Option<BreadcrumbPopoverKind>,
-    breadcrumb_expanded: bool,
+    breadcrumb_state: BreadcrumbState,
     focused_block: Option<FocusedBlock>,
     next_scroll_position: NextScrollCursorCenterTopBottom,
     addons: TypeIdHashMap<Box<dyn Addon>>,
@@ -1186,10 +1175,6 @@ pub struct Editor {
     breadcrumb_outline_task: Shared<Task<()>>,
     breadcrumb_outline_debounce_task: Task<()>,
     breadcrumb_outline: Option<BreadcrumbOutline>,
-    /// `breadcrumb_outline` converted to multi-buffer anchors for the buffer id/version it holds.
-    breadcrumb_converted_outline_cache: RefCell<Option<ConvertedBreadcrumbOutline>>,
-    #[cfg(any(test, feature = "test-support"))]
-    breadcrumb_converted_outline_recomputes: Cell<usize>,
     sticky_headers_task: Task<()>,
     sticky_headers: Option<Vec<OutlineItem<Anchor>>>,
     pub(crate) colorize_brackets_task: Task<()>,
@@ -2469,19 +2454,7 @@ impl Editor {
             in_project_search: false,
             previous_search_ranges: None,
             breadcrumb_header: None,
-            breadcrumb_navigation: None,
-            breadcrumb_symbol_navigation: None,
-            breadcrumb_popover_handle: BREADCRUMB_PICKER_RENDERERS
-                .get()
-                .map(|renderers| (renderers.popover_handle)()),
-            breadcrumb_symbol_popover_handle: BREADCRUMB_PICKER_RENDERERS
-                .get()
-                .map(|renderers| (renderers.symbol_popover_handle)()),
-            breadcrumb_reanchoring: false,
-            breadcrumb_dismiss_subscription: None,
-            breadcrumb_symbol_dismiss_subscription: None,
-            breadcrumb_pending_reanchor: None,
-            breadcrumb_expanded: false,
+            breadcrumb_state: BreadcrumbState::default(),
             focused_block: None,
             next_scroll_position: NextScrollCursorCenterTopBottom::default(),
             addons: Default::default(),
@@ -2517,9 +2490,6 @@ impl Editor {
             breadcrumb_outline_task: Task::ready(()).shared(),
             breadcrumb_outline_debounce_task: Task::ready(()),
             breadcrumb_outline: None,
-            breadcrumb_converted_outline_cache: RefCell::new(None),
-            #[cfg(any(test, feature = "test-support"))]
-            breadcrumb_converted_outline_recomputes: Cell::new(0),
             sticky_headers_task: Task::ready(()),
             sticky_headers: None,
             colorize_brackets_task: Task::ready(()),
@@ -3784,7 +3754,10 @@ impl Editor {
         let multi_buffer_snapshot = self.buffer().read(cx).snapshot(cx);
 
         // Full editors only, and debounced like `refresh_document_symbols`: every keystroke lands here.
+        // Skipped when breadcrumbs are hidden or the buffer is a multibuffer, since nothing reads this outline then.
         if self.mode().is_full()
+            && self.breadcrumbs_visible()
+            && multi_buffer_snapshot.is_singleton()
             && let Some((_, buffer)) = multi_buffer_snapshot.anchor_to_buffer_anchor(cursor)
         {
             if self.breadcrumb_outline_is_fresh(buffer.remote_id(), buffer.version()) {
@@ -11040,30 +11013,55 @@ impl Editor {
     }
 
     pub fn breadcrumb_navigation(&self) -> Option<&BreadcrumbNavigation> {
-        self.breadcrumb_navigation.as_ref()
+        self.breadcrumb_state.directory_navigation()
     }
 
     pub fn breadcrumb_symbol_navigation(&self) -> Option<&BreadcrumbSymbolNavigation> {
-        self.breadcrumb_symbol_navigation.as_ref()
+        self.breadcrumb_state.symbol_navigation()
     }
 
     pub fn breadcrumb_popover_handle(&self) -> Option<Rc<dyn ErasedBreadcrumbPopoverHandle>> {
-        self.breadcrumb_popover_handle.clone()
+        self.breadcrumb_state.directory_popover_handle()
     }
 
     pub fn breadcrumb_symbol_popover_handle(
         &self,
     ) -> Option<Rc<dyn ErasedBreadcrumbPopoverHandle>> {
-        self.breadcrumb_symbol_popover_handle.clone()
+        self.breadcrumb_state.symbol_popover_handle()
     }
 
     pub(crate) fn breadcrumb_expanded(&self) -> bool {
-        self.breadcrumb_expanded
+        self.breadcrumb_state.expanded
     }
 
     pub(crate) fn expand_breadcrumb_trail(&mut self, cx: &mut Context<Self>) {
-        self.breadcrumb_expanded = true;
+        self.breadcrumb_state.expanded = true;
         cx.emit(EditorEvent::BreadcrumbsChanged);
+    }
+
+    pub(crate) fn note_breadcrumb_zone_mouse_down(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.breadcrumb_state.zone_mouse_down = true;
+        let editor = cx.weak_entity();
+        // Not `cx.defer`: the dismiss subscription reads the flag from an `Emit`
+        // effect queued after the defer, which would reset it first.
+        // `on_next_frame` alone requests nothing; notify so a frame is guaranteed to run.
+        window.on_next_frame(move |_, cx| {
+            editor
+                .update(cx, |editor, _| {
+                    editor.breadcrumb_state.zone_mouse_down = false;
+                })
+                .ok();
+        });
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn breadcrumb_zone_mouse_down(&self) -> bool {
+        self.breadcrumb_state.zone_mouse_down
     }
 
     pub fn watch_breadcrumb_dismissal<T: EventEmitter<DismissEvent> + 'static>(
@@ -11073,7 +11071,7 @@ impl Editor {
         path: Arc<RelPath>,
         cx: &mut Context<Self>,
     ) {
-        self.breadcrumb_dismiss_subscription = Some(cx.subscribe(
+        self.breadcrumb_state.dismiss_subscription = Some(cx.subscribe(
             entity,
             move |editor, _, _: &gpui::DismissEvent, cx| {
                 editor.clear_breadcrumb_navigation(worktree_id, &path, cx);
@@ -11088,7 +11086,7 @@ impl Editor {
         active_item: Option<OutlineItem<Anchor>>,
         cx: &mut Context<Self>,
     ) {
-        self.breadcrumb_symbol_dismiss_subscription = Some(cx.subscribe(
+        self.breadcrumb_state.dismiss_subscription = Some(cx.subscribe(
             entity,
             move |editor, _, _: &gpui::DismissEvent, cx| {
                 editor.clear_breadcrumb_symbol_navigation(buffer_id, active_item.as_ref(), cx);
@@ -11102,27 +11100,21 @@ impl Editor {
         path: Arc<RelPath>,
         cx: &mut Context<Self>,
     ) {
-        if let Some(handle) = &self.breadcrumb_popover_handle {
-            handle.hide(cx);
-        }
-        if let Some(handle) = &self.breadcrumb_symbol_popover_handle {
-            handle.hide(cx);
-        }
-        self.breadcrumb_symbol_navigation = None;
-
+        self.breadcrumb_state.hide_popovers(cx);
         let navigated = self
-            .breadcrumb_navigation
-            .as_ref()
+            .breadcrumb_state
+            .directory_navigation()
             .is_some_and(|navigation| {
                 navigation.navigated
                     && navigation.worktree_id == worktree_id
                     && navigation.active_path.starts_with(&path)
             });
-        self.breadcrumb_navigation = Some(BreadcrumbNavigation {
-            worktree_id,
-            active_path: path,
-            navigated,
-        });
+        self.breadcrumb_state
+            .set_directory_navigation(BreadcrumbNavigation {
+                worktree_id,
+                active_path: path,
+                navigated,
+            });
         cx.emit(EditorEvent::BreadcrumbsChanged);
     }
 
@@ -11132,17 +11124,10 @@ impl Editor {
         active_item: Option<OutlineItem<Anchor>>,
         cx: &mut Context<Self>,
     ) {
-        if let Some(handle) = &self.breadcrumb_symbol_popover_handle {
-            handle.hide(cx);
-        }
-        if let Some(handle) = &self.breadcrumb_popover_handle {
-            handle.hide(cx);
-        }
-        self.breadcrumb_navigation = None;
-
+        self.breadcrumb_state.hide_popovers(cx);
         let navigated = self
-            .breadcrumb_symbol_navigation
-            .as_ref()
+            .breadcrumb_state
+            .symbol_navigation()
             .is_some_and(|navigation| {
                 if !navigation.navigated || navigation.buffer_id != buffer_id {
                     return false;
@@ -11157,11 +11142,12 @@ impl Editor {
                     .unwrap_or_default();
                 trail.iter().any(|item| item.range == clicked_item.range)
             });
-        self.breadcrumb_symbol_navigation = Some(BreadcrumbSymbolNavigation {
-            buffer_id,
-            active_item,
-            navigated,
-        });
+        self.breadcrumb_state
+            .set_symbol_navigation(BreadcrumbSymbolNavigation {
+                buffer_id,
+                active_item,
+                navigated,
+            });
         cx.emit(EditorEvent::BreadcrumbsChanged);
     }
 
@@ -11173,27 +11159,20 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.breadcrumb_navigation = Some(BreadcrumbNavigation {
-            worktree_id,
-            active_path: path,
-            navigated: true,
-        });
-        self.breadcrumb_symbol_navigation = None;
+        self.breadcrumb_state
+            .begin_directory_reanchor(BreadcrumbNavigation {
+                worktree_id,
+                active_path: path,
+                navigated: true,
+            });
         cx.emit(EditorEvent::BreadcrumbsChanged);
 
-        self.breadcrumb_reanchoring = true;
-        let handle = self.breadcrumb_popover_handle.clone();
-        let symbol_handle = self.breadcrumb_symbol_popover_handle.clone();
-
         cx.defer_in(window, move |editor, _window, cx| {
-            if let Some(handle) = &handle {
-                handle.hide(cx);
+            editor.breadcrumb_state.hide_popovers(cx);
+            // A tab switch in between may have already cancelled this reanchor.
+            if editor.breadcrumb_state.queue_reanchor() {
+                cx.notify();
             }
-            if let Some(symbol_handle) = &symbol_handle {
-                symbol_handle.hide(cx);
-            }
-            editor.breadcrumb_pending_reanchor = Some(BreadcrumbPopoverKind::Directory);
-            cx.notify();
         });
     }
 
@@ -11205,44 +11184,36 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.breadcrumb_symbol_navigation = Some(BreadcrumbSymbolNavigation {
-            buffer_id,
-            active_item,
-            navigated: true,
-        });
+        self.breadcrumb_state
+            .begin_symbol_reanchor(BreadcrumbSymbolNavigation {
+                buffer_id,
+                active_item,
+                navigated: true,
+            });
         cx.emit(EditorEvent::BreadcrumbsChanged);
 
-        self.breadcrumb_reanchoring = true;
-        let handle = self.breadcrumb_symbol_popover_handle.clone();
-
         cx.defer_in(window, move |editor, _window, cx| {
-            if let Some(handle) = &handle {
-                handle.hide(cx);
+            editor.breadcrumb_state.hide_popovers(cx);
+            // A tab switch in between may have already cancelled this reanchor.
+            if editor.breadcrumb_state.queue_reanchor() {
+                cx.notify();
             }
-            editor.breadcrumb_pending_reanchor = Some(BreadcrumbPopoverKind::Symbol);
-            cx.notify();
         });
     }
 
-    pub(crate) fn breadcrumb_pending_reanchor(&self) -> Option<BreadcrumbPopoverKind> {
-        self.breadcrumb_pending_reanchor
+    pub(crate) fn breadcrumb_reanchor_pending(&self) -> bool {
+        self.breadcrumb_state.reanchor_pending()
     }
 
-    #[cfg(any(test, feature = "test-support"))]
     pub fn breadcrumb_reanchoring(&self) -> bool {
-        self.breadcrumb_reanchoring
+        self.breadcrumb_state.reanchoring()
     }
 
     pub fn reanchor_breadcrumb_popover(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(kind) = self.breadcrumb_pending_reanchor else {
+        if !self.breadcrumb_state.take_queued_reanchor() {
             return;
-        };
-        self.breadcrumb_pending_reanchor = None;
-
-        let handle = match kind {
-            BreadcrumbPopoverKind::Directory => self.breadcrumb_popover_handle.clone(),
-            BreadcrumbPopoverKind::Symbol => self.breadcrumb_symbol_popover_handle.clone(),
-        };
+        }
+        let handle = self.breadcrumb_state.reanchoring_popover_handle();
         let editor = cx.entity().downgrade();
         // Deferred: runs mid-draw, and `show` needs to build and focus the dropdown.
         window.defer(cx, move |window, cx| {
@@ -11250,31 +11221,13 @@ impl Editor {
                 handle.show(window, cx);
             }
             editor
-                .update(cx, |editor, _| editor.breadcrumb_reanchoring = false)
+                .update(cx, |editor, _| editor.breadcrumb_state.finish_reanchor())
                 .ok();
         });
     }
 
     pub fn cancel_breadcrumb_reanchor(&mut self, cx: &mut Context<Self>) {
-        let mut changed = false;
-        if self.breadcrumb_reanchoring {
-            self.breadcrumb_reanchoring = false;
-            changed = true;
-        }
-        if self.breadcrumb_pending_reanchor.take().is_some() {
-            changed = true;
-        }
-        if self.breadcrumb_navigation.take().is_some() {
-            changed = true;
-        }
-        if self.breadcrumb_symbol_navigation.take().is_some() {
-            changed = true;
-        }
-        if self.breadcrumb_expanded {
-            self.breadcrumb_expanded = false;
-            changed = true;
-        }
-        if changed {
+        if self.breadcrumb_state.close() {
             cx.emit(EditorEvent::BreadcrumbsChanged);
         }
     }
@@ -11285,17 +11238,10 @@ impl Editor {
         path: &Arc<RelPath>,
         cx: &mut Context<Self>,
     ) {
-        if self.breadcrumb_reanchoring {
-            return;
-        }
-        let is_current = self
-            .breadcrumb_navigation
-            .as_ref()
-            .is_some_and(|navigation| {
-                navigation.worktree_id == worktree_id && &navigation.active_path == path
-            });
-        if is_current && self.breadcrumb_navigation.take().is_some() {
-            self.breadcrumb_expanded = false;
+        if self
+            .breadcrumb_state
+            .clear_directory_navigation(worktree_id, path)
+        {
             cx.emit(EditorEvent::BreadcrumbsChanged);
         }
     }
@@ -11306,19 +11252,10 @@ impl Editor {
         active_item: Option<&OutlineItem<Anchor>>,
         cx: &mut Context<Self>,
     ) {
-        if self.breadcrumb_reanchoring {
-            return;
-        }
-        let is_current = self
-            .breadcrumb_symbol_navigation
-            .as_ref()
-            .is_some_and(|navigation| {
-                navigation.buffer_id == buffer_id
-                    && navigation.active_item.as_ref().map(|item| &item.range)
-                        == active_item.map(|item| &item.range)
-            });
-        if is_current && self.breadcrumb_symbol_navigation.take().is_some() {
-            self.breadcrumb_expanded = false;
+        if self
+            .breadcrumb_state
+            .clear_symbol_navigation(buffer_id, active_item)
+        {
             cx.emit(EditorEvent::BreadcrumbsChanged);
         }
     }
@@ -11328,14 +11265,10 @@ impl Editor {
         &mut self,
         cx: &mut Context<Self>,
     ) {
-        if !self.breadcrumb_expanded
-            || self.breadcrumb_navigation.is_some()
-            || self.breadcrumb_symbol_navigation.is_some()
-            || self.breadcrumb_reanchoring
-        {
+        if !self.breadcrumb_state.expanded || self.breadcrumb_state.session_open() {
             return;
         }
-        self.breadcrumb_expanded = false;
+        self.breadcrumb_state.expanded = false;
         cx.emit(EditorEvent::BreadcrumbsChanged);
     }
 
@@ -12213,12 +12146,6 @@ pub struct BreadcrumbSymbolNavigation {
     /// None targets the file segment, whose menu lists the top level symbols.
     pub active_item: Option<OutlineItem<Anchor>>,
     pub navigated: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum BreadcrumbPopoverKind {
-    Directory,
-    Symbol,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -2,6 +2,8 @@ mod breadcrumbs;
 mod header;
 mod mouse;
 
+pub(crate) use breadcrumbs::BreadcrumbState;
+pub(crate) use breadcrumbs::bar_file_icon_color;
 #[cfg(test)]
 pub(crate) use breadcrumbs::breadcrumb_path_segments;
 pub(crate) use breadcrumbs::outline_parents;

@@ -5,37 +5,17 @@ use std::sync::Arc;
 use editor::{Anchor, Editor, ErasedBreadcrumbPopoverHandle, flatten_text_for_single_line_display};
 use fuzzy::{StringMatch, StringMatchCandidate};
 use gpui::{
-    AnyElement, App, Context, DismissEvent, Entity, ParentElement, Styled, StyledText, Task,
-    WeakEntity, Window, div, rems,
+    AnyElement, App, Context, DismissEvent, Entity, FontWeight, HighlightStyle, ParentElement,
+    Styled, StyledText, Task, WeakEntity, Window, div, rems,
 };
 use language::OutlineItem;
 use picker::{Picker, PickerDelegate, PickerEditorPosition};
 use project::WorktreeId;
 use text::BufferId;
-use ui::{
-    ButtonLike, ButtonStyle, Color, Icon, IconName, IconSize, ListItem, ListItemSpacing,
-    PopoverMenu, PopoverMenuHandle, prelude::*,
-};
+use ui::{Color, Icon, IconName, IconSize, ListItem, ListItemSpacing, PopoverMenu, prelude::*};
 use util::rel_path::RelPath;
 
-use crate::MAX_BREADCRUMB_MENU_ENTRIES;
-
-/// Newtype avoiding an orphan-rule conflict for `ErasedBreadcrumbPopoverHandle`.
-pub(crate) struct SymbolPopoverHandle(pub PopoverMenuHandle<BreadcrumbSymbolPicker>);
-
-impl ErasedBreadcrumbPopoverHandle for SymbolPopoverHandle {
-    fn hide(&self, cx: &mut App) {
-        self.0.hide(cx);
-    }
-
-    fn show(&self, window: &mut Window, cx: &mut App) {
-        self.0.show(window, cx);
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-}
+use crate::{BreadcrumbPickerCore, BreadcrumbPickerDelegate};
 
 pub struct BreadcrumbSymbolDelegate {
     editor: WeakEntity<Editor>,
@@ -43,12 +23,7 @@ pub struct BreadcrumbSymbolDelegate {
     /// The segment this popover is anchored under; `None` is the file segment.
     target: Option<OutlineItem<Anchor>>,
     items: Vec<OutlineItem<Anchor>>,
-    /// Built once from `items`; a typed query clones this `Rc`, an empty one still copies up to the cap.
-    candidates: Rc<[StringMatchCandidate]>,
-    matches: Vec<StringMatch>,
-    query: String,
-    selected_index: usize,
-    current_range: Option<Range<Anchor>>,
+    core: BreadcrumbPickerCore,
     parent_dir: Option<(WorktreeId, Arc<RelPath>)>,
     /// The outline had not answered yet when the popover opened; cleared once `watch_outline_ready`'s task lands.
     loading: bool,
@@ -64,7 +39,6 @@ impl BreadcrumbSymbolDelegate {
         target: Option<OutlineItem<Anchor>>,
         items: Vec<OutlineItem<Anchor>>,
         loading: bool,
-        current_range: Option<Range<Anchor>>,
         parent_dir: Option<(WorktreeId, Arc<RelPath>)>,
         window: &mut Window,
         cx: &mut App,
@@ -75,11 +49,7 @@ impl BreadcrumbSymbolDelegate {
                 buffer_id,
                 target: target.clone(),
                 items: Vec::new(),
-                candidates: Vec::new().into(),
-                matches: Vec::new(),
-                query: String::new(),
-                selected_index: 0,
-                current_range,
+                core: BreadcrumbPickerCore::default(),
                 parent_dir,
                 loading,
                 _loading_task: Task::ready(()),
@@ -100,7 +70,7 @@ impl BreadcrumbSymbolDelegate {
 
     /// Rebuilds `candidates` for new `items`, then rebuilds the empty-query display from them.
     fn reset_items(&mut self, items: Vec<OutlineItem<Anchor>>) {
-        self.candidates = items
+        self.core.candidates = items
             .iter()
             .enumerate()
             .map(|(index, item)| {
@@ -108,35 +78,22 @@ impl BreadcrumbSymbolDelegate {
             })
             .collect::<Vec<_>>()
             .into();
+        debug_assert!(
+            self.core
+                .candidates
+                .iter()
+                .enumerate()
+                .all(|(index, candidate)| candidate.id == index)
+        );
         self.items = items;
         // A non-empty query keeps whatever `matches` it already has; `update_matches`'s refresh re-runs the filter.
-        if self.query.is_empty() {
-            self.apply_empty_query_matches();
+        if self.core.query.is_empty() {
+            crate::apply_empty_query_matches(self);
         }
     }
 
-    /// Caps `matches` like a typed filter, preselecting `current_range` and keeping it displayed even past the cap.
-    fn apply_empty_query_matches(&mut self) {
-        let keep_candidate_id = self
-            .current_range
-            .as_ref()
-            .and_then(|range| self.items.iter().position(|item| &item.range == range));
-        self.matches = crate::cap_empty_query_matches(
-            &self.candidates,
-            keep_candidate_id,
-            MAX_BREADCRUMB_MENU_ENTRIES,
-        );
-        self.selected_index = self
-            .current_range
-            .as_ref()
-            .and_then(|range| {
-                self.matches.iter().position(|entry_match| {
-                    self.items
-                        .get(entry_match.candidate_id)
-                        .is_some_and(|item| &item.range == range)
-                })
-            })
-            .unwrap_or(0);
+    fn current_range(&self) -> Option<&Range<Anchor>> {
+        self.target.as_ref().map(|item| &item.range)
     }
 
     /// Waits for the prefetch the caller already kicked off, then refreshes the listing.
@@ -173,13 +130,29 @@ impl BreadcrumbSymbolDelegate {
     }
 
     fn shows_current_marker(&self) -> bool {
-        self.current_range
-            .as_ref()
-            .is_some_and(|range| self.items.iter().any(|item| &item.range == range))
+        (0..self.items.len()).any(|candidate_id| self.is_current_candidate(candidate_id))
     }
 
     fn item_at(&self, index: usize) -> Option<&OutlineItem<Anchor>> {
-        self.items.get(self.matches.get(index)?.candidate_id)
+        self.items.get(self.core.matches.get(index)?.candidate_id)
+    }
+}
+
+impl BreadcrumbPickerDelegate for BreadcrumbSymbolDelegate {
+    fn core(&self) -> &BreadcrumbPickerCore {
+        &self.core
+    }
+
+    fn core_mut(&mut self) -> &mut BreadcrumbPickerCore {
+        &mut self.core
+    }
+
+    fn is_current_candidate(&self, candidate_id: usize) -> bool {
+        self.current_range().is_some_and(|range| {
+            self.items
+                .get(candidate_id)
+                .is_some_and(|item| &item.range == range)
+        })
     }
 }
 
@@ -191,11 +164,11 @@ impl PickerDelegate for BreadcrumbSymbolDelegate {
     }
 
     fn match_count(&self) -> usize {
-        self.matches.len()
+        self.core.matches.len()
     }
 
     fn selected_index(&self) -> usize {
-        self.selected_index
+        self.core.selected_index
     }
 
     fn set_selected_index(
@@ -204,7 +177,7 @@ impl PickerDelegate for BreadcrumbSymbolDelegate {
         _window: &mut Window,
         cx: &mut Context<BreadcrumbSymbolPicker>,
     ) {
-        self.selected_index = index;
+        self.core.selected_index = index;
         cx.notify();
     }
 
@@ -215,7 +188,7 @@ impl PickerDelegate for BreadcrumbSymbolDelegate {
     fn no_matches_text(&self, _window: &mut Window, _cx: &mut App) -> Option<SharedString> {
         Some(if self.loading {
             "Loading symbols…".into()
-        } else if !self.query.is_empty() {
+        } else if !self.core.query.is_empty() {
             "No matches".into()
         } else {
             "No symbols".into()
@@ -236,35 +209,7 @@ impl PickerDelegate for BreadcrumbSymbolDelegate {
         _window: &mut Window,
         cx: &mut Context<BreadcrumbSymbolPicker>,
     ) -> Task<()> {
-        self.query = query.clone();
-
-        if query.is_empty() {
-            self.apply_empty_query_matches();
-            cx.notify();
-            return Task::ready(());
-        }
-
-        let candidates = self.candidates.clone();
-        let executor = cx.background_executor().clone();
-        cx.spawn(async move |picker, cx| {
-            let matches = fuzzy::match_strings(
-                &candidates,
-                &query,
-                false,
-                true,
-                MAX_BREADCRUMB_MENU_ENTRIES,
-                &Default::default(),
-                executor,
-            )
-            .await;
-            picker
-                .update(cx, |picker, cx| {
-                    picker.delegate.matches = matches;
-                    picker.delegate.selected_index = 0;
-                    cx.notify();
-                })
-                .ok();
-        })
+        crate::update_picker_matches(self, query, cx)
     }
 
     fn confirm(
@@ -273,7 +218,7 @@ impl PickerDelegate for BreadcrumbSymbolDelegate {
         window: &mut Window,
         cx: &mut Context<BreadcrumbSymbolPicker>,
     ) {
-        let Some(item) = self.item_at(self.selected_index).cloned() else {
+        let Some(item) = self.item_at(self.core.selected_index).cloned() else {
             return;
         };
         if let Some(editor) = self.editor.upgrade() {
@@ -291,10 +236,10 @@ impl PickerDelegate for BreadcrumbSymbolDelegate {
         window: &mut Window,
         cx: &mut Context<BreadcrumbSymbolPicker>,
     ) -> Option<String> {
-        if !self.query.is_empty() {
+        if !self.core.query.is_empty() {
             return None;
         }
-        let selected = self.item_at(self.selected_index)?.clone();
+        let selected = self.item_at(self.core.selected_index)?.clone();
         let editor = self.editor.upgrade()?;
         let children =
             editor
@@ -315,7 +260,7 @@ impl PickerDelegate for BreadcrumbSymbolDelegate {
         window: &mut Window,
         cx: &mut Context<BreadcrumbSymbolPicker>,
     ) -> Option<String> {
-        if !self.query.is_empty() {
+        if !self.core.query.is_empty() {
             return None;
         }
         let editor = self.editor.upgrade()?;
@@ -335,7 +280,6 @@ impl PickerDelegate for BreadcrumbSymbolDelegate {
         Some(String::new())
     }
 
-    /// Uses the symbol's own highlighting; fuzzy match positions are dropped to avoid a clash.
     fn render_match(
         &self,
         index: usize,
@@ -344,7 +288,8 @@ impl PickerDelegate for BreadcrumbSymbolDelegate {
         cx: &mut Context<BreadcrumbSymbolPicker>,
     ) -> Option<Self::ListItem> {
         let item = self.item_at(index)?;
-        let is_current = self.current_range.as_ref() == Some(&item.range);
+        let string_match = self.core.matches.get(index)?;
+        let is_current = self.current_range() == Some(&item.range);
 
         let mut text_style = window.text_style();
         text_style.color = Color::Default.color(cx);
@@ -368,18 +313,42 @@ impl PickerDelegate for BreadcrumbSymbolDelegate {
                     },
                 ))
             })
-            .child(
+            .child({
+                let flattened_text = flatten_text_for_single_line_display(&item.text);
+                let highlights = match_emphasized_highlights(item, &flattened_text, string_match);
                 div().text_ui(cx).child(
-                    StyledText::new(flatten_text_for_single_line_display(&item.text))
-                        .with_default_highlights(&text_style, item.highlight_ranges.clone()),
-                ),
-            )
+                    StyledText::new(flattened_text)
+                        .with_default_highlights(&text_style, highlights),
+                )
+            })
             .into_any_element(),
         )
     }
 }
 
+/// A weight-only overlay keeps the syntax highlight's color visible under the match emphasis.
+fn match_emphasized_highlights(
+    item: &OutlineItem<Anchor>,
+    flattened_text: &str,
+    string_match: &StringMatch,
+) -> Vec<(Range<usize>, HighlightStyle)> {
+    // A kept stale match can carry the item's old text; its ranges would trip StyledText's checks.
+    if flattened_text != string_match.string {
+        return item.highlight_ranges.iter().cloned().collect();
+    }
+    let bold = HighlightStyle {
+        font_weight: Some(FontWeight::BOLD),
+        ..Default::default()
+    };
+    gpui::combine_highlights(
+        string_match.ranges().map(|range| (range, bold)),
+        item.highlight_ranges.iter().cloned(),
+    )
+    .collect()
+}
+
 /// The popover always opens; this only decides what it shows, so a click never picks between an empty popover and the outline modal.
+#[derive(Debug, PartialEq)]
 enum BreadcrumbSymbolMenuOutcome {
     Ready(Vec<OutlineItem<Anchor>>),
     /// The outline answered, and it is genuinely empty.
@@ -415,29 +384,21 @@ pub(crate) fn render_breadcrumb_symbol_segment(
     label: gpui::AnyElement,
     index: usize,
 ) -> gpui::AnyElement {
-    let trigger = ButtonLike::new(("breadcrumb-symbol", index))
-        .style(ButtonStyle::Transparent)
-        .size(ui::ButtonSize::None)
-        .height(rems_from_px(22.).into())
-        .child(label);
-
-    // Only the active segment carries the handle `Editor::navigate_breadcrumb_symbol_to` reopens through.
-    let popover_handle = if is_active_segment {
-        shared_popover_handle
-            .as_any()
-            .downcast_ref::<SymbolPopoverHandle>()
-            .map(|handle| handle.0.clone())
-            .unwrap_or_default()
-    } else {
-        PopoverMenuHandle::default()
-    };
+    let trigger = crate::segment_trigger("breadcrumb-symbol", index, label);
+    let popover_handle = crate::segment_popover_handle::<BreadcrumbSymbolDelegate>(
+        is_active_segment,
+        shared_popover_handle,
+    );
 
     let menu = PopoverMenu::new(("breadcrumb-symbol-menu", index)).with_handle(popover_handle);
-    let menu = if target.is_none() {
-        menu.trigger_with_tooltip(trigger, ui::Tooltip::text("Right-Click to Copy Path"))
+    let copy_title = if target.is_none() {
+        "Copy File Path"
     } else {
-        menu.trigger(trigger)
+        "Copy Path with Line Number"
     };
+    let menu = menu.trigger_with_tooltip(trigger, move |_, cx| {
+        ui::Tooltip::with_meta(copy_title, None, "Right click", cx)
+    });
     menu.menu(move |window, cx| {
         let editor_entity = editor.upgrade()?;
         let (menu_items, loading) = match breadcrumb_symbol_menu_outcome(
@@ -466,7 +427,6 @@ pub(crate) fn render_breadcrumb_symbol_segment(
             target.clone(),
             menu_items,
             loading,
-            target.as_ref().map(|item| item.range.clone()),
             parent_dir.clone(),
             window,
             cx,
@@ -483,345 +443,305 @@ pub(crate) fn render_breadcrumb_symbol_segment(
 mod tests {
     use super::*;
 
-    use editor::MultiBuffer;
-    use editor::MultiBufferSnapshot;
-    use editor::test::build_editor;
     use gpui::{Focusable, TestAppContext, VisualTestContext};
     use std::cell::Cell;
     use text::Point;
 
-    use crate::test_support::{Harness, bind_drill_navigation_keymap};
+    use crate::test_support::{
+        EditorFixture, bind_drill_navigation_keymap, editor_fixture, init_test,
+    };
 
-    fn init_test(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            let _app_state = workspace::AppState::test(cx);
-            theme_settings::init(theme::LoadThemes::JustBase, cx);
-            editor::init(cx);
-            crate::init(cx);
-        });
+    const SOURCE: &str = "struct Alpha {\n    one: u32,\n}\n\nimpl Alpha {\n    fn beta(&self) {}\n\n    fn gamma(&self) {}\n}\n";
+
+    struct SymbolTest {
+        picker: Entity<BreadcrumbSymbolPicker>,
+        editor: Entity<Editor>,
+        buffer_id: BufferId,
+        cx: VisualTestContext,
     }
 
-    fn test_item(snapshot: &MultiBufferSnapshot, row: u32, text: &str) -> OutlineItem<Anchor> {
-        let range =
-            snapshot.anchor_before(Point::new(row, 0))..snapshot.anchor_after(Point::new(row, 0));
-        OutlineItem {
-            depth: 0,
-            range: range.clone(),
-            selection_range: range.clone(),
-            source_range_for_text: range,
-            text: text.into(),
-            highlight_ranges: Vec::new(),
-            name_ranges: Vec::new(),
-            body_range: None,
-            annotation_range: None,
+    fn singleton_buffer_id(editor: &Entity<Editor>, cx: &mut VisualTestContext) -> BufferId {
+        editor.read_with(cx, |editor, cx| {
+            editor
+                .buffer()
+                .read(cx)
+                .as_singleton()
+                .unwrap()
+                .read(cx)
+                .remote_id()
+        })
+    }
+
+    fn outline_item_named(
+        editor: &Editor,
+        buffer_id: BufferId,
+        text: &str,
+        cx: &App,
+    ) -> OutlineItem<Anchor> {
+        let mut queue = editor.breadcrumb_symbol_menu_items(buffer_id, None, cx);
+        while let Some(item) = queue.pop() {
+            if item.text.as_ref() == text {
+                return item;
+            }
+            queue.extend(
+                editor
+                    .breadcrumb_symbol_menu_items(buffer_id, Some(&item), cx)
+                    .into_iter()
+                    .filter(|child| child.depth > item.depth),
+            );
+        }
+        panic!("no outline item named {text:?} in the test source");
+    }
+
+    fn resolved_outline_fixture(cx: &mut TestAppContext) -> EditorFixture<BreadcrumbSymbolPicker> {
+        let mut fixture = editor_fixture(SOURCE, Some(language::rust_lang()), cx);
+        let editor = fixture.editor.clone();
+        let buffer_id = singleton_buffer_id(&editor, &mut fixture.cx);
+        fixture.cx.run_until_parked();
+        editor.update_in(&mut fixture.cx, |editor, _, cx| {
+            editor.prefetch_breadcrumb_outline(buffer_id, cx);
+        });
+        fixture.cx.run_until_parked();
+        fixture
+    }
+
+    /// A picker over `SOURCE`'s real outline, fed exactly what the production popover gets:
+    /// the editor's own buffer id and the resolved menu items for `target`.
+    fn symbol_test(target_text: Option<&str>, cx: &mut TestAppContext) -> SymbolTest {
+        let mut fixture = resolved_outline_fixture(cx);
+        let editor = fixture.editor.clone();
+        let buffer_id = singleton_buffer_id(&editor, &mut fixture.cx);
+        let (target, items) = editor.read_with(&mut fixture.cx, |editor, cx| {
+            let target = target_text.map(|text| outline_item_named(editor, buffer_id, text, cx));
+            let items = editor.breadcrumb_symbol_menu_items(buffer_id, target.as_ref(), cx);
+            (target, items)
+        });
+        assert!(!items.is_empty(), "the outline must have resolved");
+        let harness = fixture.attach_picker(|editor, window, cx| {
+            BreadcrumbSymbolDelegate::picker(
+                editor.downgrade(),
+                buffer_id,
+                target,
+                items,
+                false,
+                None,
+                window,
+                cx,
+            )
+        });
+        SymbolTest {
+            picker: harness.picker,
+            editor: harness.editor,
+            buffer_id,
+            cx: harness.cx,
         }
     }
 
-    fn build_test_editor(cx: &mut TestAppContext) -> (gpui::WindowHandle<Editor>, Entity<Editor>) {
-        let buffer = cx.new(|cx| language::Buffer::local("alpha\nbeta\ngamma\n", cx));
-        let multi_buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
-        let editor_window =
-            cx.add_window(|window, cx| build_editor(multi_buffer.clone(), window, cx));
-        let editor = editor_window.root(cx).unwrap();
-        (editor_window, editor)
-    }
-
     #[gpui::test]
-    async fn test_breadcrumb_symbol_picker_preselects_current_symbol(cx: &mut TestAppContext) {
+    async fn test_breadcrumb_symbol_picker_filtering_follows_the_query(cx: &mut TestAppContext) {
         init_test(cx);
 
-        let (editor_window, editor) = build_test_editor(cx);
-        let cx = &mut VisualTestContext::from_window(*editor_window, cx);
+        let mut t = symbol_test(Some("fn gamma"), cx);
+        let cx = &mut t.cx;
 
-        let snapshot = editor.read_with(cx, |editor, cx| editor.buffer().read(cx).snapshot(cx));
-        let items = vec![
-            test_item(&snapshot, 0, "alpha"),
-            test_item(&snapshot, 1, "beta"),
-            test_item(&snapshot, 2, "gamma"),
-        ];
-        let current_range = items[1].range.clone();
-
-        let picker = editor_window
-            .update(cx, |_, window, cx| {
-                BreadcrumbSymbolDelegate::picker(
-                    editor.downgrade(),
-                    BufferId::new(1).unwrap(),
-                    None,
-                    items,
-                    false,
-                    Some(current_range),
-                    None,
-                    window,
-                    cx,
-                )
-            })
-            .unwrap();
-
-        picker.read_with(cx, |picker, _| {
+        t.picker.read_with(cx, |picker, _| {
             assert_eq!(
-                picker.delegate.selected_index, 1,
+                picker.delegate.item_at(1).map(|item| item.text.as_ref()),
+                Some("fn gamma"),
+                "a leaf target lists its siblings"
+            );
+            assert_eq!(
+                picker.delegate.core.selected_index, 1,
                 "the segment's own symbol is preselected"
             );
         });
 
-        picker
+        let candidates_before = t
+            .picker
+            .read_with(cx, |picker, _| picker.delegate.core.candidates.clone());
+
+        t.picker
             .update_in(cx, |picker, window, cx| {
                 picker.delegate.update_matches(String::new(), window, cx)
             })
             .await;
-
-        picker.read_with(cx, |picker, _| {
+        t.picker.read_with(cx, |picker, _| {
             assert_eq!(
-                picker.delegate.selected_index, 1,
+                picker.delegate.core.selected_index, 1,
                 "clearing the query keeps the current symbol selected"
             );
         });
-    }
 
-    #[gpui::test]
-    async fn test_breadcrumb_symbol_picker_fuzzy_filtering_resets_selection(
-        cx: &mut TestAppContext,
-    ) {
-        init_test(cx);
-
-        let (editor_window, editor) = build_test_editor(cx);
-        let cx = &mut VisualTestContext::from_window(*editor_window, cx);
-
-        let snapshot = editor.read_with(cx, |editor, cx| editor.buffer().read(cx).snapshot(cx));
-        let items = vec![
-            test_item(&snapshot, 0, "alpha"),
-            test_item(&snapshot, 1, "beta"),
-            test_item(&snapshot, 2, "gamma"),
-        ];
-
-        let picker = editor_window
-            .update(cx, |_, window, cx| {
-                BreadcrumbSymbolDelegate::picker(
-                    editor.downgrade(),
-                    BufferId::new(1).unwrap(),
-                    None,
-                    items,
-                    false,
-                    None,
-                    None,
-                    window,
-                    cx,
-                )
-            })
-            .unwrap();
-
-        picker
+        t.picker
             .update_in(cx, |picker, window, cx| {
                 picker
                     .delegate
                     .update_matches("gam".to_string(), window, cx)
             })
             .await;
-
-        picker.read_with(cx, |picker, _| {
+        t.picker.read_with(cx, |picker, _| {
             assert_eq!(
-                picker.delegate.matches.len(),
+                picker.delegate.core.matches.len(),
                 1,
                 "the query narrows the listing to the one discriminating match"
             );
             assert_eq!(
                 picker.delegate.item_at(0).map(|item| item.text.as_ref()),
-                Some("gamma")
+                Some("fn gamma")
             );
             assert_eq!(
-                picker.delegate.selected_index, 0,
+                picker.delegate.core.selected_index, 0,
                 "filtering resets the selection to the top match"
             );
         });
-    }
 
-    #[gpui::test]
-    async fn test_update_matches_reuses_cached_candidates(cx: &mut TestAppContext) {
-        init_test(cx);
-
-        let (editor_window, editor) = build_test_editor(cx);
-        let cx = &mut VisualTestContext::from_window(*editor_window, cx);
-
-        let snapshot = editor.read_with(cx, |editor, cx| editor.buffer().read(cx).snapshot(cx));
-        let items = vec![
-            test_item(&snapshot, 0, "alpha"),
-            test_item(&snapshot, 1, "beta"),
-            test_item(&snapshot, 2, "gamma"),
-        ];
-
-        let picker = editor_window
-            .update(cx, |_, window, cx| {
-                BreadcrumbSymbolDelegate::picker(
-                    editor.downgrade(),
-                    BufferId::new(1).unwrap(),
-                    None,
-                    items,
-                    false,
-                    None,
-                    None,
-                    window,
-                    cx,
-                )
-            })
-            .unwrap();
-
-        let candidates_before =
-            picker.read_with(cx, |picker, _| picker.delegate.candidates.clone());
-
-        picker
-            .update_in(cx, |picker, window, cx| {
-                picker
-                    .delegate
-                    .update_matches("gam".to_string(), window, cx)
-            })
-            .await;
-        picker
+        t.picker
             .update_in(cx, |picker, window, cx| {
                 picker.delegate.update_matches("ga".to_string(), window, cx)
             })
             .await;
-
-        picker.read_with(cx, |picker, _| {
+        t.picker.read_with(cx, |picker, _| {
             assert!(
-                Rc::ptr_eq(&candidates_before, &picker.delegate.candidates),
+                Rc::ptr_eq(&candidates_before, &picker.delegate.core.candidates),
                 "successive keystrokes must reuse the same candidate list, not rebuild it"
             );
         });
     }
 
     #[gpui::test]
-    async fn test_confirming_breadcrumb_symbol_navigates_and_dismisses(cx: &mut TestAppContext) {
+    async fn test_queried_rows_carry_syntax_highlights_and_bold_match_emphasis(
+        cx: &mut TestAppContext,
+    ) {
         init_test(cx);
 
-        let (editor_window, editor) = build_test_editor(cx);
-        let cx = &mut VisualTestContext::from_window(*editor_window, cx);
-        let buffer_id = BufferId::new(1).unwrap();
-
-        let snapshot = editor.read_with(cx, |editor, cx| editor.buffer().read(cx).snapshot(cx));
-        let items = vec![
-            test_item(&snapshot, 0, "alpha"),
-            test_item(&snapshot, 1, "beta"),
-            test_item(&snapshot, 2, "gamma"),
-        ];
-
-        editor.update(cx, |editor, cx| {
-            editor.open_breadcrumb_symbol_navigation(buffer_id, None, cx);
+        let syntax = HighlightStyle {
+            color: Some(gpui::red()),
+            ..Default::default()
+        };
+        let mut t = symbol_test(None, cx);
+        let cx = &mut t.cx;
+        t.picker.update(cx, |picker, _| {
+            for item in &mut picker.delegate.items {
+                item.highlight_ranges = vec![(0..item.text.len(), syntax)];
+            }
         });
 
-        let picker = editor_window
-            .update(cx, |_, window, cx| {
-                BreadcrumbSymbolDelegate::picker(
-                    editor.downgrade(),
-                    buffer_id,
-                    None,
-                    items,
-                    false,
-                    None,
-                    None,
-                    window,
-                    cx,
-                )
+        t.picker
+            .update_in(cx, |picker, window, cx| {
+                picker
+                    .delegate
+                    .update_matches("struct".to_string(), window, cx)
             })
-            .unwrap();
-        editor.update(cx, |editor, cx| {
+            .await;
+
+        let (highlights, positions, text_len) = t.picker.read_with(cx, |picker, _| {
+            let item = picker.delegate.item_at(0).expect("one row matches");
+            assert_eq!(item.text.as_ref(), "struct Alpha");
+            let string_match = picker
+                .delegate
+                .core
+                .matches
+                .first()
+                .expect("one row matches");
+            assert!(
+                !string_match.positions.is_empty(),
+                "a non-empty query must carry its match positions"
+            );
+            (
+                match_emphasized_highlights(
+                    item,
+                    &flatten_text_for_single_line_display(&item.text),
+                    string_match,
+                ),
+                string_match.positions.clone(),
+                item.text.len(),
+            )
+        });
+
+        let bold_at = |offset: usize| {
+            highlights.iter().any(|(range, style)| {
+                range.contains(&offset) && style.font_weight == Some(FontWeight::BOLD)
+            })
+        };
+        let syntax_at = |offset: usize| {
+            highlights
+                .iter()
+                .any(|(range, style)| range.contains(&offset) && style.color == Some(gpui::red()))
+        };
+        for &offset in &positions {
+            assert!(bold_at(offset), "matched byte {offset} must render bold");
+            assert!(
+                syntax_at(offset),
+                "matched byte {offset} must keep its syntax color"
+            );
+        }
+        let unmatched = text_len - 1;
+        assert!(!positions.contains(&unmatched));
+        assert!(!bold_at(unmatched), "unmatched bytes must not render bold");
+        assert!(
+            syntax_at(unmatched),
+            "unmatched bytes keep the syntax highlight"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_breadcrumb_symbol_picker_navigates_and_dismisses_from_the_keyboard(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        bind_drill_navigation_keymap(cx);
+
+        let mut t = symbol_test(None, cx);
+        let buffer_id = t.buffer_id;
+        let picker = t.picker.clone();
+        let cx = &mut t.cx;
+
+        t.editor.update(cx, |editor, cx| {
+            editor.open_breadcrumb_symbol_navigation(buffer_id, None, cx);
             editor.watch_breadcrumb_symbol_dismissal(&picker, buffer_id, None, cx);
         });
 
         let dismissed = Rc::new(Cell::new(false));
-        let subscription = cx.update(|_, cx| {
-            cx.subscribe(&picker, {
+        let _subscription = cx.update(|_, cx| {
+            cx.subscribe(&t.picker, {
                 let dismissed = dismissed.clone();
                 move |_, _: &DismissEvent, _| dismissed.set(true)
             })
         });
 
-        picker.update_in(cx, |picker, window, cx| {
-            picker.delegate.selected_index = 2;
-            picker.delegate.confirm(false, window, cx);
-        });
-        cx.run_until_parked();
-
-        editor.update(cx, |editor, cx| {
-            let snapshot = editor.display_snapshot(cx);
-            let cursor = editor.selections.newest::<Point>(&snapshot).head();
-            assert_eq!(
-                cursor,
-                Point::new(2, 0),
-                "confirming navigates the cursor to the chosen symbol"
-            );
-        });
-        assert!(dismissed.get(), "confirming a row dismisses the popover");
-        editor.read_with(cx, |editor, _| {
-            assert!(
-                editor.breadcrumb_symbol_navigation().is_none(),
-                "the dismissal must clear the navigation session confirm just ended"
-            );
-        });
-        drop(subscription);
-    }
-
-    #[gpui::test]
-    async fn test_breadcrumb_symbol_picker_navigates_from_the_keyboard(cx: &mut TestAppContext) {
-        init_test(cx);
-
-        let buffer = cx.new(|cx| language::Buffer::local("alpha\nbeta\ngamma\n", cx));
-        let multi_buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
-
-        let harness_window = cx.add_window(|window, cx| {
-            let editor = cx.new(|cx| build_editor(multi_buffer.clone(), window, cx));
-            let snapshot = editor.read(cx).buffer().read(cx).snapshot(cx);
-            let items = vec![
-                test_item(&snapshot, 0, "alpha"),
-                test_item(&snapshot, 1, "beta"),
-                test_item(&snapshot, 2, "gamma"),
-            ];
-            let picker = BreadcrumbSymbolDelegate::picker(
-                editor.downgrade(),
-                BufferId::new(1).unwrap(),
-                None,
-                items,
-                false,
-                None,
-                None,
-                window,
-                cx,
-            );
-            Harness { picker, editor }
-        });
-        let (picker, editor) = harness_window
-            .read_with(cx, |harness, _| {
-                (harness.picker.clone(), harness.editor.clone())
-            })
-            .unwrap();
-        let cx = &mut VisualTestContext::from_window(*harness_window, cx);
-        cx.run_until_parked();
-
-        picker.update_in(cx, |picker, window, cx| {
+        t.picker.update_in(cx, |picker, window, cx| {
             window.focus(&picker.focus_handle(cx), cx);
         });
         cx.run_until_parked();
 
-        cx.dispatch_action(menu::SelectNext);
-        picker.read_with(cx, |picker, _| {
+        cx.simulate_keystrokes("down");
+        t.picker.read_with(cx, |picker, _| {
             assert_eq!(
                 picker
                     .delegate
-                    .item_at(picker.delegate.selected_index)
+                    .item_at(picker.delegate.core.selected_index)
                     .map(|item| item.text.as_ref()),
-                Some("beta"),
+                Some("impl Alpha"),
             );
         });
 
-        cx.dispatch_action(menu::Confirm);
+        cx.simulate_keystrokes("enter");
         cx.run_until_parked();
 
-        editor.update(cx, |editor, cx| {
+        t.editor.update(cx, |editor, cx| {
             let snapshot = editor.display_snapshot(cx);
             let cursor = editor.selections.newest::<Point>(&snapshot).head();
             assert_eq!(
                 cursor,
-                Point::new(1, 0),
-                "confirming the selected row navigates the cursor there"
+                Point::new(4, 5),
+                "confirming the selected row puts the cursor on the impl's name, not its start"
+            );
+        });
+        assert!(dismissed.get(), "confirming a row dismisses the popover");
+        t.editor.read_with(cx, |editor, _| {
+            assert!(
+                editor.breadcrumb_symbol_navigation().is_none(),
+                "the dismissal must clear the navigation session confirm just ended"
             );
         });
     }
@@ -832,38 +752,31 @@ mod tests {
     ) {
         init_test(cx);
 
-        let (editor_window, editor) = build_test_editor(cx);
-        let cx = &mut VisualTestContext::from_window(*editor_window, cx);
+        let mut t = symbol_test(Some("fn gamma"), cx);
+        let cx = &mut t.cx;
 
-        let snapshot = editor.read_with(cx, |editor, cx| editor.buffer().read(cx).snapshot(cx));
-        let target = test_item(&snapshot, 0, "alpha");
-        let buffer_id = BufferId::new(1).unwrap();
-
-        let picker = editor_window
-            .update(cx, |_, window, cx| {
-                BreadcrumbSymbolDelegate::picker(
-                    editor.downgrade(),
-                    buffer_id,
-                    Some(target),
-                    vec![test_item(&snapshot, 0, "alpha")],
-                    false,
-                    None,
-                    None,
-                    window,
-                    cx,
-                )
-            })
-            .unwrap();
-
-        picker.update_in(cx, |picker, window, cx| {
-            picker.delegate.select_parent(window, cx);
+        let result = t.picker.update_in(cx, |picker, window, cx| {
+            picker.delegate.select_parent(window, cx)
         });
         cx.run_until_parked();
 
-        editor.read_with(cx, |editor, _| {
-            assert!(
-                editor.breadcrumb_symbol_navigation().is_some(),
-                "select_parent with a target segment navigates the editor's symbol state"
+        assert_eq!(
+            result,
+            Some(String::new()),
+            "select_parent with a target segment consumes the key and resets the query"
+        );
+        t.editor.read_with(cx, |editor, _| {
+            let navigation = editor
+                .breadcrumb_symbol_navigation()
+                .expect("select_parent with a target segment navigates the editor's symbol state");
+            assert!(navigation.navigated);
+            assert_eq!(
+                navigation
+                    .active_item
+                    .as_ref()
+                    .map(|item| item.text.as_ref()),
+                Some("impl Alpha"),
+                "the navigation lands on the target's outline parent"
             );
         });
     }
@@ -874,33 +787,21 @@ mod tests {
     ) {
         init_test(cx);
 
-        let (editor_window, editor) = build_test_editor(cx);
-        let cx = &mut VisualTestContext::from_window(*editor_window, cx);
+        let mut t = symbol_test(None, cx);
+        let cx = &mut t.cx;
 
-        let picker = editor_window
-            .update(cx, |_, window, cx| {
-                BreadcrumbSymbolDelegate::picker(
-                    editor.downgrade(),
-                    BufferId::new(1).unwrap(),
-                    None,
-                    Vec::new(),
-                    false,
-                    None,
-                    None,
-                    window,
-                    cx,
-                )
-            })
-            .unwrap();
-
-        let result = picker.update_in(cx, |picker, window, cx| {
+        let result = t.picker.update_in(cx, |picker, window, cx| {
             picker.delegate.select_parent(window, cx)
         });
         assert!(
             result.is_none(),
             "the file segment with no parent directory has nowhere to go"
         );
-        editor.read_with(cx, |editor, _| {
+        t.editor.read_with(cx, |editor, _| {
+            assert!(
+                editor.breadcrumb_navigation().is_none(),
+                "the parent-directory fallback navigates the directory axis; a noop must not"
+            );
             assert!(editor.breadcrumb_symbol_navigation().is_none());
         });
     }
@@ -910,42 +811,17 @@ mod tests {
         init_test(cx);
         bind_drill_navigation_keymap(cx);
 
-        let buffer = cx.new(|cx| language::Buffer::local("alpha\nbeta\ngamma\n", cx));
-        let multi_buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
-        let buffer_id = BufferId::new(1).unwrap();
-
-        let harness_window = cx.add_window(|window, cx| {
-            let editor = cx.new(|cx| build_editor(multi_buffer.clone(), window, cx));
-            let snapshot = editor.read(cx).buffer().read(cx).snapshot(cx);
-            let target = test_item(&snapshot, 0, "alpha");
-            let picker = BreadcrumbSymbolDelegate::picker(
-                editor.downgrade(),
-                buffer_id,
-                Some(target),
-                vec![test_item(&snapshot, 0, "alpha")],
-                false,
-                None,
-                None,
-                window,
-                cx,
-            );
-            Harness { picker, editor }
-        });
-        let (picker, _editor) = harness_window
-            .read_with(cx, |harness, _| {
-                (harness.picker.clone(), harness.editor.clone())
-            })
-            .unwrap();
-        let cx = &mut VisualTestContext::from_window(*harness_window, cx);
+        let mut t = symbol_test(Some("fn gamma"), cx);
+        let cx = &mut t.cx;
         cx.run_until_parked();
 
-        picker.update_in(cx, |picker, window, cx| {
+        t.picker.update_in(cx, |picker, window, cx| {
             window.focus(&picker.focus_handle(cx), cx);
         });
         cx.run_until_parked();
         cx.simulate_keystrokes("a l p h a");
         cx.run_until_parked();
-        picker.update(cx, |picker, cx| {
+        t.picker.update(cx, |picker, cx| {
             assert_eq!(picker.query(cx), "alpha");
         });
 
@@ -954,15 +830,75 @@ mod tests {
         cx.simulate_keystrokes("left");
         cx.simulate_keystrokes("z");
         cx.run_until_parked();
-        picker.update(cx, |picker, cx| {
+        t.picker.update(cx, |picker, cx| {
             assert_eq!(picker.query(cx), "alphza");
         });
 
         cx.simulate_keystrokes("right");
         cx.simulate_keystrokes("y");
         cx.run_until_parked();
-        picker.update(cx, |picker, cx| {
+        t.picker.update(cx, |picker, cx| {
             assert_eq!(picker.query(cx), "alphzay");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_breadcrumb_symbol_select_child_drills_into_the_selected_symbols_children(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        bind_drill_navigation_keymap(cx);
+
+        let mut t = symbol_test(None, cx);
+        let buffer_id = t.buffer_id;
+        let cx = &mut t.cx;
+        cx.run_until_parked();
+
+        t.picker.read_with(cx, |picker, _| {
+            assert_eq!(
+                picker
+                    .delegate
+                    .item_at(picker.delegate.core.selected_index)
+                    .map(|item| item.text.as_ref()),
+                Some("struct Alpha"),
+            );
+        });
+
+        t.picker.update_in(cx, |picker, window, cx| {
+            window.focus(&picker.focus_handle(cx), cx);
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("right");
+        cx.run_until_parked();
+
+        t.picker.update(cx, |picker, cx| {
+            assert_eq!(
+                picker.query(cx),
+                "",
+                "drilling resets the query for the reopened listing"
+            );
+        });
+        t.editor.read_with(cx, |editor, cx| {
+            let navigation = editor
+                .breadcrumb_symbol_navigation()
+                .expect("right drills into the selected symbol");
+            assert!(navigation.navigated);
+            let active_item = navigation
+                .active_item
+                .as_ref()
+                .expect("the drilled symbol becomes the navigation target");
+            assert_eq!(active_item.text.as_ref(), "struct Alpha");
+            let children = editor
+                .breadcrumb_symbol_menu_items(buffer_id, Some(active_item), cx)
+                .iter()
+                .map(|item| item.text.to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                children,
+                ["one"],
+                "the reopened popover lists the drilled symbol's children"
+            );
         });
     }
 
@@ -972,22 +908,16 @@ mod tests {
     ) {
         init_test(cx);
 
-        let (editor_window, editor) = build_test_editor(cx);
-        let cx = &mut VisualTestContext::from_window(*editor_window, cx);
-        let buffer_id = editor.read_with(cx, |editor, cx| {
-            editor
-                .buffer()
-                .read(cx)
-                .as_singleton()
-                .unwrap()
-                .read(cx)
-                .remote_id()
-        });
+        let mut fixture =
+            editor_fixture::<BreadcrumbSymbolPicker>(SOURCE, Some(language::rust_lang()), cx);
+        let editor = fixture.editor.clone();
+        let cx = &mut fixture.cx;
+        let buffer_id = singleton_buffer_id(&editor, cx);
 
         editor.read_with(cx, |editor, cx| {
-            let outcome = breadcrumb_symbol_menu_outcome(editor, buffer_id, None, cx);
-            assert!(
-                matches!(outcome, BreadcrumbSymbolMenuOutcome::NotReady),
+            assert_eq!(
+                breadcrumb_symbol_menu_outcome(editor, buffer_id, None, cx),
+                BreadcrumbSymbolMenuOutcome::NotReady,
                 "the outline has not been fetched yet, so the picker's items are not known; \
                  the caller kicks a prefetch and opens the popover in a loading state anyway"
             );
@@ -1000,25 +930,15 @@ mod tests {
     ) {
         init_test(cx);
 
-        let (editor_window, editor) = build_test_editor(cx);
-        let cx = &mut VisualTestContext::from_window(*editor_window, cx);
-        let buffer_id = editor.read_with(cx, |editor, cx| {
-            editor
-                .buffer()
-                .read(cx)
-                .as_singleton()
-                .unwrap()
-                .read(cx)
-                .remote_id()
-        });
-
         // A resolved language with no outline query still answers, just with nothing.
-        editor.update(cx, |editor, cx| {
-            let buffer = editor.buffer().read(cx).as_singleton().unwrap().clone();
-            buffer.update(cx, |buffer, cx| {
-                buffer.set_language(Some(language::PLAIN_TEXT.clone()), cx)
-            });
-        });
+        let mut fixture = editor_fixture::<BreadcrumbSymbolPicker>(
+            "alpha\nbeta\ngamma\n",
+            Some(language::PLAIN_TEXT.clone()),
+            cx,
+        );
+        let editor = fixture.editor.clone();
+        let cx = &mut fixture.cx;
+        let buffer_id = singleton_buffer_id(&editor, cx);
         cx.run_until_parked();
 
         editor.update(cx, |editor, cx| {
@@ -1027,10 +947,38 @@ mod tests {
         cx.run_until_parked();
 
         editor.read_with(cx, |editor, cx| {
-            let outcome = breadcrumb_symbol_menu_outcome(editor, buffer_id, None, cx);
-            assert!(
-                matches!(outcome, BreadcrumbSymbolMenuOutcome::Empty),
+            assert_eq!(
+                breadcrumb_symbol_menu_outcome(editor, buffer_id, None, cx),
+                BreadcrumbSymbolMenuOutcome::Empty,
                 "a loaded outline with no items shows the popover's own empty state"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_breadcrumb_symbol_menu_outcome_is_ready_with_the_resolved_items(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let mut fixture = resolved_outline_fixture(cx);
+        let editor = fixture.editor.clone();
+        let cx = &mut fixture.cx;
+        let buffer_id = singleton_buffer_id(&editor, cx);
+
+        editor.read_with(cx, |editor, cx| {
+            let expected = editor.breadcrumb_symbol_menu_items(buffer_id, None, cx);
+            assert_eq!(
+                expected
+                    .iter()
+                    .map(|item| item.text.as_ref())
+                    .collect::<Vec<_>>(),
+                ["struct Alpha", "impl Alpha"],
+            );
+            assert_eq!(
+                breadcrumb_symbol_menu_outcome(editor, buffer_id, None, cx),
+                BreadcrumbSymbolMenuOutcome::Ready(expected),
+                "a resolved, non-empty outline hands the popover its items"
             );
         });
     }
@@ -1072,19 +1020,11 @@ mod tests {
                 Vec::new(),
                 true,
                 None,
-                None,
                 window,
                 cx,
             )
         });
 
-        picker.read_with(cx, |picker, _| {
-            assert_eq!(
-                picker.delegate.match_count(),
-                0,
-                "the outline has not answered yet"
-            );
-        });
         let loading_placeholder = cx.update(|window, cx| {
             picker.update(cx, |picker, cx| picker.delegate.no_matches_text(window, cx))
         });
@@ -1093,13 +1033,6 @@ mod tests {
         // `refresh` later reads `picker.query`, not the delegate's field, so it must be set here too.
         picker.update_in(cx, |picker, window, cx| {
             picker.set_query("struct", window, cx);
-        });
-        picker.read_with(cx, |picker, _| {
-            assert_eq!(
-                picker.delegate.match_count(),
-                0,
-                "a query typed before the outline answers has nothing to filter yet"
-            );
         });
         let still_loading_placeholder = cx.update(|window, cx| {
             picker.update(cx, |picker, cx| picker.delegate.no_matches_text(window, cx))
@@ -1119,13 +1052,61 @@ mod tests {
                 1,
                 "the still-typed query filters the now-real symbols instead of listing all of them"
             );
-            assert!(
-                picker
-                    .delegate
-                    .item_at(0)
-                    .is_some_and(|item| item.text.contains("struct")),
+            assert_eq!(
+                picker.delegate.item_at(0).map(|item| item.text.as_ref()),
+                Some("struct Foo"),
                 "the one match left is the struct, not the impl block"
             );
         });
+    }
+    #[test]
+    fn test_stale_match_emphasis_is_skipped_when_the_item_text_changed() {
+        let syntax_highlight = HighlightStyle {
+            color: Some(gpui::red()),
+            ..Default::default()
+        };
+        let item = OutlineItem::<Anchor> {
+            depth: 0,
+            range: Anchor::Min..Anchor::Max,
+            selection_range: Anchor::Min..Anchor::Max,
+            source_range_for_text: Anchor::Min..Anchor::Max,
+            text: "fn short".into(),
+            highlight_ranges: vec![(0..2, syntax_highlight)],
+            name_ranges: Vec::new(),
+            body_range: None,
+            annotation_range: None,
+        };
+        let stale = StringMatch {
+            candidate_id: 0,
+            score: 0.,
+            positions: vec![20, 21],
+            string: "fn a_name_much_longer_than_the_refreshed_item".to_string(),
+        };
+        assert_eq!(
+            match_emphasized_highlights(
+                &item,
+                &flatten_text_for_single_line_display(&item.text),
+                &stale
+            ),
+            vec![(0..2, syntax_highlight)],
+            "a stale match must render syntax highlights only"
+        );
+
+        let fresh = StringMatch {
+            candidate_id: 0,
+            score: 0.,
+            positions: vec![3, 4],
+            string: "fn short".to_string(),
+        };
+        assert!(
+            match_emphasized_highlights(
+                &item,
+                &flatten_text_for_single_line_display(&item.text),
+                &fresh
+            )
+            .iter()
+            .any(|(_, style)| style.font_weight == Some(FontWeight::BOLD)),
+            "a match for the current text keeps its bold emphasis"
+        );
     }
 }

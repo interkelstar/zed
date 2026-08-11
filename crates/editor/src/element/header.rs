@@ -684,7 +684,7 @@ pub(crate) fn render_buffer_header(
         (None, None)
     };
     let focus_handle = editor_read.focus_handle(cx);
-    let colors = cx.theme().colors();
+    let colors = cx.theme().colors().clone();
     // On transparent windows, only render an opaque `editor_subheader_background` so it masks
     // the editor content beneath it without creating a darker bar. Sticky shadows still require
     // an opaque window to avoid rendering as a halo.
@@ -895,16 +895,22 @@ pub(crate) fn render_buffer_header(
                                         el.child(Icon::new(IconName::FileLock).color(Color::Muted))
                                     })
                                     .when_some(breadcrumbs, |then, breadcrumbs| {
-                                        // The toolbar's own breadcrumb bar stays in the UI font; only the header row matches the buffer.
-                                        then.child(div().font_buffer(cx).text_buffer(cx).child(
-                                            render_breadcrumb_text(
-                                                breadcrumbs,
-                                                None,
-                                                editor_handle,
-                                                true,
-                                                cx,
-                                            ),
-                                        ))
+                                        then.child(
+                                            div()
+                                                .font(
+                                                    theme::theme_settings(cx)
+                                                        .buffer_font(cx)
+                                                        .clone(),
+                                                )
+                                                .child(render_breadcrumb_text(
+                                                    breadcrumbs,
+                                                    None,
+                                                    editor_handle,
+                                                    true,
+                                                    window,
+                                                    cx,
+                                                )),
+                                        )
                                     })
                             },
                         ))

@@ -1,5 +1,4 @@
 use std::ops::Range;
-use std::rc::Rc;
 
 use collections::HashMap;
 use futures::FutureExt;
@@ -26,14 +25,6 @@ pub(crate) struct BreadcrumbOutline {
     buffer_id: BufferId,
     version: clock::Global,
     items: Vec<OutlineItem<text::Anchor>>,
-}
-
-/// `BreadcrumbOutline`'s items resolved to multi-buffer anchors.
-pub(crate) struct ConvertedBreadcrumbOutline {
-    buffer_id: BufferId,
-    version: clock::Global,
-    items: Rc<Vec<OutlineItem<Anchor>>>,
-    depths: Rc<Vec<usize>>,
 }
 
 impl Editor {
@@ -130,7 +121,13 @@ impl Editor {
     }
 
     pub fn prefetch_breadcrumb_outline(&mut self, buffer_id: BufferId, cx: &mut Context<Self>) {
-        self.prefetch_breadcrumb_outline_inner(buffer_id, false, cx);
+        let Some(buffer) = self.buffer.read(cx).buffer(buffer_id) else {
+            return;
+        };
+        if self.breadcrumb_outline_is_fresh(buffer_id, &buffer.read(cx).version()) {
+            return;
+        }
+        self.refresh_breadcrumb_outline(buffer_id, cx);
     }
 
     /// `Shared` lets a popover that opened before the outline was ready await this same completion instead of polling.
@@ -138,19 +135,10 @@ impl Editor {
         self.breadcrumb_outline_task.clone()
     }
 
-    /// Bypasses the version guard: the source changed without an edit, so the version still matches.
+    /// Skips the freshness guard: the source changed without an edit, so the version still matches.
     pub(crate) fn refresh_breadcrumb_outline(
         &mut self,
         buffer_id: BufferId,
-        cx: &mut Context<Self>,
-    ) {
-        self.prefetch_breadcrumb_outline_inner(buffer_id, true, cx);
-    }
-
-    fn prefetch_breadcrumb_outline_inner(
-        &mut self,
-        buffer_id: BufferId,
-        force_refresh: bool,
         cx: &mut Context<Self>,
     ) {
         if !self.mode().is_full() {
@@ -160,10 +148,6 @@ impl Editor {
             return;
         };
         let version = buffer.read(cx).version();
-        if !force_refresh && self.breadcrumb_outline_is_fresh(buffer_id, &version) {
-            return;
-        }
-
         let items = self.buffer_outline_items(buffer_id, cx);
         self.breadcrumb_outline_task = cx
             .spawn(async move |editor, cx| {
@@ -190,7 +174,6 @@ impl Editor {
             version,
             items,
         });
-        self.breadcrumb_converted_outline_cache.replace(None);
     }
 
     /// Avoids `buffer_outline_items`: called from inside the refresh task it would await, which deadlocks.
@@ -233,6 +216,13 @@ impl Editor {
         self.breadcrumb_outline_is_fresh(buffer_id, &buffer.read(cx).version())
     }
 
+    pub(crate) fn breadcrumb_outline_version(&self, buffer_id: BufferId) -> Option<&clock::Global> {
+        self.breadcrumb_outline
+            .as_ref()
+            .filter(|outline| outline.buffer_id == buffer_id)
+            .map(|outline| &outline.version)
+    }
+
     pub(crate) fn breadcrumb_cursor_buffer_id(&self, cx: &App) -> Option<BufferId> {
         let cursor = self.selections.newest_anchor().head();
         let snapshot = self.buffer().read(cx).snapshot(cx);
@@ -241,44 +231,24 @@ impl Editor {
             .map(|(_, buffer)| buffer.remote_id())
     }
 
-    /// Converted outline items and their depths, cached for the buffer id/version they answer for.
+    /// An O(N) conversion, recomputed per call; the bar's render path reaches it
+    /// through `symbol_trail_with_fallback`, which memoizes the resulting trail.
     fn breadcrumb_converted_outline(
         &self,
         buffer_id: BufferId,
         cx: &App,
-    ) -> Option<(Rc<Vec<OutlineItem<Anchor>>>, Rc<Vec<usize>>)> {
+    ) -> Option<(Vec<OutlineItem<Anchor>>, Vec<usize>)> {
         let outline = self
             .breadcrumb_outline
             .as_ref()
             .filter(|outline| outline.buffer_id == buffer_id)?;
-
-        if let Some(cached) = self.breadcrumb_converted_outline_cache.borrow().as_ref()
-            && cached.buffer_id == outline.buffer_id
-            && cached.version == outline.version
-        {
-            return Some((cached.items.clone(), cached.depths.clone()));
-        }
-
-        #[cfg(any(test, feature = "test-support"))]
-        self.breadcrumb_converted_outline_recomputes
-            .set(self.breadcrumb_converted_outline_recomputes.get() + 1);
-
         let multi_buffer_snapshot = self.buffer().read(cx).snapshot(cx);
         let items = outline
             .items
             .iter()
             .filter_map(|item| text_outline_item_to_multibuffer(item, &multi_buffer_snapshot))
             .collect::<Vec<_>>();
-        let depths = items.iter().map(|item| item.depth).collect::<Vec<_>>();
-        let items = Rc::new(items);
-        let depths = Rc::new(depths);
-
-        *self.breadcrumb_converted_outline_cache.borrow_mut() = Some(ConvertedBreadcrumbOutline {
-            buffer_id: outline.buffer_id,
-            version: outline.version.clone(),
-            items: items.clone(),
-            depths: depths.clone(),
-        });
+        let depths = items.iter().map(|item| item.depth).collect();
         Some((items, depths))
     }
 
@@ -322,15 +292,9 @@ impl Editor {
         item: &OutlineItem<Anchor>,
         cx: &App,
     ) -> Option<OutlineItem<Anchor>> {
-        let (items, depths) = self.breadcrumb_converted_outline(buffer_id, cx)?;
-        let index = items
-            .iter()
-            .position(|candidate| candidate.range == item.range)?;
-        let parent_index = crate::element::outline_parents(&depths)
-            .get(index)
-            .copied()
-            .flatten()?;
-        items.get(parent_index).cloned()
+        let mut trail = self.breadcrumb_symbol_trail(buffer_id, item, cx);
+        trail.pop()?;
+        trail.pop()
     }
 
     /// The ancestor chain of `item`, root first, ending with `item` itself.
@@ -352,10 +316,57 @@ impl Editor {
 
         let parents = crate::element::outline_parents(&depths);
         let mut trail = Vec::new();
-        loop {
-            let Some(current_item) = items.get(current) else {
-                break;
-            };
+        while let Some(current_item) = items.get(current) {
+            trail.push(current_item.clone());
+            match parents.get(current).copied().flatten() {
+                Some(parent_index) => current = parent_index,
+                None => break,
+            }
+        }
+        trail.reverse();
+        trail
+    }
+
+    /// Like [`Self::breadcrumb_symbol_trail`], but in buffer coordinates:
+    /// safe to cache across multibuffer layout changes.
+    pub(crate) fn breadcrumb_symbol_trail_in_buffer(
+        &self,
+        buffer_id: BufferId,
+        item: &OutlineItem<Anchor>,
+        cx: &App,
+    ) -> Vec<OutlineItem<text::Anchor>> {
+        let Some(outline) = self
+            .breadcrumb_outline
+            .as_ref()
+            .filter(|outline| outline.buffer_id == buffer_id)
+        else {
+            return Vec::new();
+        };
+        let snapshot = self.buffer().read(cx).snapshot(cx);
+        let Some(target) = maybe!({
+            Some(
+                snapshot.anchor_to_buffer_anchor(item.range.start)?.0
+                    ..snapshot.anchor_to_buffer_anchor(item.range.end)?.0,
+            )
+        }) else {
+            return Vec::new();
+        };
+        let Some(mut current) = outline
+            .items
+            .iter()
+            .position(|candidate| candidate.range == target)
+        else {
+            return Vec::new();
+        };
+
+        let depths = outline
+            .items
+            .iter()
+            .map(|item| item.depth)
+            .collect::<Vec<_>>();
+        let parents = crate::element::outline_parents(&depths);
+        let mut trail = Vec::new();
+        while let Some(current_item) = outline.items.get(current) {
             trail.push(current_item.clone());
             match parents.get(current).copied().flatten() {
                 Some(parent_index) => current = parent_index,
@@ -505,7 +516,7 @@ fn lsp_symbols_enabled(buffer: &Buffer, cx: &App) -> bool {
 }
 
 // Drops the item if any anchor fails to resolve, e.g. the buffer has no excerpts anymore.
-fn text_outline_item_to_multibuffer(
+pub(crate) fn text_outline_item_to_multibuffer(
     item: &OutlineItem<text::Anchor>,
     multi_buffer_snapshot: &MultiBufferSnapshot,
 ) -> Option<OutlineItem<Anchor>> {
@@ -1814,89 +1825,6 @@ mod tests {
         );
     }
 
-    #[gpui::test]
-    async fn test_breadcrumb_converted_outline_is_cached_across_calls(cx: &mut TestAppContext) {
-        init_test(cx, |_| {});
-
-        let mut cx = EditorLspTestContext::new_rust(lsp::ServerCapabilities::default(), cx).await;
-        cx.set_state("struct Foo {}\n\nimpl Foo {\n    fn baˇr() {}\n}\n");
-        cx.run_until_parked();
-
-        let buffer_id = cx.update_editor(|editor, _window, cx| {
-            let buffer_id = editor
-                .buffer()
-                .read(cx)
-                .as_singleton()
-                .unwrap()
-                .read(cx)
-                .remote_id();
-            editor.prefetch_breadcrumb_outline(buffer_id, cx);
-            buffer_id
-        });
-        cx.run_until_parked();
-
-        cx.update_editor(|editor, _window, cx| {
-            editor.breadcrumb_symbol_menu_items(buffer_id, None, cx);
-            let recomputes_after_first_call = editor.breadcrumb_converted_outline_recomputes.get();
-            assert_eq!(recomputes_after_first_call, 1);
-
-            editor.breadcrumb_symbol_menu_items(buffer_id, None, cx);
-            let top_level = editor.breadcrumb_symbol_menu_items(buffer_id, None, cx);
-            let item = top_level.first().unwrap();
-            editor.breadcrumb_symbol_parent(buffer_id, item, cx);
-            editor.breadcrumb_symbol_trail(buffer_id, item, cx);
-
-            assert_eq!(
-                editor.breadcrumb_converted_outline_recomputes.get(),
-                recomputes_after_first_call,
-                "repeated calls at the same buffer version must reuse the cached conversion"
-            );
-        });
-    }
-
-    #[gpui::test]
-    async fn test_breadcrumb_converted_outline_cache_invalidates_on_edit(cx: &mut TestAppContext) {
-        init_test(cx, |_| {});
-
-        let mut cx = EditorLspTestContext::new_rust(lsp::ServerCapabilities::default(), cx).await;
-        cx.set_state("struct Foo {}\n\nimpl Foo {\n    fn baˇr() {}\n}\n");
-        cx.run_until_parked();
-
-        let buffer_id = cx.update_editor(|editor, _window, cx| {
-            let buffer_id = editor
-                .buffer()
-                .read(cx)
-                .as_singleton()
-                .unwrap()
-                .read(cx)
-                .remote_id();
-            editor.prefetch_breadcrumb_outline(buffer_id, cx);
-            buffer_id
-        });
-        cx.run_until_parked();
-
-        let recomputes_before_edit = cx.update_editor(|editor, _window, cx| {
-            editor.breadcrumb_symbol_menu_items(buffer_id, None, cx);
-            editor.breadcrumb_converted_outline_recomputes.get()
-        });
-
-        cx.set_state("struct Foo {}\n\nimpl Foo {\n    fn baz(ˇ) {}\n}\n");
-        cx.run_until_parked();
-
-        cx.update_editor(|editor, _window, cx| {
-            editor.prefetch_breadcrumb_outline(buffer_id, cx);
-        });
-        cx.run_until_parked();
-
-        cx.update_editor(|editor, _window, cx| {
-            editor.breadcrumb_symbol_menu_items(buffer_id, None, cx);
-            assert!(
-                editor.breadcrumb_converted_outline_recomputes.get() > recomputes_before_edit,
-                "a new outline version (from an edit) must invalidate the cache"
-            );
-        });
-    }
-
     fn build_unlanguaged_editor(
         cx: &mut TestAppContext,
     ) -> (gpui::WindowHandle<Editor>, Entity<Editor>, BufferId) {
@@ -1941,7 +1869,7 @@ mod tests {
 
         // No outline query configured: this language answers, but with nothing.
         editor.update(cx, |editor, cx| {
-            let buffer = editor.buffer().read(cx).as_singleton().unwrap().clone();
+            let buffer = editor.buffer().read(cx).as_singleton().unwrap();
             buffer.update(cx, |buffer, cx| {
                 buffer.set_language(Some(language::PLAIN_TEXT.clone()), cx)
             });
@@ -1962,81 +1890,6 @@ mod tests {
                 editor
                     .breadcrumb_symbol_menu_items(buffer_id, None, cx)
                     .is_empty()
-            );
-        });
-    }
-
-    #[gpui::test]
-    async fn test_stale_outline_debounce_does_not_evict_a_different_buffers_fresh_outline(
-        cx: &mut TestAppContext,
-    ) {
-        init_test(cx, |_| {});
-
-        let (editor, cx) = cx.add_window_view(|window, cx| {
-            let multi_buffer = MultiBuffer::build_multi(
-                [
-                    ("fn one() {}\n", vec![Point::row_range(0..1)]),
-                    ("fn two() {}\n", vec![Point::row_range(0..1)]),
-                ],
-                cx,
-            );
-            Editor::new(crate::EditorMode::full(), multi_buffer, None, window, cx)
-        });
-        cx.run_until_parked();
-
-        let (buffer_a_id, buffer_b_id) = editor.read_with(cx, |editor, cx| {
-            let snapshot = editor.buffer().read(cx).snapshot(cx);
-            let mut buffer_ids = snapshot
-                .excerpts()
-                .map(|excerpt| excerpt.context.start.buffer_id);
-            (buffer_ids.next().unwrap(), buffer_ids.next().unwrap())
-        });
-
-        // Without a resolved language, buffer A's debounce would answer `None` and never touch the cache.
-        editor.update(cx, |editor, cx| {
-            let buffer_a = editor.buffer().read(cx).buffer(buffer_a_id).unwrap();
-            buffer_a.update(cx, |buffer, cx| {
-                buffer.set_language(Some(language::PLAIN_TEXT.clone()), cx)
-            });
-        });
-        cx.run_until_parked();
-
-        editor.update_in(cx, |editor, window, cx| {
-            editor.change_selections(Default::default(), window, cx, |selections| {
-                selections.select_ranges([Point::new(0, 0)..Point::new(0, 0)]);
-            });
-        });
-
-        // Buffer B is already fresh, as if it had been fetched moments ago.
-        let buffer_b_version = editor.read_with(cx, |editor, cx| {
-            editor
-                .buffer()
-                .read(cx)
-                .buffer(buffer_b_id)
-                .unwrap()
-                .read(cx)
-                .version()
-        });
-        editor.update(cx, |editor, cx| {
-            editor.set_breadcrumb_outline(buffer_b_id, buffer_b_version.clone(), Vec::new(), cx);
-        });
-
-        // Row 1 is the blank separator `build_multi` puts between excerpts; B starts at row 2.
-        editor.update_in(cx, |editor, window, cx| {
-            editor.change_selections(Default::default(), window, cx, |selections| {
-                selections.select_ranges([Point::new(2, 0)..Point::new(2, 0)]);
-            });
-        });
-
-        cx.executor()
-            .advance_clock(LSP_REQUEST_DEBOUNCE_TIMEOUT * 2);
-        cx.run_until_parked();
-
-        editor.read_with(cx, |editor, _cx| {
-            assert!(
-                editor.breadcrumb_outline_is_fresh(buffer_b_id, &buffer_b_version),
-                "a stale debounce timer left over from a previous buffer must not overwrite \
-                 the cache for the buffer the cursor is actually on"
             );
         });
     }

@@ -301,7 +301,7 @@ pub trait PickerDelegate: Sized + 'static {
     ) -> Option<String> {
         None
     }
-    /// Called when `SelectChild` fires (e.g. shift-right-arrow). Return `Some(query)`
+    /// Called when `SelectChild` fires (e.g. right-arrow). Return `Some(query)`
     /// to step into the currently selected item (e.g. a directory); the picker
     /// will set the query and refresh matches.
     fn select_child(
@@ -312,7 +312,7 @@ pub trait PickerDelegate: Sized + 'static {
         None
     }
 
-    /// Called when `SelectParent` fires (e.g. shift-left-arrow). Return `Some(query)`
+    /// Called when `SelectParent` fires (e.g. left-arrow). Return `Some(query)`
     /// to step back to the parent; the picker will set the query and refresh
     /// matches.
     fn select_parent(
@@ -1597,6 +1597,7 @@ mod tests {
         selected_items: Vec<usize>,
         multi_confirmed: Rc<Cell<Option<Vec<usize>>>>,
         drill_context: bool,
+        query: String,
         parent_selected: Rc<Cell<bool>>,
         child_selected: Rc<Cell<bool>>,
     }
@@ -1611,6 +1612,7 @@ mod tests {
                 selected_items: Vec::new(),
                 multi_confirmed: Rc::new(Cell::new(None)),
                 drill_context: false,
+                query: String::new(),
                 parent_selected: Rc::new(Cell::new(false)),
                 child_selected: Rc::new(Cell::new(false)),
             }
@@ -1666,10 +1668,11 @@ mod tests {
 
         fn update_matches(
             &mut self,
-            _query: String,
+            query: String,
             _window: &mut Window,
             _cx: &mut Context<Picker<Self>>,
         ) -> Task<()> {
+            self.query = query;
             Task::ready(())
         }
 
@@ -1727,13 +1730,18 @@ mod tests {
             self.drill_context.then_some("BreadcrumbPicker")
         }
 
+        // Like the production delegates, drilling declines under a typed query so the
+        // keystroke can propagate to the query editor's cursor movement.
         fn select_parent(
             &mut self,
             _window: &mut Window,
             _cx: &mut Context<Picker<Self>>,
         ) -> Option<String> {
+            if !self.query.is_empty() {
+                return None;
+            }
             self.parent_selected.set(true);
-            Some("parent".to_string())
+            Some(String::new())
         }
 
         fn select_child(
@@ -1741,8 +1749,11 @@ mod tests {
             _window: &mut Window,
             _cx: &mut Context<Picker<Self>>,
         ) -> Option<String> {
+            if !self.query.is_empty() {
+                return None;
+            }
             self.child_selected.set(true);
-            Some("child".to_string())
+            Some(String::new())
         }
 
         fn render_match(
@@ -2009,9 +2020,11 @@ mod tests {
         bind_drill_navigation_keymap(cx);
 
         let parent_selected = Rc::new(Cell::new(false));
+        let child_selected = Rc::new(Cell::new(false));
         let (picker, cx) = cx.add_window_view(|window, cx| {
             let mut delegate = TestDelegate::new(vec![true]).with_drill_context();
             delegate.parent_selected = parent_selected.clone();
+            delegate.child_selected = child_selected.clone();
             Picker::uniform_list(delegate, window, cx)
         });
 
@@ -2026,6 +2039,66 @@ mod tests {
         assert!(
             parent_selected.get(),
             "a picker tagged BreadcrumbPicker should drill on plain left through the real keymap"
+        );
+
+        cx.simulate_keystrokes("right");
+        cx.run_until_parked();
+
+        assert!(
+            child_selected.get(),
+            "a picker tagged BreadcrumbPicker should drill on plain right through the real keymap"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_plain_left_right_reach_editor_cursor_in_tagged_picker_with_query(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        bind_drill_navigation_keymap(cx);
+
+        let parent_selected = Rc::new(Cell::new(false));
+        let child_selected = Rc::new(Cell::new(false));
+        let (picker, cx) = cx.add_window_view(|window, cx| {
+            let mut delegate = TestDelegate::new(vec![true]).with_drill_context();
+            delegate.parent_selected = parent_selected.clone();
+            delegate.child_selected = child_selected.clone();
+            Picker::uniform_list(delegate, window, cx)
+        });
+
+        picker.update_in(cx, |picker, window, cx| {
+            picker.focus(window, cx);
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("a b");
+        cx.run_until_parked();
+
+        // A cursor moved by "left" yields "acb"; a swallowed "left" yields "abc".
+        cx.simulate_keystrokes("left");
+        cx.simulate_keystrokes("c");
+        cx.run_until_parked();
+        picker.update(cx, |picker, cx| {
+            assert_eq!(
+                picker.query(cx),
+                "acb",
+                "with a typed query, plain left must reach the query editor's cursor movement"
+            );
+        });
+
+        cx.simulate_keystrokes("right");
+        cx.simulate_keystrokes("d");
+        cx.run_until_parked();
+        picker.update(cx, |picker, cx| {
+            assert_eq!(
+                picker.query(cx),
+                "acbd",
+                "with a typed query, plain right must reach the query editor's cursor movement"
+            );
+        });
+
+        assert!(
+            !parent_selected.get() && !child_selected.get(),
+            "no drill may fire while the query is non-empty"
         );
     }
 

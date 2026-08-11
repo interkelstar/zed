@@ -7,9 +7,139 @@ use editor::{
     BREADCRUMB_PICKER_RENDERERS, BreadcrumbPickerRenderers, ErasedBreadcrumbPopoverHandle,
 };
 use fuzzy::{StringMatch, StringMatchCandidate};
-use gpui::App;
+use gpui::{AnyElement, App, Context, Task, Window};
+use picker::{Picker, PickerDelegate};
+use ui::{ButtonLike, ButtonSize, ButtonStyle, PopoverMenuHandle, prelude::*};
 
 pub(crate) const MAX_BREADCRUMB_MENU_ENTRIES: usize = 200;
+
+/// Newtype avoiding an orphan-rule conflict for `ErasedBreadcrumbPopoverHandle`.
+pub(crate) struct BreadcrumbPopoverHandle<D: PickerDelegate>(pub PopoverMenuHandle<Picker<D>>);
+
+impl<D: PickerDelegate> ErasedBreadcrumbPopoverHandle for BreadcrumbPopoverHandle<D> {
+    fn hide(&self, cx: &mut App) {
+        self.0.hide(cx);
+    }
+
+    fn show(&self, window: &mut Window, cx: &mut App) {
+        self.0.show(window, cx);
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// The filter state both delegates embed and forward their `PickerDelegate` accessors to.
+pub(crate) struct BreadcrumbPickerCore {
+    /// Rebuilt only alongside the backing listing; a typed query clones this `Rc`, an empty one still copies up to the cap.
+    pub candidates: Rc<[StringMatchCandidate]>,
+    pub matches: Vec<StringMatch>,
+    pub query: String,
+    pub selected_index: usize,
+}
+
+impl Default for BreadcrumbPickerCore {
+    fn default() -> Self {
+        Self {
+            candidates: Vec::new().into(),
+            matches: Vec::new(),
+            query: String::new(),
+            selected_index: 0,
+        }
+    }
+}
+
+pub(crate) trait BreadcrumbPickerDelegate: PickerDelegate {
+    fn core(&self) -> &BreadcrumbPickerCore;
+    fn core_mut(&mut self) -> &mut BreadcrumbPickerCore;
+    /// Whether the candidate is the entry the popover's own segment represents.
+    fn is_current_candidate(&self, candidate_id: usize) -> bool;
+}
+
+/// Caps `matches` like a typed filter, preselecting the current entry and keeping it displayed even past the cap.
+pub(crate) fn apply_empty_query_matches(delegate: &mut impl BreadcrumbPickerDelegate) {
+    // Both delegates build candidates with `new(index, ..)`: ids double as listing indices.
+    let keep_candidate_id = delegate
+        .core()
+        .candidates
+        .iter()
+        .map(|candidate| candidate.id)
+        .find(|&candidate_id| delegate.is_current_candidate(candidate_id));
+    let matches = cap_empty_query_matches(
+        &delegate.core().candidates,
+        keep_candidate_id,
+        MAX_BREADCRUMB_MENU_ENTRIES,
+    );
+    let selected_index = matches
+        .iter()
+        .position(|entry_match| delegate.is_current_candidate(entry_match.candidate_id))
+        .unwrap_or(0);
+    let core = delegate.core_mut();
+    core.matches = matches;
+    core.selected_index = selected_index;
+}
+
+pub(crate) fn update_picker_matches<D: BreadcrumbPickerDelegate>(
+    delegate: &mut D,
+    query: String,
+    cx: &mut Context<Picker<D>>,
+) -> Task<()> {
+    delegate.core_mut().query = query.clone();
+
+    if query.is_empty() {
+        apply_empty_query_matches(delegate);
+        cx.notify();
+        return Task::ready(());
+    }
+
+    let candidates = delegate.core().candidates.clone();
+    let executor = cx.background_executor().clone();
+    cx.spawn(async move |picker, cx| {
+        let matches = fuzzy::match_strings(
+            &candidates,
+            &query,
+            false,
+            true,
+            MAX_BREADCRUMB_MENU_ENTRIES,
+            &Default::default(),
+            executor,
+        )
+        .await;
+        picker
+            .update(cx, |picker, cx| {
+                let core = picker.delegate.core_mut();
+                core.matches = matches;
+                core.selected_index = 0;
+                cx.notify();
+            })
+            .ok();
+    })
+}
+
+pub(crate) fn segment_trigger(id: &'static str, index: usize, label: AnyElement) -> ButtonLike {
+    ButtonLike::new((id, index))
+        .style(ButtonStyle::Transparent)
+        .size(ButtonSize::None)
+        .height(rems_from_px(22.).into())
+        .child(label)
+}
+
+/// Only the active segment carries the handle the editor's navigate calls reopen through.
+pub(crate) fn segment_popover_handle<D: PickerDelegate>(
+    is_active_segment: bool,
+    shared_popover_handle: Rc<dyn ErasedBreadcrumbPopoverHandle>,
+) -> PopoverMenuHandle<Picker<D>> {
+    if is_active_segment {
+        shared_popover_handle
+            .as_any()
+            .downcast_ref::<BreadcrumbPopoverHandle<D>>()
+            .map(|handle| handle.0.clone())
+            .unwrap_or_default()
+    } else {
+        PopoverMenuHandle::default()
+    }
+}
 
 /// Caps the empty-query listing like a typed filter, keeping `keep_candidate_id` displayed even if it would otherwise sort past the cap.
 pub(crate) fn cap_empty_query_matches(
@@ -69,29 +199,155 @@ pub fn init(_cx: &mut App) {
 }
 
 fn default_popover_handle() -> Rc<dyn ErasedBreadcrumbPopoverHandle> {
-    Rc::new(directory::DirectoryPopoverHandle(Default::default()))
+    Rc::new(BreadcrumbPopoverHandle::<
+        directory::BreadcrumbDirectoryDelegate,
+    >(Default::default()))
 }
 
 fn default_symbol_popover_handle() -> Rc<dyn ErasedBreadcrumbPopoverHandle> {
-    Rc::new(symbol::SymbolPopoverHandle(Default::default()))
+    Rc::new(BreadcrumbPopoverHandle::<symbol::BreadcrumbSymbolDelegate>(
+        Default::default(),
+    ))
 }
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    use editor::Editor;
-    use gpui::{Context, Entity, IntoElement, Render, TestAppContext, Window};
+    use std::sync::Arc;
+
+    use editor::test::build_editor;
+    use editor::{Editor, MultiBuffer};
+    use gpui::{
+        App, AppContext as _, Context, Entity, IntoElement, ParentElement as _, Render,
+        TestAppContext, VisualTestContext, Window,
+    };
+    use project::{FakeFs, Project, WorktreeId};
     use settings::KeymapFile;
+    use util::path;
+    use workspace::Workspace;
+
+    pub(crate) fn init_test(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let _app_state = workspace::AppState::test(cx);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+            crate::init(cx);
+        });
+    }
 
     /// `PopoverMenu`-free pickers need a real `Render` root to drive keystrokes through.
     pub(crate) struct Harness<P: Render> {
-        pub(crate) picker: Entity<P>,
+        pub(crate) picker: Option<Entity<P>>,
         pub(crate) editor: Entity<Editor>,
     }
 
     impl<P: Render> Render for Harness<P> {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            self.picker.clone()
+            gpui::div().children(self.picker.clone())
         }
+    }
+
+    pub(crate) struct WorkspaceFixture {
+        pub(crate) fs: Arc<FakeFs>,
+        pub(crate) project: Entity<Project>,
+        pub(crate) workspace: Entity<Workspace>,
+        pub(crate) worktree_id: WorktreeId,
+    }
+
+    pub(crate) async fn workspace_fixture(
+        tree: serde_json::Value,
+        cx: &mut TestAppContext,
+    ) -> WorkspaceFixture {
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root"), tree).await;
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        let worktree_id = project.update(cx, |project, cx| {
+            project.worktrees(cx).next().unwrap().read(cx).id()
+        });
+        let workspace_window =
+            cx.add_window(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let workspace = workspace_window.root(cx).unwrap();
+        cx.run_until_parked();
+        WorkspaceFixture {
+            fs,
+            project,
+            workspace,
+            worktree_id,
+        }
+    }
+
+    pub(crate) struct PickerHarness<P: Render> {
+        pub(crate) picker: Entity<P>,
+        pub(crate) editor: Entity<Editor>,
+        pub(crate) cx: VisualTestContext,
+    }
+
+    /// A `Harness` window whose picker attaches later: lets editor state the picker reads
+    /// (e.g. the breadcrumb outline) resolve first.
+    pub(crate) struct EditorFixture<P: Render> {
+        harness: Entity<Harness<P>>,
+        pub(crate) editor: Entity<Editor>,
+        pub(crate) cx: VisualTestContext,
+    }
+
+    pub(crate) fn editor_fixture<P: Render>(
+        buffer_text: &str,
+        language: Option<Arc<language::Language>>,
+        cx: &mut TestAppContext,
+    ) -> EditorFixture<P> {
+        let buffer = cx.new(|cx| {
+            let mut buffer = language::Buffer::local(buffer_text, cx);
+            if language.is_some() {
+                buffer.set_language(language, cx);
+            }
+            buffer
+        });
+        let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+        let harness_window = cx.add_window(|window, cx| {
+            let editor = cx.new(|cx| build_editor(buffer, window, cx));
+            Harness {
+                picker: None,
+                editor,
+            }
+        });
+        let harness = harness_window.root(cx).unwrap();
+        let editor = cx.update(|cx| harness.read(cx).editor.clone());
+        let cx = VisualTestContext::from_window(*harness_window, cx);
+        EditorFixture {
+            harness,
+            editor,
+            cx,
+        }
+    }
+
+    impl<P: Render> EditorFixture<P> {
+        pub(crate) fn attach_picker(
+            mut self,
+            build_picker: impl FnOnce(&Entity<Editor>, &mut Window, &mut App) -> Entity<P>,
+        ) -> PickerHarness<P> {
+            let picker = self.cx.update(|window, cx| {
+                let picker = build_picker(&self.editor, window, cx);
+                self.harness.update(cx, |harness, cx| {
+                    harness.picker = Some(picker.clone());
+                    cx.notify();
+                });
+                picker
+            });
+            PickerHarness {
+                picker,
+                editor: self.editor,
+                cx: self.cx,
+            }
+        }
+    }
+
+    /// Builds a `Harness`-rooted window around a fresh editor and the delegate-specific picker
+    /// `build_picker` constructs. No `run_until_parked`: some tests assert on in-flight state.
+    pub(crate) fn picker_harness<P: Render>(
+        buffer_text: &str,
+        cx: &mut TestAppContext,
+        build_picker: impl FnOnce(&Entity<Editor>, &mut Window, &mut App) -> Entity<P>,
+    ) -> PickerHarness<P> {
+        editor_fixture(buffer_text, None, cx).attach_picker(build_picker)
     }
 
     /// Binds the shipped context strings, minus the sibling `menu` block: shadowing there is uncaught.
@@ -104,6 +360,13 @@ pub(crate) mod test_support {
                         "bindings": {
                             "left": "editor::MoveLeft",
                             "right": "editor::MoveRight"
+                        }
+                    },
+                    {
+                        "context": "Picker > Editor",
+                        "bindings": {
+                            "down": "menu::SelectNext",
+                            "enter": "menu::Confirm"
                         }
                     },
                     {

@@ -1,8 +1,14 @@
 //! Breadcrumb path and symbol navigation.
 
+use std::cell::RefCell;
+use std::ops::Range;
 use std::sync::OnceLock;
 
+use gpui::Subscription;
+use ui::{ScrollAxes, Scrollbars, WithScrollbar};
+
 use super::*;
+use crate::{BreadcrumbNavigation, BreadcrumbSymbolNavigation};
 
 mod layout;
 mod outline;
@@ -10,14 +16,12 @@ mod path;
 
 pub(crate) use layout::BreadcrumbSegmentKind;
 use layout::{
-    align_symbol_segments, classify_breadcrumb_segment_kinds, hard_cap_breadcrumb_middle_segments,
+    BreadcrumbLayoutPlan, align_symbol_segments, classify_breadcrumb_segment_kinds,
+    hard_cap_breadcrumb_middle_segments,
 };
-use layout::{
-    breadcrumb_layout_plan_for_expansion, breadcrumb_layout_plan_width, plan_breadcrumb_layout,
-};
+use layout::{breadcrumb_layout_plan_width, plan_breadcrumb_layout};
 pub(crate) use outline::outline_parents;
 pub use outline::{child_outline_indices, sibling_outline_indices, top_level_outline_indices};
-use path::breadcrumb_path_is_navigable;
 pub use path::{
     BreadcrumbDirectoryEntry, BreadcrumbDirectoryListingSettings, breadcrumb_diagnostic_severity,
     breadcrumb_directory_entries,
@@ -60,6 +64,269 @@ pub struct BreadcrumbPickerRenderers {
 
 pub static BREADCRUMB_PICKER_RENDERERS: OnceLock<BreadcrumbPickerRenderers> = OnceLock::new();
 
+/// Which dropdown session is live; the `Reanchoring*` variants cover the popover moving to a new segment.
+pub(crate) enum BreadcrumbPopover {
+    Closed,
+    Directory(BreadcrumbNavigation),
+    Symbol(BreadcrumbSymbolNavigation),
+    ReanchoringDirectory {
+        navigation: BreadcrumbNavigation,
+        pending: bool,
+    },
+    ReanchoringSymbol {
+        navigation: BreadcrumbSymbolNavigation,
+        pending: bool,
+    },
+}
+
+/// Buffer-coordinate on purpose: multibuffer layout can change under the key.
+struct SymbolTrailCache {
+    buffer_id: BufferId,
+    version: clock::Global,
+    range: Range<Anchor>,
+    trail: Vec<OutlineItem<text::Anchor>>,
+}
+
+pub(crate) struct BreadcrumbState {
+    popover: BreadcrumbPopover,
+    pub(crate) expanded: bool,
+    /// Set for one frame by a mouse-down on the bar, so a dismiss from that click keeps the trail expanded.
+    pub(crate) zone_mouse_down: bool,
+    pub(crate) dismiss_subscription: Option<Subscription>,
+    directory_popover_handle: Option<Rc<dyn ErasedBreadcrumbPopoverHandle>>,
+    symbol_popover_handle: Option<Rc<dyn ErasedBreadcrumbPopoverHandle>>,
+    symbol_trail_cache: RefCell<Option<SymbolTrailCache>>,
+}
+
+impl Default for BreadcrumbState {
+    fn default() -> Self {
+        let renderers = BREADCRUMB_PICKER_RENDERERS.get();
+        Self {
+            popover: BreadcrumbPopover::Closed,
+            expanded: false,
+            zone_mouse_down: false,
+            dismiss_subscription: None,
+            directory_popover_handle: renderers.map(|renderers| (renderers.popover_handle)()),
+            symbol_popover_handle: renderers.map(|renderers| (renderers.symbol_popover_handle)()),
+            symbol_trail_cache: RefCell::new(None),
+        }
+    }
+}
+
+impl BreadcrumbState {
+    pub(crate) fn directory_navigation(&self) -> Option<&BreadcrumbNavigation> {
+        match &self.popover {
+            BreadcrumbPopover::Directory(navigation)
+            | BreadcrumbPopover::ReanchoringDirectory { navigation, .. } => Some(navigation),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn symbol_navigation(&self) -> Option<&BreadcrumbSymbolNavigation> {
+        match &self.popover {
+            BreadcrumbPopover::Symbol(navigation)
+            | BreadcrumbPopover::ReanchoringSymbol { navigation, .. } => Some(navigation),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn directory_popover_handle(&self) -> Option<Rc<dyn ErasedBreadcrumbPopoverHandle>> {
+        self.directory_popover_handle.clone()
+    }
+
+    pub(crate) fn symbol_popover_handle(&self) -> Option<Rc<dyn ErasedBreadcrumbPopoverHandle>> {
+        self.symbol_popover_handle.clone()
+    }
+
+    pub(crate) fn session_open(&self) -> bool {
+        !matches!(self.popover, BreadcrumbPopover::Closed)
+    }
+
+    pub(crate) fn reanchoring(&self) -> bool {
+        matches!(
+            self.popover,
+            BreadcrumbPopover::ReanchoringDirectory { .. }
+                | BreadcrumbPopover::ReanchoringSymbol { .. }
+        )
+    }
+
+    pub(crate) fn reanchor_pending(&self) -> bool {
+        matches!(
+            self.popover,
+            BreadcrumbPopover::ReanchoringDirectory { pending: true, .. }
+                | BreadcrumbPopover::ReanchoringSymbol { pending: true, .. }
+        )
+    }
+
+    pub(crate) fn hide_popovers(&self, cx: &mut App) {
+        if let Some(handle) = &self.directory_popover_handle {
+            handle.hide(cx);
+        }
+        if let Some(handle) = &self.symbol_popover_handle {
+            handle.hide(cx);
+        }
+    }
+
+    /// Keeps an in-flight reanchor open: its `show` reopens the dropdown through this same session.
+    pub(crate) fn set_directory_navigation(&mut self, navigation: BreadcrumbNavigation) {
+        self.popover = if self.reanchoring() {
+            BreadcrumbPopover::ReanchoringDirectory {
+                navigation,
+                pending: false,
+            }
+        } else {
+            BreadcrumbPopover::Directory(navigation)
+        };
+    }
+
+    pub(crate) fn set_symbol_navigation(&mut self, navigation: BreadcrumbSymbolNavigation) {
+        self.popover = if self.reanchoring() {
+            BreadcrumbPopover::ReanchoringSymbol {
+                navigation,
+                pending: false,
+            }
+        } else {
+            BreadcrumbPopover::Symbol(navigation)
+        };
+    }
+
+    pub(crate) fn begin_directory_reanchor(&mut self, navigation: BreadcrumbNavigation) {
+        self.popover = BreadcrumbPopover::ReanchoringDirectory {
+            navigation,
+            pending: false,
+        };
+    }
+
+    pub(crate) fn begin_symbol_reanchor(&mut self, navigation: BreadcrumbSymbolNavigation) {
+        self.popover = BreadcrumbPopover::ReanchoringSymbol {
+            navigation,
+            pending: false,
+        };
+    }
+
+    pub(crate) fn queue_reanchor(&mut self) -> bool {
+        match &mut self.popover {
+            BreadcrumbPopover::ReanchoringDirectory { pending, .. }
+            | BreadcrumbPopover::ReanchoringSymbol { pending, .. } => {
+                *pending = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn take_queued_reanchor(&mut self) -> bool {
+        match &mut self.popover {
+            BreadcrumbPopover::ReanchoringDirectory { pending, .. }
+            | BreadcrumbPopover::ReanchoringSymbol { pending, .. }
+                if *pending =>
+            {
+                *pending = false;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn reanchoring_popover_handle(
+        &self,
+    ) -> Option<Rc<dyn ErasedBreadcrumbPopoverHandle>> {
+        match &self.popover {
+            BreadcrumbPopover::ReanchoringDirectory { .. } => self.directory_popover_handle.clone(),
+            BreadcrumbPopover::ReanchoringSymbol { .. } => self.symbol_popover_handle.clone(),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn finish_reanchor(&mut self) {
+        self.popover = match std::mem::replace(&mut self.popover, BreadcrumbPopover::Closed) {
+            BreadcrumbPopover::ReanchoringDirectory { navigation, .. } => {
+                BreadcrumbPopover::Directory(navigation)
+            }
+            BreadcrumbPopover::ReanchoringSymbol { navigation, .. } => {
+                BreadcrumbPopover::Symbol(navigation)
+            }
+            other => other,
+        };
+    }
+
+    /// A no-op while reanchoring: the dropdown is only moving between segments, not closing.
+    pub(crate) fn clear_directory_navigation(
+        &mut self,
+        worktree_id: WorktreeId,
+        path: &Arc<RelPath>,
+    ) -> bool {
+        match &self.popover {
+            BreadcrumbPopover::Directory(navigation)
+                if navigation.worktree_id == worktree_id && &navigation.active_path == path =>
+            {
+                self.close_session();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn clear_symbol_navigation(
+        &mut self,
+        buffer_id: BufferId,
+        active_item: Option<&OutlineItem<Anchor>>,
+    ) -> bool {
+        match &self.popover {
+            BreadcrumbPopover::Symbol(navigation)
+                if navigation.buffer_id == buffer_id
+                    && navigation.active_item.as_ref().map(|item| &item.range)
+                        == active_item.map(|item| &item.range) =>
+            {
+                self.close_session();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn close_session(&mut self) {
+        self.popover = BreadcrumbPopover::Closed;
+        if !self.zone_mouse_down {
+            self.expanded = false;
+        }
+    }
+
+    pub(crate) fn close(&mut self) -> bool {
+        let changed = self.session_open() || self.expanded;
+        self.popover = BreadcrumbPopover::Closed;
+        self.expanded = false;
+        changed
+    }
+
+    fn cached_symbol_trail(
+        &self,
+        buffer_id: BufferId,
+        version: &clock::Global,
+        range: &Range<Anchor>,
+    ) -> Option<Vec<OutlineItem<text::Anchor>>> {
+        let cache = self.symbol_trail_cache.borrow();
+        let cache = cache.as_ref()?;
+        (cache.buffer_id == buffer_id && &cache.version == version && &cache.range == range)
+            .then(|| cache.trail.clone())
+    }
+
+    fn cache_symbol_trail(
+        &self,
+        buffer_id: BufferId,
+        version: clock::Global,
+        range: Range<Anchor>,
+        trail: &[OutlineItem<text::Anchor>],
+    ) {
+        *self.symbol_trail_cache.borrow_mut() = Some(SymbolTrailCache {
+            buffer_id,
+            version,
+            range,
+            trail: trail.to_vec(),
+        });
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum BreadcrumbSegmentTarget {
     Symbol {
@@ -76,8 +343,12 @@ pub(crate) enum BreadcrumbSegmentTarget {
 }
 
 /// The single-byte replacement keeps byte-offset highlight ranges valid.
-pub fn flatten_text_for_single_line_display(text: &str) -> String {
-    text.replace('\n', " ")
+pub fn flatten_text_for_single_line_display(text: &SharedString) -> SharedString {
+    if text.contains('\n') {
+        text.replace('\n', " ").into()
+    } else {
+        text.clone()
+    }
 }
 
 struct PreparedBreadcrumbSegment {
@@ -90,6 +361,8 @@ struct PreparedBreadcrumbSegment {
     /// Diagnostics tint the icon and git status owns the label, as in the project panel.
     icon_color: Color,
     label_color: Color,
+    /// The hard cap's "⋯" pseudo-segment: rendered as an expand trigger, like a layout ellipsis.
+    hard_cap_ellipsis: bool,
 }
 
 /// Measured once per render; `shape_line` is cached by text and font.
@@ -132,6 +405,9 @@ struct BreadcrumbsRow {
     file_outlives_symbols: bool,
     /// An excerpt header row: its ellipsis must render as a plain marker, since it can never expand.
     multibuffer_header: bool,
+    /// Total painted child width, observable by tests: taffy never sees children painted past the row's bounds.
+    #[cfg(test)]
+    painted_extent: Option<Rc<std::cell::Cell<Pixels>>>,
 }
 
 const BREADCRUMB_SEGMENT_GROUP: &str = "breadcrumb-segment";
@@ -140,36 +416,13 @@ const BREADCRUMB_LABEL_PADDING: Pixels = px(4.);
 
 const BREADCRUMB_ICON_SIZE: IconSize = IconSize::Small;
 
-fn breadcrumb_file_icon(file_path: Option<&RelPath>, cx: &App) -> Option<SharedString> {
-    if !BreadcrumbDirectoryListingSettings::get_global(cx).file_icons {
-        return None;
-    }
-    file_icons::FileIcons::get_icon(file_path?.as_std_path(), cx)
-}
-
-/// Keeps at most one file icon on screen: the tab-bar-hidden prefix already renders one.
-fn breadcrumb_segment_file_icon(
-    icon: Option<SharedString>,
-    prefix_present: bool,
-) -> Option<SharedString> {
-    if prefix_present { None } else { icon }
-}
-
-fn breadcrumb_separator_width(window: &Window) -> Pixels {
-    IconSize::XSmall.rems().to_pixels(window.rem_size())
-}
-
 impl BreadcrumbsRow {
-    fn effective_text_style(&self, window: &Window) -> gpui::TextStyle {
-        window.text_style()
-    }
-
     fn measure(&self, window: &mut Window) -> BreadcrumbSegmentMetrics {
-        let text_style = self.effective_text_style(window);
+        let text_style = window.text_style();
         let font_size = text_style.font_size.to_pixels(window.rem_size());
         let gap = window.rem_size() * 0.25;
 
-        let arrow_width = breadcrumb_separator_width(window);
+        let arrow_width = IconSize::XSmall.rems().to_pixels(window.rem_size());
 
         let ellipsis_run = text_style.to_run("⋯".len());
         let ellipsis_label_width = window
@@ -187,7 +440,7 @@ impl BreadcrumbsRow {
                 let runs = segment_text_runs(segment, &text, &text_style);
                 let label_width = window
                     .text_system()
-                    .shape_line(text.into(), font_size, &runs, None)
+                    .shape_line(text, font_size, &runs, None)
                     .width();
                 let icon_width = if segment.icon.is_some() {
                     BREADCRUMB_ICON_SIZE.rems().to_pixels(window.rem_size()) + gap
@@ -242,23 +495,20 @@ impl BreadcrumbsRow {
             .into_any_element()
     }
 
-    fn wrap_segment(&self, element: gpui::AnyElement) -> gpui::AnyElement {
-        div()
-            .group(BREADCRUMB_SEGMENT_GROUP)
-            .child(element)
-            .into_any_element()
-    }
-
     fn render_segment(
         &self,
         index: usize,
         position: usize,
         last_position: usize,
+        max_width: Option<Pixels>,
         window: &mut Window,
         cx: &mut App,
     ) -> gpui::AnyElement {
         let segment = &self.segments[index];
-        let mut text_style = self.effective_text_style(window);
+        if segment.hard_cap_ellipsis {
+            return self.render_ellipsis(position, last_position, cx);
+        }
+        let mut text_style = window.text_style();
         text_style.color = segment.label_color.color(cx);
 
         let text = if segment.dirty_filename_style
@@ -270,6 +520,23 @@ impl BreadcrumbsRow {
             StyledText::new(flatten_text_for_single_line_display(&segment.label.text))
                 .with_default_highlights(&text_style, segment.label.highlights.clone())
                 .into_any()
+        };
+        let text = if let Some(max_width) = max_width {
+            let gap = window.rem_size() * 0.25;
+            let icon_width = if segment.icon.is_some() {
+                BREADCRUMB_ICON_SIZE.rems().to_pixels(window.rem_size()) + gap
+            } else {
+                Pixels::ZERO
+            };
+            let label_width =
+                (max_width - BREADCRUMB_LABEL_PADDING * 2. - icon_width).max(Pixels::ZERO);
+            div()
+                .max_w(label_width)
+                .truncate()
+                .child(text)
+                .into_any_element()
+        } else {
+            text
         };
 
         let content = match &segment.icon {
@@ -290,6 +557,7 @@ impl BreadcrumbsRow {
         let content =
             if let (Some(target), Some(editor)) = (segment.target.clone(), self.editor.clone()) {
                 div()
+                    .id(("breadcrumb-segment", position))
                     .on_mouse_down(gpui::MouseButton::Right, move |_, _, cx| {
                         let Some(editor) = editor.upgrade() else {
                             return;
@@ -389,12 +657,13 @@ impl BreadcrumbsRow {
                 }
                 _ => return label,
             };
-        self.wrap_segment(element)
+        wrap_segment(element)
     }
 
     fn render_ellipsis(&self, position: usize, last_position: usize, cx: &App) -> gpui::AnyElement {
         let content = Label::new("⋯").color(Color::Placeholder).into_any_element();
-        let interactive = breadcrumb_ellipsis_is_interactive(self.multibuffer_header);
+        // A header row can never expand, so only the main bar's ellipsis is live.
+        let interactive = !self.multibuffer_header;
         let label = self.with_separator(position, last_position, content, interactive, cx);
         if !interactive {
             return label;
@@ -412,9 +681,11 @@ impl BreadcrumbsRow {
                     editor.update(cx, |editor, cx| editor.expand_breadcrumb_trail(cx));
                 }
             })
+            // An ellipsis has no path of its own; keep the bar's copy fallback from firing.
+            .on_mouse_down(gpui::MouseButton::Right, |_, _, cx| cx.stop_propagation())
             .child(label)
             .into_any_element();
-        self.wrap_segment(element)
+        wrap_segment(element)
     }
 
     /// The segment a popover is currently open under, if any: `plan_breadcrumb_layout` must never collapse it.
@@ -432,6 +703,13 @@ impl BreadcrumbsRow {
             )
         })
     }
+}
+
+fn wrap_segment(element: gpui::AnyElement) -> gpui::AnyElement {
+    div()
+        .group(BREADCRUMB_SEGMENT_GROUP)
+        .child(element)
+        .into_any_element()
 }
 
 fn resolve_breadcrumb_segment_copy_path(
@@ -565,7 +843,9 @@ impl gpui::Element for BreadcrumbsRow {
                                     anchored_index,
                                     file_outlives_symbols,
                                 );
+                                // Even the minimal plan can overflow; prepaint then truncates the last label.
                                 breadcrumb_layout_plan_width(&widths, &plan, ellipsis_width)
+                                    .min(available_width)
                             }
                             AvailableSpace::MinContent => widths
                                 .last()
@@ -594,17 +874,21 @@ impl gpui::Element for BreadcrumbsRow {
     ) -> Self::PrepaintState {
         let kinds: Vec<BreadcrumbSegmentKind> = self.segments.iter().map(|s| s.kind).collect();
         let anchored_index = self.anchored_segment_index();
-        let plan =
-            breadcrumb_layout_plan_for_expansion(self.expanded, kinds.len()).unwrap_or_else(|| {
-                plan_breadcrumb_layout(
-                    &metrics.widths,
-                    &kinds,
-                    metrics.ellipsis_width,
-                    bounds.size.width,
-                    anchored_index,
-                    self.file_outlives_symbols,
-                )
-            });
+        let plan = if self.expanded {
+            BreadcrumbLayoutPlan {
+                visible: (0..kinds.len()).collect(),
+                ellipses: Vec::new(),
+            }
+        } else {
+            plan_breadcrumb_layout(
+                &metrics.widths,
+                &kinds,
+                metrics.ellipsis_width,
+                bounds.size.width,
+                anchored_index,
+                self.file_outlives_symbols,
+            )
+        };
 
         if let Some(anchored_index) = anchored_index
             && !plan.visible.contains(&anchored_index)
@@ -614,7 +898,7 @@ impl gpui::Element for BreadcrumbsRow {
                 .and_then(|segment| segment.target.clone())
             && let Some(editor) = self.editor.as_ref().and_then(WeakEntity::upgrade)
             // Reanchoring drops and re-shows the popover itself; dismissing mid-flight fights it.
-            && !editor.read(cx).breadcrumb_reanchoring
+            && !editor.read(cx).breadcrumb_reanchoring()
         {
             dismiss_orphaned_breadcrumb_popover(&editor, &target, cx);
         }
@@ -638,13 +922,19 @@ impl gpui::Element for BreadcrumbsRow {
         }
 
         let last_position = sequence.len().saturating_sub(1);
+        // Nothing left to drop and still too wide: the last label must ellipsize itself.
+        let truncate_last = !self.expanded
+            && breadcrumb_layout_plan_width(&metrics.widths, &plan, metrics.ellipsis_width)
+                > bounds.size.width;
         let gap = window.rem_size() * 0.25;
         let mut x = bounds.origin.x;
         let mut children = Vec::with_capacity(sequence.len());
         for (position, item) in sequence.into_iter().enumerate() {
+            let max_width = (truncate_last && position == last_position)
+                .then(|| (bounds.origin.x + bounds.size.width - x).max(Pixels::ZERO));
             let mut element = match item {
                 FinalItem::Segment(index) => {
-                    self.render_segment(index, position, last_position, window, cx)
+                    self.render_segment(index, position, last_position, max_width, window, cx)
                 }
                 FinalItem::Ellipsis => self.render_ellipsis(position, last_position, cx),
             };
@@ -653,13 +943,20 @@ impl gpui::Element for BreadcrumbsRow {
                 AvailableSpace::Definite(bounds.size.height),
             );
             let element_size = element.layout_as_root(available_space, window, cx);
-            element.prepaint_at(point(x, bounds.origin.y), window, cx);
+            // The 22px triggers outgrow a line-height row; centering keeps them inside the bar.
+            let y = bounds.origin.y + (bounds.size.height - element_size.height) / 2.;
+            element.prepaint_at(point(x, y), window, cx);
             x += element_size.width + gap;
             children.push(element);
         }
 
+        #[cfg(test)]
+        if let Some(painted_extent) = &self.painted_extent {
+            painted_extent.set((x - gap - bounds.origin.x).max(Pixels::ZERO));
+        }
+
         if let Some(editor) = self.editor.as_ref().and_then(WeakEntity::upgrade)
-            && editor.read(cx).breadcrumb_pending_reanchor().is_some()
+            && editor.read(cx).breadcrumb_reanchor_pending()
         {
             editor.update(cx, |editor, cx| {
                 editor.reanchor_breadcrumb_popover(window, cx);
@@ -690,7 +987,8 @@ pub fn render_breadcrumb_text(
     prefix: Option<gpui::AnyElement>,
     active_item: &dyn ItemHandle,
     multibuffer_header: bool,
-    cx: &App,
+    window: &mut Window,
+    cx: &mut App,
 ) -> gpui::AnyElement {
     // min_w_0: a flex item's minimum size defaults to its content's.
     let element = h_flex().flex_grow_1().min_w_0().text_ui(cx);
@@ -705,7 +1003,7 @@ pub fn render_breadcrumb_text(
     let mut has_root_segment = false;
     let mut file_path_for_icon: Option<Arc<RelPath>> = None;
     let mut file_status = None;
-    let mut diagnostic_severity = None;
+    let mut file_icon_color = Color::Muted;
 
     if !multibuffer_header
         && let Some(editor_entity) = editor.as_ref().and_then(WeakEntity::upgrade)
@@ -728,17 +1026,11 @@ pub fn render_breadcrumb_text(
                         project.read(cx).project_path_git_status(project_path, cx)
                     })
             });
-            diagnostic_severity = editor_ref
-                .project()
-                .zip(real_project_path.as_ref())
-                .and_then(|(project, project_path)| {
-                    path::breadcrumb_diagnostic_severity(
-                        project.read(cx),
-                        project_path,
-                        listing_settings.show_diagnostics,
-                        cx,
-                    )
-                });
+            // The prefix icon resolves its own tint; skip the second lookup per frame.
+            if prefix.is_none() && listing_settings.file_icons {
+                file_icon_color =
+                    bar_file_icon_color(editor_ref.project(), real_project_path.as_ref(), cx);
+            }
             // While set, the bar shows that directory's path instead of the file's.
             let navigation = editor_ref.breadcrumb_navigation().cloned();
             let navigated = navigation
@@ -753,19 +1045,17 @@ pub fn render_breadcrumb_text(
                 navigation.buffer_id == buffer_id && navigation.active_item.is_none()
             });
 
-            let is_navigable = breadcrumb_path_is_navigable(
-                real_project_path.is_some(),
-                real_project_path.as_ref().and_then(|project_path| {
-                    editor_ref
-                        .project()
-                        .and_then(|project| {
-                            project
-                                .read(cx)
-                                .worktree_for_id(project_path.worktree_id, cx)
-                        })
-                        .map(|worktree| worktree.read(cx).is_single_file())
-                }),
-            );
+            // A single-file worktree (a file opened outside any real worktree) has no tree to browse.
+            let is_navigable = real_project_path.as_ref().is_some_and(|project_path| {
+                !editor_ref
+                    .project()
+                    .and_then(|project| {
+                        project
+                            .read(cx)
+                            .worktree_for_id(project_path.worktree_id, cx)
+                    })
+                    .is_some_and(|worktree| worktree.read(cx).is_single_file())
+            });
 
             // The root segment keeps sibling top-level directories reachable from the root.
             if is_navigable
@@ -819,7 +1109,12 @@ pub fn render_breadcrumb_text(
             }
 
             if !path_split {
-                symbol_segments.push(file_segment_symbol_target(buffer_id, file_segment_active));
+                // Even a non-navigable path gets a target: the file segment still opens the outline picker.
+                symbol_segments.push(Some(BreadcrumbSegmentTarget::Symbol {
+                    buffer_id,
+                    item: None,
+                    is_active_segment: file_segment_active,
+                }));
             }
 
             // Directory navigation replaces the whole bar; symbol segments don't apply.
@@ -832,7 +1127,7 @@ pub fn render_breadcrumb_text(
                     let trail = symbol_navigation
                         .as_ref()
                         .and_then(|navigation| navigation.active_item.as_ref())
-                        .map(|item| editor_ref.breadcrumb_symbol_trail(buffer_id, item, cx))
+                        .map(|item| symbol_trail_with_fallback(editor_ref, buffer_id, item, cx))
                         .unwrap_or_default();
                     // The incoming labels carry the cursor's symbol trail; navigation replaces it.
                     segments.truncate(file_segment_index + 1);
@@ -873,21 +1168,35 @@ pub fn render_breadcrumb_text(
         }
     }
 
+    // A multibuffer excerpt header has no scroll container, so its row never expands.
+    let expanded = !multibuffer_header
+        && editor
+            .as_ref()
+            .and_then(WeakEntity::upgrade)
+            .is_some_and(|editor_entity| editor_entity.read(cx).breadcrumb_expanded());
+
     let symbol_segments = align_symbol_segments(&segments, symbol_segments);
     let kinds =
         classify_breadcrumb_segment_kinds(segments.len(), file_segment_index, has_root_segment);
-    let (segments, symbol_segments, kinds, file_segment_index) =
-        hard_cap_breadcrumb_middle_segments(segments, symbol_segments, kinds, file_segment_index);
+    let (segments, symbol_segments, kinds, file_segment_index, hard_cap_index) =
+        hard_cap_breadcrumb_middle_segments(
+            segments,
+            symbol_segments,
+            kinds,
+            file_segment_index,
+            expanded,
+        );
 
-    let file_icon = breadcrumb_segment_file_icon(
-        breadcrumb_file_icon(file_path_for_icon.as_deref(), cx),
-        prefix.is_some(),
-    );
+    // At most one file icon on screen: the tab-bar-hidden prefix already renders one.
+    let file_icon =
+        if prefix.is_some() || !BreadcrumbDirectoryListingSettings::get_global(cx).file_icons {
+            None
+        } else {
+            file_path_for_icon
+                .as_deref()
+                .and_then(|path| file_icons::FileIcons::get_icon(path.as_std_path(), cx))
+        };
     let file_status_color = crate::element::file_status_label_color(file_status);
-    let file_icon_color =
-        crate::items::entry_diagnostic_aware_icon_decoration_and_color(diagnostic_severity)
-            .map(|(_, color)| color)
-            .unwrap_or(Color::Muted);
 
     let tab_bar_hidden = !workspace::TabBarSettings::get_global(cx).show;
     let apply_dirty_filename_style = tab_bar_hidden && active_item.is_dirty(cx);
@@ -898,7 +1207,12 @@ pub fn render_breadcrumb_text(
         .zip(kinds)
         .enumerate()
         .map(|(index, ((label, target), kind))| {
-            let is_file_segment = is_file_breadcrumb_segment(kind, target.as_ref());
+            // A navigated bar can put a Directory at file_segment_index; only the bare file target counts.
+            let is_file_segment = kind == BreadcrumbSegmentKind::File
+                && matches!(
+                    target.as_ref(),
+                    Some(BreadcrumbSegmentTarget::Symbol { item: None, .. })
+                );
             PreparedBreadcrumbSegment {
                 kind,
                 label,
@@ -917,17 +1231,10 @@ pub fn render_breadcrumb_text(
                 } else {
                     Color::Muted
                 },
+                hard_cap_ellipsis: Some(index) == hard_cap_index,
             }
         })
         .collect();
-
-    let expanded = breadcrumb_row_is_expanded(
-        multibuffer_header,
-        editor
-            .as_ref()
-            .and_then(WeakEntity::upgrade)
-            .is_some_and(|editor_entity| editor_entity.read(cx).breadcrumb_expanded()),
-    );
 
     let row = BreadcrumbsRow {
         segments: prepared_segments,
@@ -935,6 +1242,8 @@ pub fn render_breadcrumb_text(
         expanded,
         file_outlives_symbols: tab_bar_hidden,
         multibuffer_header,
+        #[cfg(test)]
+        painted_extent: None,
     };
 
     let breadcrumbs_stack = if multibuffer_header {
@@ -947,10 +1256,14 @@ pub fn render_breadcrumb_text(
             .into_any_element()
     } else {
         h_flex()
-            .id("breadcrumb-trail")
             .min_w_0()
-            .overflow_x_scroll()
             .child(row)
+            // Thin and bottom-hugging, so the thumb stays below the crumb glyphs.
+            .custom_scrollbars(
+                Scrollbars::new(ScrollAxes::Horizontal).thumb_geometry(px(4.), px(1.)),
+                window,
+                cx,
+            )
             .into_any_element()
     };
 
@@ -970,6 +1283,17 @@ pub fn render_breadcrumb_text(
     match editor {
         Some(editor) => element
             .id("breadcrumb_container")
+            // Capture phase: runs before `PopoverMenu`'s bubbled dismiss for the same click.
+            .capture_any_mouse_down({
+                let editor = editor.clone();
+                move |_, window, cx| {
+                    if let Some(editor) = editor.upgrade() {
+                        editor.update(cx, |editor, cx| {
+                            editor.note_breadcrumb_zone_mouse_down(window, cx)
+                        });
+                    }
+                }
+            })
             // Not a `ButtonLike`: it renders `flex_none` and would never shrink.
             .child(
                 h_flex()
@@ -1003,38 +1327,70 @@ pub fn render_breadcrumb_text(
     }
 }
 
-/// Always a target, even when the path itself isn't navigable (single-file worktree, untitled):
-/// the file segment still opens the outline picker.
-fn file_segment_symbol_target(
+/// An edit can rewrite the drilled symbol's region; the stored item keeps the anchored segment alive until a fresh outline lands.
+///
+/// Reached on every bar render while a symbol session is live, so the trail is
+/// memoized against the stored outline's version, in buffer coordinates: the
+/// multibuffer layout can change without touching the cache key.
+fn symbol_trail_with_fallback(
+    editor: &Editor,
     buffer_id: BufferId,
-    is_active_segment: bool,
-) -> Option<BreadcrumbSegmentTarget> {
-    Some(BreadcrumbSegmentTarget::Symbol {
-        buffer_id,
-        item: None,
-        is_active_segment,
-    })
+    item: &OutlineItem<Anchor>,
+    cx: &App,
+) -> Vec<OutlineItem<Anchor>> {
+    let version = editor.breadcrumb_outline_version(buffer_id);
+    let buffer_trail = match version.and_then(|version| {
+        editor
+            .breadcrumb_state
+            .cached_symbol_trail(buffer_id, version, &item.range)
+    }) {
+        Some(trail) => trail,
+        None => {
+            let trail = editor.breadcrumb_symbol_trail_in_buffer(buffer_id, item, cx);
+            if let Some(version) = version {
+                editor.breadcrumb_state.cache_symbol_trail(
+                    buffer_id,
+                    version.clone(),
+                    item.range.clone(),
+                    &trail,
+                );
+            }
+            trail
+        }
+    };
+    let snapshot = editor.buffer().read(cx).snapshot(cx);
+    // All-or-nothing: a partially converted trail would render with a silent hole.
+    let trail = buffer_trail
+        .iter()
+        .map(|trail_item| {
+            crate::document_symbols::text_outline_item_to_multibuffer(trail_item, &snapshot)
+        })
+        .collect::<Option<Vec<_>>>();
+    match trail {
+        Some(trail) if !trail.is_empty() => trail,
+        _ => vec![item.clone()],
+    }
 }
 
-/// A multibuffer excerpt header has no scroll container, so an expanded row would overrun its neighbours.
-fn breadcrumb_row_is_expanded(multibuffer_header: bool, expanded: bool) -> bool {
-    !multibuffer_header && expanded
-}
-
-/// A header row can never expand (see `breadcrumb_row_is_expanded`), so only the main bar's ellipsis is live.
-fn breadcrumb_ellipsis_is_interactive(multibuffer_header: bool) -> bool {
-    !multibuffer_header
-}
-
-fn is_file_breadcrumb_segment(
-    kind: BreadcrumbSegmentKind,
-    target: Option<&BreadcrumbSegmentTarget>,
-) -> bool {
-    kind == BreadcrumbSegmentKind::File
-        && matches!(
-            target,
-            Some(BreadcrumbSegmentTarget::Symbol { item: None, .. })
-        )
+// Deliberately not gated on `diagnostic_badges`: that setting only affects picker rows.
+pub(crate) fn bar_file_icon_color(
+    project: Option<&Entity<project::Project>>,
+    project_path: Option<&project::ProjectPath>,
+    cx: &App,
+) -> Color {
+    let severity = project
+        .zip(project_path)
+        .and_then(|(project, project_path)| {
+            path::breadcrumb_diagnostic_severity(
+                project.read(cx),
+                project_path,
+                BreadcrumbDirectoryListingSettings::get_global(cx).show_diagnostics,
+                cx,
+            )
+        });
+    crate::items::entry_diagnostic_aware_icon_decoration_and_color(severity)
+        .map(|(_, color)| color)
+        .unwrap_or(Color::Muted)
 }
 
 /// Where the file name starts, shared between painting and measuring.
@@ -1092,26 +1448,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_breadcrumb_segment_file_icon_suppressed_when_a_prefix_is_present() {
-        let icon: SharedString = "icons/file.svg".into();
-        assert_eq!(
-            breadcrumb_segment_file_icon(Some(icon.clone()), true),
-            None,
-            "a prefix icon already renders one"
-        );
-        assert_eq!(
-            breadcrumb_segment_file_icon(Some(icon.clone()), false),
-            Some(icon),
-            "no prefix means the segment icon is the only one"
-        );
-        assert_eq!(breadcrumb_segment_file_icon(None, false), None);
-    }
-
-    #[test]
     fn test_flatten_text_for_single_line_display_preserves_byte_offsets() {
         // Byte-offset ranges must locate the same substring in both strings.
-        let original = "fn outer() {\n    inner()\n}";
-        let flattened = flatten_text_for_single_line_display(original);
+        let original = SharedString::from("fn outer() {\n    inner()\n}");
+        let flattened = flatten_text_for_single_line_display(&original);
 
         assert_eq!(flattened, "fn outer() {     inner() }");
         assert_eq!(flattened.len(), original.len());
@@ -1124,84 +1464,15 @@ mod tests {
     }
 
     #[test]
-    fn test_is_file_breadcrumb_segment_requires_the_bare_file_target() {
-        let file_target = BreadcrumbSegmentTarget::Symbol {
-            buffer_id: BufferId::new(1).unwrap(),
-            item: None,
-            is_active_segment: true,
-        };
-        assert!(is_file_breadcrumb_segment(
-            BreadcrumbSegmentKind::File,
-            Some(&file_target)
-        ));
-
-        let directory_target = BreadcrumbSegmentTarget::Directory {
-            worktree_id: WorktreeId::from_usize(0),
-            path: RelPath::empty().into(),
-            active_path: None,
-            is_active_segment: true,
-        };
-        assert!(
-            !is_file_breadcrumb_segment(BreadcrumbSegmentKind::File, Some(&directory_target)),
-            "a navigated bar can put a Directory at file_segment_index"
-        );
-
-        assert!(!is_file_breadcrumb_segment(
-            BreadcrumbSegmentKind::Middle,
-            Some(&file_target)
-        ));
-    }
-
-    #[test]
-    fn test_breadcrumb_row_is_expanded_stays_false_for_a_multibuffer_header() {
-        assert!(
-            !breadcrumb_row_is_expanded(true, true),
-            "a header row has no scroll container to contain an expanded trail"
-        );
-        assert!(breadcrumb_row_is_expanded(false, true));
-        assert!(!breadcrumb_row_is_expanded(false, false));
-    }
-
-    #[test]
-    fn test_breadcrumb_ellipsis_is_interactive_only_off_a_multibuffer_header() {
-        assert!(
-            !breadcrumb_ellipsis_is_interactive(true),
-            "a header row's ellipsis can never expand it, so it must not offer to"
-        );
-        assert!(breadcrumb_ellipsis_is_interactive(false));
-    }
-
-    #[test]
-    fn test_dirty_filename_text_style_only_changes_font_weight() {
+    fn test_dirty_filename_styles_only_change_font_weight() {
         let mut base = gpui::TextStyle::default();
         base.color = gpui::red();
 
         let dirty = dirty_filename_text_style(&base);
-
         assert_eq!(dirty.color, base.color, "the git status color must survive");
         assert_eq!(dirty.font_weight, FontWeight::BOLD);
-    }
 
-    #[test]
-    fn test_file_segment_symbol_target_is_set_even_when_not_navigable() {
-        let buffer_id = BufferId::new(1).unwrap();
-
-        let target = file_segment_symbol_target(buffer_id, false)
-            .expect("the file segment always gets a target, navigable or not");
-        assert!(matches!(
-            target,
-            BreadcrumbSegmentTarget::Symbol {
-                item: None,
-                is_active_segment: false,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn test_dirty_filename_highlight_style_carries_no_color() {
         let highlight = dirty_filename_highlight_style();
-
         assert_eq!(
             highlight.color, None,
             "color must fall through to the base run's"
@@ -1250,40 +1521,439 @@ mod tests {
         });
     }
 
-    fn breadcrumb_row_scroll_range(expanded: bool, cx: &mut gpui::TestAppContext) -> Pixels {
+    #[gpui::test]
+    fn test_symbol_trail_survives_an_outline_that_lost_the_drilled_range(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        crate::editor_tests::init_test(cx, |_| {});
+
+        let buffer = cx.new(|cx| language::Buffer::local("fn alpha() {}\nfn beta() {}\n", cx));
+        let multi_buffer = cx.new(|cx| multi_buffer::MultiBuffer::singleton(buffer.clone(), cx));
+        let editor_window =
+            cx.add_window(|window, cx| crate::test::build_editor(multi_buffer, window, cx));
+        let editor = editor_window.root(cx).unwrap();
+        let buffer_id = buffer.read_with(cx, |buffer, _| buffer.remote_id());
+
+        let (version, item_alpha, item_beta) = buffer.read_with(cx, |buffer, _| {
+            let snapshot = buffer.snapshot();
+            let make = |start: usize, end: usize, text: &str| OutlineItem {
+                depth: 0,
+                range: snapshot.anchor_before(start)..snapshot.anchor_after(end),
+                selection_range: snapshot.anchor_before(start)..snapshot.anchor_after(end),
+                source_range_for_text: snapshot.anchor_before(start)..snapshot.anchor_after(end),
+                text: text.into(),
+                highlight_ranges: Vec::new(),
+                name_ranges: Vec::new(),
+                body_range: None,
+                annotation_range: None,
+            };
+            (
+                buffer.version(),
+                make(0, 13, "fn alpha"),
+                make(14, 26, "fn beta"),
+            )
+        });
+
+        editor.update(cx, |editor, cx| {
+            editor.set_breadcrumb_outline(buffer_id, version.clone(), vec![item_alpha], cx);
+        });
+        let stored = editor.read_with(cx, |editor, cx| {
+            editor
+                .breadcrumb_symbol_menu_items(buffer_id, None, cx)
+                .first()
+                .cloned()
+                .expect("the fresh outline lists its one symbol")
+        });
+        editor.read_with(cx, |editor, cx| {
+            assert_eq!(
+                editor.breadcrumb_symbol_trail(buffer_id, &stored, cx).len(),
+                1,
+                "sanity: the fresh outline resolves the trail"
+            );
+        });
+
+        editor.update(cx, |editor, cx| {
+            editor.set_breadcrumb_outline(buffer_id, version, vec![item_beta], cx);
+        });
+        editor.read_with(cx, |editor, cx| {
+            assert!(
+                editor
+                    .breadcrumb_symbol_trail(buffer_id, &stored, cx)
+                    .is_empty(),
+                "sanity: the replaced outline no longer contains the drilled range"
+            );
+            let trail = symbol_trail_with_fallback(editor, buffer_id, &stored, cx);
+            assert_eq!(
+                trail
+                    .iter()
+                    .map(|item| item.text.clone())
+                    .collect::<Vec<_>>(),
+                vec![stored.text.clone()],
+                "the stored segment must survive a lookup miss instead of vanishing"
+            );
+        });
+    }
+
+    /// Moving the buffer to a new path key rebuilds its excerpts without
+    /// touching the buffer version, which is the cache key.
+    #[gpui::test]
+    fn test_cached_symbol_trail_follows_multibuffer_layout_changes(cx: &mut gpui::TestAppContext) {
+        crate::editor_tests::init_test(cx, |_| {});
+
+        let buffer = cx.new(|cx| language::Buffer::local("fn alpha() {}\n", cx));
+        let excerpt_ranges = vec![multi_buffer::ExcerptRange::new(
+            language::Point::new(0, 0)..language::Point::new(0, 13),
+        )];
+        let multi_buffer = cx.new(|cx| {
+            let mut multi_buffer = multi_buffer::MultiBuffer::new(language::Capability::ReadWrite);
+            multi_buffer.set_excerpt_ranges_for_path(
+                multi_buffer::PathKey::sorted(0),
+                buffer.clone(),
+                &buffer.read(cx).snapshot(),
+                excerpt_ranges.clone(),
+                cx,
+            );
+            multi_buffer
+        });
+        let editor_window =
+            cx.add_window(|window, cx| crate::test::build_editor(multi_buffer.clone(), window, cx));
+        let editor = editor_window.root(cx).unwrap();
+        let buffer_id = buffer.read_with(cx, |buffer, _| buffer.remote_id());
+
+        let (version, item) = buffer.read_with(cx, |buffer, _| {
+            let snapshot = buffer.snapshot();
+            let item = OutlineItem {
+                depth: 0,
+                range: snapshot.anchor_before(0)..snapshot.anchor_after(13),
+                selection_range: snapshot.anchor_before(0)..snapshot.anchor_after(13),
+                source_range_for_text: snapshot.anchor_before(0)..snapshot.anchor_after(13),
+                text: "fn alpha".into(),
+                highlight_ranges: Vec::new(),
+                name_ranges: Vec::new(),
+                body_range: None,
+                annotation_range: None,
+            };
+            (buffer.version(), item)
+        });
+        editor.update(cx, |editor, cx| {
+            editor.set_breadcrumb_outline(buffer_id, version, vec![item], cx);
+        });
+        let stored = editor.read_with(cx, |editor, cx| {
+            editor
+                .breadcrumb_symbol_menu_items(buffer_id, None, cx)
+                .first()
+                .cloned()
+                .expect("the fresh outline lists its one symbol")
+        });
+        editor.read_with(cx, |editor, cx| {
+            let trail = symbol_trail_with_fallback(editor, buffer_id, &stored, cx);
+            assert_eq!(trail.len(), 1, "sanity: the first read populates the cache");
+        });
+
+        multi_buffer.update(cx, |multi_buffer, cx| {
+            multi_buffer.set_excerpt_ranges_for_path(
+                multi_buffer::PathKey::sorted(1),
+                buffer.clone(),
+                &buffer.read(cx).snapshot(),
+                excerpt_ranges,
+                cx,
+            );
+        });
+
+        editor.read_with(cx, |editor, cx| {
+            let expected = editor
+                .breadcrumb_symbol_menu_items(buffer_id, None, cx)
+                .first()
+                .cloned()
+                .expect("the moved excerpts still list the symbol");
+            let trail = symbol_trail_with_fallback(editor, buffer_id, &stored, cx);
+            assert_eq!(
+                trail.last().map(|item| item.range.clone()),
+                Some(expected.range),
+                "a cached trail must be re-anchored into the current multibuffer layout"
+            );
+        });
+    }
+
+    struct DismissEmitter;
+
+    impl gpui::EventEmitter<gpui::DismissEvent> for DismissEmitter {}
+
+    #[gpui::test]
+    fn test_breadcrumb_zone_mouse_down_keeps_trail_expanded_through_dismiss(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        crate::editor_tests::init_test(cx, |_| {});
+
+        let buffer = cx.new(|cx| language::Buffer::local("fn main() {}", cx));
+        let buffer = cx.new(|cx| multi_buffer::MultiBuffer::singleton(buffer, cx));
+        let editor_window =
+            cx.add_window(|window, cx| crate::test::build_editor(buffer, window, cx));
+        let editor = editor_window.root(cx).unwrap();
+        let worktree_id = WorktreeId::from_usize(0);
+        let path = RelPath::empty().into_arc();
+        let picker = cx.new(|_| DismissEmitter);
+
+        // Production ordering: the bar's capture handler notes the mouse-down,
+        // then `PopoverMenu` emits a dismiss from the same click; the emitted
+        // event reaches the subscription only after this update returns.
+        editor_window
+            .update(cx, |editor, window, cx| {
+                editor.expand_breadcrumb_trail(cx);
+                editor.open_breadcrumb_navigation(worktree_id, path.clone(), cx);
+                editor.watch_breadcrumb_dismissal(&picker, worktree_id, path.clone(), cx);
+                editor.note_breadcrumb_zone_mouse_down(window, cx);
+                picker.update(cx, |_, cx| cx.emit(gpui::DismissEvent));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        editor.read_with(cx, |editor, _| {
+            assert!(
+                editor.breadcrumb_navigation().is_none(),
+                "the dismiss must still close the session"
+            );
+            assert!(
+                editor.breadcrumb_expanded(),
+                "a dismiss caused by a click on the bar must not collapse the trail"
+            );
+        });
+
+        cx.update_window(editor_window.into(), |_, window, cx| {
+            window.simulate_next_frame(cx)
+        })
+        .unwrap();
+        editor.read_with(cx, |editor, _| {
+            assert!(
+                !editor.breadcrumb_zone_mouse_down(),
+                "the next frame must clear the one-frame flag"
+            );
+        });
+
+        // Same dismiss with no preceding mouse-down on the bar: collapses.
+        editor_window
+            .update(cx, |editor, _, cx| {
+                editor.open_breadcrumb_navigation(worktree_id, path.clone(), cx);
+                editor.watch_breadcrumb_dismissal(&picker, worktree_id, path.clone(), cx);
+                picker.update(cx, |_, cx| cx.emit(gpui::DismissEvent));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        editor.read_with(cx, |editor, _| {
+            assert!(
+                !editor.breadcrumb_expanded(),
+                "a dismiss from outside the bar still collapses the trail"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_bar_file_icon_tint_does_not_require_diagnostic_badges(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use language::{Diagnostic, DiagnosticEntry, DiagnosticSourceKind};
+        use lsp::{DiagnosticSeverity as LspDiagnosticSeverity, LanguageServerId};
+        use project::{FakeFs, Project, ProjectPath};
+        use serde_json::json;
+        use std::path::Path;
+        use text::{PointUtf16, Unclipped};
+        use util::path;
+
+        crate::editor_tests::init_test(cx, |_| {});
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root"), json!({ "error.txt": "" }))
+            .await;
+        let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+        let worktree_id = project.update(cx, |project, cx| {
+            project.worktrees(cx).next().unwrap().read(cx).id()
+        });
+        cx.run_until_parked();
+
+        let lsp_store = project.read_with(cx, |project, _| project.lsp_store());
+        lsp_store.update(cx, |lsp_store, cx| {
+            lsp_store
+                .update_diagnostic_entries(
+                    LanguageServerId(0),
+                    Path::new(path!("/root/error.txt")).to_owned(),
+                    None,
+                    None,
+                    vec![DiagnosticEntry {
+                        range: Unclipped(PointUtf16::new(0, 0))..Unclipped(PointUtf16::new(0, 1)),
+                        diagnostic: Diagnostic {
+                            severity: LspDiagnosticSeverity::ERROR,
+                            is_primary: true,
+                            message: "boom".to_string(),
+                            source_kind: DiagnosticSourceKind::Pushed,
+                            ..Diagnostic::default()
+                        },
+                    }],
+                    cx,
+                )
+                .unwrap();
+        });
+        cx.run_until_parked();
+
+        let project_path = ProjectPath {
+            worktree_id,
+            path: util::rel_path::rel_path("error.txt").into_arc(),
+        };
+        let color = cx.update(|cx| bar_file_icon_color(Some(&project), Some(&project_path), cx));
+        assert_eq!(
+            color,
+            Color::Error,
+            "the bar tint must not depend on the picker-only diagnostic_badges setting"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_leading_file_icon_inherits_diagnostic_tint_when_tab_bar_hidden(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use language::{Diagnostic, DiagnosticEntry, DiagnosticSourceKind};
+        use lsp::{DiagnosticSeverity as LspDiagnosticSeverity, LanguageServerId};
+        use project::{FakeFs, Project};
+        use serde_json::json;
+        use settings::SettingsStore;
+        use std::path::Path;
+        use text::{PointUtf16, Unclipped};
+        use util::path;
+
+        crate::editor_tests::init_test(cx, |_| {});
+        cx.update(|cx| {
+            cx.update_global::<SettingsStore, _>(|settings, cx| {
+                settings.update_user_settings(cx, |settings| {
+                    settings.tab_bar.get_or_insert_default().show = Some(false);
+                    settings.tabs.get_or_insert_default().file_icons = Some(true);
+                });
+            });
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root"), json!({ "error.txt": "boom" }))
+            .await;
+        let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+        cx.run_until_parked();
+
+        let lsp_store = project.read_with(cx, |project, _| project.lsp_store());
+        lsp_store.update(cx, |lsp_store, cx| {
+            lsp_store
+                .update_diagnostic_entries(
+                    LanguageServerId(0),
+                    Path::new(path!("/root/error.txt")).to_owned(),
+                    None,
+                    None,
+                    vec![DiagnosticEntry {
+                        range: Unclipped(PointUtf16::new(0, 0))..Unclipped(PointUtf16::new(0, 1)),
+                        diagnostic: Diagnostic {
+                            severity: LspDiagnosticSeverity::ERROR,
+                            is_primary: true,
+                            message: "boom".to_string(),
+                            source_kind: DiagnosticSourceKind::Pushed,
+                            ..Diagnostic::default()
+                        },
+                    }],
+                    cx,
+                )
+                .unwrap();
+        });
+        cx.run_until_parked();
+
+        let buffer = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer(path!("/root/error.txt"), cx)
+            })
+            .await
+            .unwrap();
+        let multi_buffer = cx.new(|cx| multi_buffer::MultiBuffer::singleton(buffer, cx));
+        let editor_window = cx.add_window(|window, cx| {
+            crate::test::build_editor_with_project(project.clone(), multi_buffer, window, cx)
+        });
+        let editor = editor_window.root(cx).unwrap();
+
+        let icon = editor.read_with(cx, |editor, cx| editor.breadcrumb_prefix_icon(cx));
+        let (_, color) = icon.expect("a hidden tab bar must yield a leading icon");
+        assert_eq!(
+            color,
+            Color::Error,
+            "the leading icon must carry the same diagnostic tint as the file segment"
+        );
+    }
+
+    fn draw_breadcrumb_row(
+        labels: Vec<SharedString>,
+        expanded: bool,
+        cx: &mut gpui::TestAppContext,
+    ) -> (Pixels, Pixels) {
+        draw_breadcrumb_row_in_container(labels, expanded, px(200.), None, cx)
+    }
+
+    fn draw_breadcrumb_row_in_container(
+        labels: Vec<SharedString>,
+        expanded: bool,
+        container_width: Pixels,
+        anchored_index: Option<usize>,
+        cx: &mut gpui::TestAppContext,
+    ) -> (Pixels, Pixels) {
         crate::editor_tests::init_test(cx, |_| {});
         let scroll_handle = gpui::ScrollHandle::new();
+        let painted_extent = Rc::new(std::cell::Cell::new(Pixels::ZERO));
         let window = cx.add_window({
             let scroll_handle = scroll_handle.clone();
+            let painted_extent = painted_extent.clone();
             move |_, _| ScrollProbe {
+                labels,
                 expanded,
+                container_width,
+                anchored_index,
                 scroll_handle,
+                painted_extent,
             }
         });
         cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
             .unwrap();
-        scroll_handle.max_offset().x
+        (scroll_handle.max_offset().x, painted_extent.get())
+    }
+
+    fn breadcrumb_row_scroll_range(expanded: bool, cx: &mut gpui::TestAppContext) -> Pixels {
+        let labels = (0..12)
+            .map(|index| SharedString::from(format!("directory-with-a-long-name-{index}")))
+            .collect();
+        draw_breadcrumb_row(labels, expanded, cx).0
     }
 
     struct ScrollProbe {
+        labels: Vec<SharedString>,
         expanded: bool,
+        container_width: Pixels,
+        anchored_index: Option<usize>,
         scroll_handle: gpui::ScrollHandle,
+        painted_extent: Rc<std::cell::Cell<Pixels>>,
     }
 
     impl Render for ScrollProbe {
-        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            let segments = (0..12)
-                .map(|index| PreparedBreadcrumbSegment {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let segments = self
+                .labels
+                .iter()
+                .enumerate()
+                .map(|(index, label)| PreparedBreadcrumbSegment {
                     kind: BreadcrumbSegmentKind::Middle,
                     label: HighlightedText {
-                        text: format!("directory-with-a-long-name-{index}").into(),
+                        text: label.clone(),
                         highlights: Vec::new(),
                     },
-                    target: None,
+                    target: (self.anchored_index == Some(index)).then(|| {
+                        BreadcrumbSegmentTarget::Symbol {
+                            buffer_id: BufferId::new(1).unwrap(),
+                            item: None,
+                            is_active_segment: true,
+                        }
+                    }),
                     dirty_filename_style: false,
                     icon: None,
                     icon_color: Color::Muted,
                     label_color: Color::Muted,
+                    hard_cap_ellipsis: false,
                 })
                 .collect();
             let row = BreadcrumbsRow {
@@ -1292,17 +1962,25 @@ mod tests {
                 expanded: self.expanded,
                 file_outlives_symbols: false,
                 multibuffer_header: false,
+                painted_extent: Some(self.painted_extent.clone()),
             };
             // Mirrors the real chain, clipping box and nested rows included.
-            h_flex().w(px(200.)).overflow_x_hidden().child(
+            h_flex().w(self.container_width).overflow_x_hidden().child(
                 h_flex().flex_grow_1().min_w_0().child(
                     h_flex().min_w_0().child(
                         h_flex()
-                            .id("breadcrumb-trail")
                             .min_w_0()
-                            .overflow_x_scroll()
+                            .child(row)
+                            .custom_scrollbars(
+                                Scrollbars::new(ScrollAxes::Horizontal)
+                                    .thumb_geometry(px(4.), px(1.))
+                                    .tracked_scroll_handle(&self.scroll_handle),
+                                window,
+                                cx,
+                            )
+                            // A tracked handle skips the automatic wiring an untracked one gets.
                             .track_scroll(&self.scroll_handle)
-                            .child(row),
+                            .overflow_x_scroll(),
                     ),
                 ),
             )
@@ -1319,6 +1997,131 @@ mod tests {
         assert!(
             breadcrumb_row_scroll_range(true, cx) > px(0.),
             "an expanded row must overflow its container for the scroll container to reach the tail"
+        );
+    }
+
+    #[gpui::test]
+    fn test_collapsed_row_truncates_an_oversized_last_segment(cx: &mut gpui::TestAppContext) {
+        let label = SharedString::from(
+            "a-single-segment-name-far-wider-than-the-two-hundred-pixel-container-it-lives-in",
+        );
+
+        let (_, natural_extent) = draw_breadcrumb_row(vec![label.clone()], true, cx);
+        assert!(
+            natural_extent > px(200.),
+            "sanity: untruncated, the label must overflow the container, got {natural_extent:?}"
+        );
+
+        let (scroll_range, painted_extent) = draw_breadcrumb_row(vec![label], false, cx);
+        assert_eq!(
+            scroll_range,
+            px(0.),
+            "a collapsed row must fit its container instead of scrolling"
+        );
+        assert!(
+            painted_extent <= px(200.),
+            "the last segment must ellipsize instead of painting past the container, got {painted_extent:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn test_anchored_middle_segment_keeps_the_last_label_inside_the_row(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let middle =
+            SharedString::from("an-anchored-middle-segment-that-eats-nearly-the-whole-row");
+
+        let (_, middle_extent) =
+            draw_breadcrumb_row_in_container(vec![middle.clone()], true, px(200.), None, cx);
+        // Leaves the last segment far less room than its natural width.
+        let container = middle_extent + px(30.);
+        let (_, painted_extent) = draw_breadcrumb_row_in_container(
+            vec![middle, SharedString::from("file-name")],
+            false,
+            container,
+            Some(0),
+            cx,
+        );
+        assert!(
+            painted_extent <= container,
+            "the truncated last label must stay inside the row, got {painted_extent:?} in {container:?}"
+        );
+    }
+
+    struct EllipsisFallbackProbe {
+        editor: WeakEntity<Editor>,
+    }
+
+    impl Render for EllipsisFallbackProbe {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let row = BreadcrumbsRow {
+                segments: vec![PreparedBreadcrumbSegment {
+                    kind: BreadcrumbSegmentKind::Middle,
+                    label: HighlightedText {
+                        text: "⋯".into(),
+                        highlights: Vec::new(),
+                    },
+                    target: None,
+                    dirty_filename_style: false,
+                    icon: None,
+                    icon_color: Color::Muted,
+                    label_color: Color::Muted,
+                    hard_cap_ellipsis: true,
+                }],
+                editor: Some(self.editor.clone()),
+                expanded: false,
+                file_outlives_symbols: false,
+                multibuffer_header: false,
+                painted_extent: None,
+            };
+            // The bar-level fallback from `render_breadcrumb_text`, reduced to its clipboard write.
+            div()
+                .size_full()
+                .on_mouse_down(gpui::MouseButton::Right, |_, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string("fallback".to_string()))
+                })
+                .child(div().w(px(60.)).h(px(22.)).child(row))
+        }
+    }
+
+    #[gpui::test]
+    fn test_right_click_on_ellipsis_does_not_reach_the_copy_fallback(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        crate::editor_tests::init_test(cx, |_| {});
+
+        let buffer = cx.new(|cx| language::Buffer::local("fn main() {}", cx));
+        let buffer = cx.new(|cx| multi_buffer::MultiBuffer::singleton(buffer, cx));
+        let editor_window =
+            cx.add_window(|window, cx| crate::test::build_editor(buffer, window, cx));
+        let editor = editor_window.root(cx).unwrap().downgrade();
+
+        let probe_window = cx.add_window(|_, _| EllipsisFallbackProbe { editor });
+        let cx = &mut gpui::VisualTestContext::from_window(probe_window.into(), cx);
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+
+        cx.simulate_mouse_down(
+            point(px(8.), px(11.)),
+            gpui::MouseButton::Right,
+            gpui::Modifiers::none(),
+        );
+        assert!(
+            cx.read_from_clipboard().is_none(),
+            "the ellipsis must swallow the right click instead of copying the file path"
+        );
+
+        cx.simulate_mouse_down(
+            point(px(300.), px(300.)),
+            gpui::MouseButton::Right,
+            gpui::Modifiers::none(),
+        );
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("fallback".to_string()),
+            "sanity: away from the ellipsis the same click reaches the fallback"
         );
     }
 }

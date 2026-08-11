@@ -7,8 +7,14 @@ use workspace::{
     item::{HighlightedText, ItemEvent, ItemHandle},
 };
 
-type RenderBreadcrumbTextFn =
-    fn(Vec<HighlightedText>, Option<AnyElement>, &dyn ItemHandle, bool, &App) -> AnyElement;
+type RenderBreadcrumbTextFn = fn(
+    Vec<HighlightedText>,
+    Option<AnyElement>,
+    &dyn ItemHandle,
+    bool,
+    &mut Window,
+    &mut App,
+) -> AnyElement;
 
 pub struct RenderBreadcrumbText(pub RenderBreadcrumbTextFn);
 
@@ -57,10 +63,20 @@ impl Render for Breadcrumbs {
 
         let prefix_element = active_item.breadcrumb_prefix(window, cx);
 
-        let Some(render_fn) = cx.try_global::<RenderBreadcrumbText>() else {
+        let Some(render_fn) = cx
+            .try_global::<RenderBreadcrumbText>()
+            .map(|global| global.0)
+        else {
             return element.into_any_element();
         };
-        let content = (render_fn.0)(segments, prefix_element, active_item.as_ref(), false, cx);
+        let content = render_fn(
+            segments,
+            prefix_element,
+            active_item.as_ref(),
+            false,
+            window,
+            cx,
+        );
         match font {
             Some(font) => div()
                 .flex_grow_1()
@@ -81,13 +97,7 @@ impl ToolbarItemView for Breadcrumbs {
         cx: &mut Context<Self>,
     ) -> ToolbarItemLocation {
         cx.notify();
-        let switching_away = self.active_item.as_ref().is_some_and(|previous| {
-            Some(previous.item_id()) != active_pane_item.map(ItemHandle::item_id)
-        });
-        let previous_item = self.active_item.take();
-        if switching_away && let Some(previous_item) = previous_item {
-            previous_item.breadcrumb_cancel_reanchor(cx);
-        }
+        self.active_item = None;
 
         let Some(item) = active_pane_item else {
             return ToolbarItemLocation::Hidden;

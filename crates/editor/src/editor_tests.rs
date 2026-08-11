@@ -405,7 +405,7 @@ fn test_stale_breadcrumb_dismissal_does_not_clobber_newer_navigation(cx: &mut Te
     });
     drain_reanchor(cx);
     _ = editor.update(cx, |editor, _, _cx| {
-        assert!(!editor.breadcrumb_reanchoring);
+        assert!(!editor.breadcrumb_reanchoring());
         let navigation = editor.breadcrumb_navigation().unwrap();
         assert_eq!(navigation.active_path, bin_path);
         assert!(navigation.navigated);
@@ -434,7 +434,7 @@ fn test_stale_breadcrumb_dismissal_does_not_clobber_newer_navigation(cx: &mut Te
     });
     drain_reanchor(cx);
     _ = editor.update(cx, |editor, _, _cx| {
-        assert!(!editor.breadcrumb_reanchoring);
+        assert!(!editor.breadcrumb_reanchoring());
         let navigation = editor
             .breadcrumb_navigation()
             .expect("choosing a directory row must not clear the navigation session");
@@ -489,12 +489,12 @@ fn test_reanchoring_guard_survives_same_identity_reselection(cx: &mut TestAppCon
         });
     });
     _ = editor.update(cx, |editor, _, _| {
-        assert!(!editor.breadcrumb_reanchoring);
+        assert!(!editor.breadcrumb_reanchoring());
     });
 
     _ = editor.update(cx, |editor, window, cx| {
         editor.navigate_breadcrumb_to(worktree_id, src_path.clone(), window, cx);
-        assert!(editor.breadcrumb_reanchoring);
+        assert!(editor.breadcrumb_reanchoring());
     });
 
     _ = editor.update(cx, |editor, _, cx| {
@@ -545,125 +545,111 @@ fn test_open_breadcrumb_navigation_keeps_navigated_for_ancestor_segment(cx: &mut
 fn test_cancel_breadcrumb_reanchor_clears_stuck_state(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 
-    let buffer = cx.new(|cx| language::Buffer::local("fn main() {}", cx));
-    let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
-    let editor = cx.add_window(|window, cx| build_editor(buffer, window, cx));
-    let worktree_id = project::WorktreeId::from_usize(0);
-    let src_path = rel_path("src").into_arc();
+    // The cancel may land before or after the deferred reanchor closure has queued.
+    for park_before_cancel in [true, false] {
+        let buffer = cx.new(|cx| language::Buffer::local("fn main() {}", cx));
+        let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+        let editor = cx.add_window(|window, cx| build_editor(buffer, window, cx));
+        let worktree_id = project::WorktreeId::from_usize(0);
+        let src_path = rel_path("src").into_arc();
 
-    _ = editor.update(cx, |editor, window, cx| {
-        editor.navigate_breadcrumb_to(worktree_id, src_path.clone(), window, cx);
-        assert!(editor.breadcrumb_reanchoring);
-    });
-    cx.run_until_parked();
-    _ = editor.update(cx, |editor, _, _| {
-        assert!(
-            editor.breadcrumb_pending_reanchor().is_some(),
-            "the deferred reanchor must have queued before we cancel it"
-        );
-    });
-
-    _ = editor.update(cx, |editor, _, cx| {
-        editor.cancel_breadcrumb_reanchor(cx);
-        assert!(!editor.breadcrumb_reanchoring);
-        assert!(editor.breadcrumb_pending_reanchor().is_none());
-        assert!(
-            editor.breadcrumb_navigation().is_none(),
-            "a cancelled reanchor must not leave stale navigation for the next prepaint"
-        );
-    });
-}
-
-#[gpui::test]
-fn test_breadcrumb_expanded_clears_on_cancel_reanchor(cx: &mut TestAppContext) {
-    init_test(cx, |_| {});
-
-    let buffer = cx.new(|cx| language::Buffer::local("fn main() {}", cx));
-    let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
-    let editor = cx.add_window(|window, cx| build_editor(buffer, window, cx));
-
-    _ = editor.update(cx, |editor, _, cx| {
-        editor.expand_breadcrumb_trail(cx);
-        assert!(editor.breadcrumb_expanded());
-
-        editor.cancel_breadcrumb_reanchor(cx);
-        assert!(
-            !editor.breadcrumb_expanded(),
-            "switching the active item must collapse an expanded bar"
-        );
-    });
-}
-
-#[gpui::test]
-fn test_breadcrumb_expanded_clears_on_selection_change(cx: &mut TestAppContext) {
-    init_test(cx, |_| {});
-
-    let buffer = cx.new(|cx| language::Buffer::local("fn main() {}", cx));
-    let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
-    let editor = cx.add_window(|window, cx| build_editor(buffer, window, cx));
-
-    _ = editor.update(cx, |editor, window, cx| {
-        editor.expand_breadcrumb_trail(cx);
-        assert!(editor.breadcrumb_expanded());
-
-        editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-            s.select_ranges([MultiBufferOffset(2)..MultiBufferOffset(2)])
+        _ = editor.update(cx, |editor, window, cx| {
+            editor.navigate_breadcrumb_to(worktree_id, src_path.clone(), window, cx);
+            assert!(editor.breadcrumb_reanchoring());
         });
+        if park_before_cancel {
+            cx.run_until_parked();
+            _ = editor.update(cx, |editor, _, _| {
+                assert!(
+                    editor.breadcrumb_reanchor_pending(),
+                    "the deferred reanchor must have queued before we cancel it"
+                );
+            });
+        }
 
-        assert!(
-            !editor.breadcrumb_expanded(),
-            "clicking into the editor must collapse an expanded bar"
-        );
-    });
-}
-
-#[gpui::test]
-fn test_breadcrumb_expanded_survives_selection_change_during_dropdown_session(
-    cx: &mut TestAppContext,
-) {
-    init_test(cx, |_| {});
-
-    let buffer = cx.new(|cx| language::Buffer::local("fn main() {}", cx));
-    let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
-    let editor = cx.add_window(|window, cx| build_editor(buffer, window, cx));
-    let worktree_id = project::WorktreeId::from_usize(0);
-
-    _ = editor.update(cx, |editor, window, cx| {
-        editor.expand_breadcrumb_trail(cx);
-        editor.open_breadcrumb_navigation(worktree_id, rel_path("src").into_arc(), cx);
-
-        editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-            s.select_ranges([MultiBufferOffset(2)..MultiBufferOffset(2)])
+        _ = editor.update(cx, |editor, _, cx| {
+            editor.cancel_breadcrumb_reanchor(cx);
+            assert!(!editor.breadcrumb_reanchoring());
+            assert!(!editor.breadcrumb_reanchor_pending());
+            assert!(
+                editor.breadcrumb_navigation().is_none(),
+                "a cancelled reanchor must not leave stale navigation for the next prepaint"
+            );
         });
-
-        assert!(
-            editor.breadcrumb_expanded(),
-            "an open dropdown must not let a selection change collapse the bar"
-        );
-    });
+        cx.run_until_parked();
+        _ = editor.update(cx, |editor, _, _| {
+            assert!(
+                !editor.breadcrumb_reanchor_pending(),
+                "a reanchor cancelled before its deferred closure ran must not be re-armed"
+            );
+        });
+    }
 }
 
 #[gpui::test]
-fn test_ending_a_symbol_dropdown_session_collapses_the_expanded_trail(cx: &mut TestAppContext) {
+fn test_breadcrumb_expanded_collapse_triggers(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 
-    let buffer = cx.new(|cx| language::Buffer::local("fn main() {}", cx));
-    let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
-    let editor = cx.add_window(|window, cx| build_editor(buffer, window, cx));
-    let buffer_id = BufferId::new(1).unwrap();
+    struct Case {
+        name: &'static str,
+        expanded_after: bool,
+        act: fn(&mut Editor, &mut Window, &mut Context<Editor>),
+    }
+    let cases = [
+        Case {
+            name: "switching the active item must collapse an expanded bar",
+            expanded_after: false,
+            act: |editor, _, cx| editor.cancel_breadcrumb_reanchor(cx),
+        },
+        Case {
+            name: "clicking into the editor must collapse an expanded bar",
+            expanded_after: false,
+            act: |editor, window, cx| {
+                editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
+                    s.select_ranges([MultiBufferOffset(2)..MultiBufferOffset(2)])
+                });
+            },
+        },
+        Case {
+            name: "an open dropdown must not let a selection change collapse the bar",
+            expanded_after: true,
+            act: |editor, window, cx| {
+                let worktree_id = project::WorktreeId::from_usize(0);
+                editor.open_breadcrumb_navigation(worktree_id, rel_path("src").into_arc(), cx);
+                editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
+                    s.select_ranges([MultiBufferOffset(2)..MultiBufferOffset(2)])
+                });
+            },
+        },
+        Case {
+            name: "the dropdown that kept the trail expanded just dismissed",
+            expanded_after: false,
+            act: |editor, _, cx| {
+                let buffer_id = BufferId::new(1).unwrap();
+                editor.open_breadcrumb_symbol_navigation(buffer_id, None, cx);
+                assert!(editor.breadcrumb_expanded());
+                editor.clear_breadcrumb_symbol_navigation(buffer_id, None, cx);
+            },
+        },
+    ];
 
-    _ = editor.update(cx, |editor, _, cx| {
-        editor.expand_breadcrumb_trail(cx);
-        editor.open_breadcrumb_symbol_navigation(buffer_id, None, cx);
-        assert!(editor.breadcrumb_expanded());
+    for case in cases {
+        let buffer = cx.new(|cx| language::Buffer::local("fn main() {}", cx));
+        let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+        let editor = cx.add_window(|window, cx| build_editor(buffer, window, cx));
 
-        editor.clear_breadcrumb_symbol_navigation(buffer_id, None, cx);
-
-        assert!(
-            !editor.breadcrumb_expanded(),
-            "the dropdown that kept the trail expanded just dismissed"
-        );
-    });
+        _ = editor.update(cx, |editor, window, cx| {
+            editor.expand_breadcrumb_trail(cx);
+            assert!(editor.breadcrumb_expanded());
+            (case.act)(editor, window, cx);
+            assert_eq!(
+                editor.breadcrumb_expanded(),
+                case.expanded_after,
+                "{}",
+                case.name
+            );
+        });
+    }
 }
 
 #[gpui::test]

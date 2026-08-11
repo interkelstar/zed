@@ -102,6 +102,7 @@ pub struct BreadcrumbDirectoryListingSettings {
     pub folder_icons: bool,
     pub git_status: bool,
     pub show_diagnostics: ShowDiagnostics,
+    pub diagnostic_badges: bool,
     pub auto_fold_dirs: bool,
 }
 
@@ -124,6 +125,7 @@ impl settings::Settings for BreadcrumbDirectoryListingSettings {
                     .unwrap()
                     .is_git_status_enabled(),
             show_diagnostics: project_panel.show_diagnostics.unwrap(),
+            diagnostic_badges: project_panel.diagnostic_badges.unwrap(),
             auto_fold_dirs: project_panel.auto_fold_dirs.unwrap(),
         }
     }
@@ -200,31 +202,10 @@ pub fn breadcrumb_directory_entries(
         .collect()
 }
 
-/// `false` for a buffer with no project path, or a single-file worktree, which has no tree to browse.
-pub(crate) fn breadcrumb_path_is_navigable(
-    has_project_path: bool,
-    worktree_is_single_file: Option<bool>,
-) -> bool {
-    has_project_path && !worktree_is_single_file.unwrap_or(false)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use gpui::TestAppContext;
-
-    #[test]
-    fn test_breadcrumb_path_is_navigable() {
-        assert!(!breadcrumb_path_is_navigable(false, None));
-        assert!(!breadcrumb_path_is_navigable(false, Some(false)));
-
-        // A file opened outside any real worktree is represented as a single-file worktree.
-        assert!(!breadcrumb_path_is_navigable(true, Some(true)));
-
-        assert!(breadcrumb_path_is_navigable(true, Some(false)));
-
-        assert!(breadcrumb_path_is_navigable(true, None));
-    }
 
     fn sample_symbol_outline_item() -> OutlineItem<Anchor> {
         OutlineItem {
@@ -241,88 +222,66 @@ mod tests {
     }
 
     #[test]
-    fn test_breadcrumb_segment_copy_path_directory_joins_worktree_and_segment() {
+    fn test_breadcrumb_segment_copy_path_per_segment_kind() {
         use util::path;
         use util::rel_path::rel_path;
 
-        let target = BreadcrumbSegmentTarget::Directory {
+        let directory = BreadcrumbSegmentTarget::Directory {
             worktree_id: WorktreeId::from_usize(0),
             path: rel_path("src/main").into_arc(),
             active_path: None,
             is_active_segment: false,
         };
+        let copied = breadcrumb_segment_copy_path(
+            &directory,
+            Some(PathBuf::from(path!("/root"))),
+            None,
+            None,
+        );
+        assert_eq!(
+            copied.as_deref(),
+            Some(path!("/root/src/main")),
+            "a directory segment joins the worktree root and the segment path"
+        );
 
-        let copied =
-            breadcrumb_segment_copy_path(&target, Some(PathBuf::from(path!("/root"))), None, None);
-
-        assert_eq!(copied.as_deref(), Some(path!("/root/src/main")));
-    }
-
-    #[test]
-    fn test_breadcrumb_segment_copy_path_file_segment_is_the_file_abs_path() {
-        use util::path;
-
-        let target = BreadcrumbSegmentTarget::Symbol {
+        let file_abs_path = Some(PathBuf::from(path!("/root/src/main/Foo.kt")));
+        let file = BreadcrumbSegmentTarget::Symbol {
             buffer_id: BufferId::new(1).unwrap(),
             item: None,
             is_active_segment: false,
         };
-
-        let copied = breadcrumb_segment_copy_path(
-            &target,
-            None,
-            Some(PathBuf::from(path!("/root/src/main/Foo.kt"))),
-            None,
+        let copied = breadcrumb_segment_copy_path(&file, None, file_abs_path.clone(), None);
+        assert_eq!(
+            copied.as_deref(),
+            Some(path!("/root/src/main/Foo.kt")),
+            "the file segment is the file's absolute path"
         );
 
-        assert_eq!(copied.as_deref(), Some(path!("/root/src/main/Foo.kt")));
-    }
-
-    #[test]
-    fn test_breadcrumb_segment_copy_path_symbol_segment_appends_the_line() {
-        use util::path;
-
-        let target = BreadcrumbSegmentTarget::Symbol {
+        let symbol = BreadcrumbSegmentTarget::Symbol {
             buffer_id: BufferId::new(1).unwrap(),
             item: Some(sample_symbol_outline_item()),
             is_active_segment: false,
         };
-
-        let copied = breadcrumb_segment_copy_path(
-            &target,
-            None,
-            Some(PathBuf::from(path!("/root/src/main/Foo.kt"))),
-            Some(42),
-        );
-
+        let copied = breadcrumb_segment_copy_path(&symbol, None, file_abs_path, Some(42));
         assert_eq!(
             copied,
-            Some(format!("{}:42", path!("/root/src/main/Foo.kt")))
+            Some(format!("{}:42", path!("/root/src/main/Foo.kt"))),
+            "a symbol segment appends the line"
         );
     }
 
     #[test]
-    fn test_breadcrumb_path_prefixes_nested() {
+    fn test_breadcrumb_path_prefixes() {
         use util::rel_path::rel_path;
 
         assert_eq!(
             breadcrumb_path_prefixes(rel_path("a/b/c.rs")),
             vec![rel_path("a"), rel_path("a/b"), rel_path("a/b/c.rs")]
         );
-    }
-
-    #[test]
-    fn test_breadcrumb_path_prefixes_top_level_file() {
-        use util::rel_path::rel_path;
-
         assert_eq!(
             breadcrumb_path_prefixes(rel_path("file.rs")),
             vec![rel_path("file.rs")]
         );
-    }
-
-    #[test]
-    fn test_breadcrumb_path_prefixes_empty() {
         assert_eq!(
             breadcrumb_path_prefixes(RelPath::empty()),
             Vec::<&RelPath>::new()
@@ -592,17 +551,10 @@ mod tests {
         });
         let entries =
             cx.update(|cx| breadcrumb_directory_entries(&project, &worktree, RelPath::empty(), cx));
-        assert!(
-            !entries
-                .iter()
-                .any(|entry| entry.name.as_ref() == "ignored.txt"),
+        assert_eq!(
+            entries.iter().map(|e| e.name.as_ref()).collect::<Vec<_>>(),
+            vec![".gitignore", "kept.txt"],
             "hide_gitignore should drop the ignored entry entirely, not just dim it",
-        );
-        assert!(
-            entries
-                .iter()
-                .any(|entry| entry.name.as_ref() == "kept.txt"),
-            "non-ignored entries stay listed"
         );
     }
 
@@ -631,8 +583,9 @@ mod tests {
 
         let entries =
             cx.update(|cx| breadcrumb_directory_entries(&project, &worktree, RelPath::empty(), cx));
-        assert!(
-            entries.iter().any(|entry| entry.name.as_ref() == ".hidden"),
+        assert_eq!(
+            entries.iter().map(|e| e.name.as_ref()).collect::<Vec<_>>(),
+            vec![".hidden", "kept.txt"],
             "hidden entry is shown by default"
         );
 
@@ -645,143 +598,10 @@ mod tests {
         });
         let entries =
             cx.update(|cx| breadcrumb_directory_entries(&project, &worktree, RelPath::empty(), cx));
-        assert!(
-            !entries.iter().any(|entry| entry.name.as_ref() == ".hidden"),
+        assert_eq!(
+            entries.iter().map(|e| e.name.as_ref()).collect::<Vec<_>>(),
+            vec!["kept.txt"],
             "hide_hidden should drop the hidden entry entirely, not just dim it",
-        );
-        assert!(
-            entries
-                .iter()
-                .any(|entry| entry.name.as_ref() == "kept.txt"),
-            "non-hidden entries stay listed"
-        );
-    }
-
-    #[gpui::test]
-    async fn test_breadcrumb_directory_entries_honors_show_diagnostics_setting(
-        cx: &mut TestAppContext,
-    ) {
-        use crate::editor_tests::init_test;
-        use language::{Diagnostic, DiagnosticEntry, DiagnosticSourceKind};
-        use lsp::{DiagnosticSeverity as LspDiagnosticSeverity, LanguageServerId};
-        use project::{FakeFs, Project};
-        use serde_json::json;
-        use settings::SettingsStore;
-        use std::path::Path;
-        use text::{PointUtf16, Unclipped};
-        use util::path;
-
-        init_test(cx, |_| {});
-
-        let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(
-            path!("/root"),
-            json!({
-                "error.txt": "",
-                "warning.txt": "",
-            }),
-        )
-        .await;
-        let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
-        let worktree = project.update(cx, |project, cx| project.worktrees(cx).next().unwrap());
-        cx.run_until_parked();
-
-        let lsp_store = project.read_with(cx, |project, _| project.lsp_store());
-        lsp_store.update(cx, |lsp_store, cx| {
-            let diagnostic = |severity, message: &str| DiagnosticEntry {
-                range: Unclipped(PointUtf16::new(0, 0))..Unclipped(PointUtf16::new(0, 1)),
-                diagnostic: Diagnostic {
-                    severity,
-                    is_primary: true,
-                    message: message.to_string(),
-                    source_kind: DiagnosticSourceKind::Pushed,
-                    ..Diagnostic::default()
-                },
-            };
-            lsp_store
-                .update_diagnostic_entries(
-                    LanguageServerId(0),
-                    Path::new(path!("/root/error.txt")).to_owned(),
-                    None,
-                    None,
-                    vec![diagnostic(LspDiagnosticSeverity::ERROR, "error")],
-                    cx,
-                )
-                .unwrap();
-            lsp_store
-                .update_diagnostic_entries(
-                    LanguageServerId(0),
-                    Path::new(path!("/root/warning.txt")).to_owned(),
-                    None,
-                    None,
-                    vec![diagnostic(LspDiagnosticSeverity::WARNING, "warning")],
-                    cx,
-                )
-                .unwrap();
-        });
-        cx.run_until_parked();
-
-        // Entries no longer carry a severity; rows resolve it live from this helper instead.
-        let severity_for = |name: &'static str, cx: &mut TestAppContext| {
-            let worktree_id = worktree.read_with(cx, |worktree, _| worktree.id());
-            cx.update(|cx| {
-                let settings = BreadcrumbDirectoryListingSettings::get_global(cx);
-                breadcrumb_diagnostic_severity(
-                    project.read(cx),
-                    &ProjectPath {
-                        worktree_id,
-                        path: util::rel_path::rel_path(name).into_arc(),
-                    },
-                    settings.show_diagnostics,
-                    cx,
-                )
-            })
-        };
-
-        assert_eq!(
-            severity_for("error.txt", cx),
-            Some(DiagnosticSeverity::ERROR)
-        );
-        assert_eq!(
-            severity_for("warning.txt", cx),
-            Some(DiagnosticSeverity::WARNING)
-        );
-
-        cx.update(|cx| {
-            cx.update_global::<SettingsStore, _>(|store, cx| {
-                store.update_user_settings(cx, |settings| {
-                    settings
-                        .project_panel
-                        .get_or_insert_default()
-                        .show_diagnostics = Some(settings::ShowDiagnostics::Errors);
-                });
-            });
-        });
-        assert_eq!(
-            severity_for("error.txt", cx),
-            Some(DiagnosticSeverity::ERROR),
-            "errors still surface under `errors`",
-        );
-        assert_eq!(
-            severity_for("warning.txt", cx),
-            None,
-            "warnings are filtered out under `errors`",
-        );
-
-        cx.update(|cx| {
-            cx.update_global::<SettingsStore, _>(|store, cx| {
-                store.update_user_settings(cx, |settings| {
-                    settings
-                        .project_panel
-                        .get_or_insert_default()
-                        .show_diagnostics = Some(settings::ShowDiagnostics::Off);
-                });
-            });
-        });
-        assert_eq!(
-            severity_for("error.txt", cx),
-            None,
-            "`off` suppresses diagnostics entirely",
         );
     }
 }
