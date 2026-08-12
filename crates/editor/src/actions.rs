@@ -944,6 +944,8 @@ actions!(
         SaveLocation,
         /// Toggles breadcrumbs display.
         ToggleBreadcrumb,
+        /// Opens the dropdown of the breadcrumb trail's last segment.
+        OpenBreadcrumbDropdown,
     ]
 );
 

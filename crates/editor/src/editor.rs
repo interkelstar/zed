@@ -22,7 +22,7 @@ mod document_colors;
 mod document_links;
 mod document_symbols;
 use document_symbols::BreadcrumbOutline;
-use element::BreadcrumbState;
+use element::{BreadcrumbState, breadcrumb_leaf_navigation};
 mod editor_settings;
 mod element;
 mod fold;
@@ -9907,6 +9907,7 @@ impl Editor {
         }
 
         if old_breadcrumbs_visible != self.breadcrumbs_visible() {
+            self.close_breadcrumbs_when_hidden(old_breadcrumbs_visible, cx);
             cx.emit(EditorEvent::BreadcrumbsChanged);
         }
 
@@ -11165,15 +11166,7 @@ impl Editor {
                 active_path: path,
                 navigated: true,
             });
-        cx.emit(EditorEvent::BreadcrumbsChanged);
-
-        cx.defer_in(window, move |editor, _window, cx| {
-            editor.breadcrumb_state.hide_popovers(cx);
-            // A tab switch in between may have already cancelled this reanchor.
-            if editor.breadcrumb_state.queue_reanchor() {
-                cx.notify();
-            }
-        });
+        self.request_breadcrumb_reanchor(window, cx);
     }
 
     /// Uses `cx.defer_in`: called while the picker's `confirm` lease is still on the stack.
@@ -11190,6 +11183,29 @@ impl Editor {
                 active_item,
                 navigated: true,
             });
+        self.request_breadcrumb_reanchor(window, cx);
+    }
+
+    /// Opens the dropdown of the trail's last segment, the only one collapsing never drops.
+    pub fn open_breadcrumb_dropdown(
+        &mut self,
+        _: &OpenBreadcrumbDropdown,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // A hidden bar renders no segment for the dropdown to deploy under.
+        if !self.breadcrumbs_visible() {
+            return;
+        }
+        let Some(navigation) = breadcrumb_leaf_navigation(self, cx) else {
+            return;
+        };
+        self.breadcrumb_state.begin_symbol_reanchor(navigation);
+        self.request_breadcrumb_reanchor(window, cx);
+    }
+
+    /// Marks the new anchor; the redrawn bar's layout pass reopens the dropdown.
+    fn request_breadcrumb_reanchor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         cx.emit(EditorEvent::BreadcrumbsChanged);
 
         cx.defer_in(window, move |editor, _window, cx| {

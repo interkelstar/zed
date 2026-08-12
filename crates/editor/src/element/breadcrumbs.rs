@@ -60,6 +60,8 @@ pub struct BreadcrumbPickerRenderers {
     ) -> gpui::AnyElement,
     pub popover_handle: fn() -> Rc<dyn ErasedBreadcrumbPopoverHandle>,
     pub symbol_popover_handle: fn() -> Rc<dyn ErasedBreadcrumbPopoverHandle>,
+    /// Horizontal padding the trigger wraps a segment in; the row measures with it or paints past its own bounds.
+    pub segment_padding: Pixels,
 }
 
 pub static BREADCRUMB_PICKER_RENDERERS: OnceLock<BreadcrumbPickerRenderers> = OnceLock::new();
@@ -296,6 +298,7 @@ impl BreadcrumbState {
         let changed = self.session_open() || self.expanded;
         self.popover = BreadcrumbPopover::Closed;
         self.expanded = false;
+        self.dismiss_subscription = None;
         changed
     }
 
@@ -365,10 +368,23 @@ struct PreparedBreadcrumbSegment {
     hard_cap_ellipsis: bool,
 }
 
-/// Measured once per render; `shape_line` is cached by text and font.
-struct BreadcrumbSegmentMetrics {
-    widths: Vec<Pixels>,
-    ellipsis_width: Pixels,
+/// Measured once per render; `shape_line` is cached by text and font. Widths are
+/// per item: the separator between two of them is [`breadcrumb_layout_plan_width`]'s.
+#[derive(Clone)]
+pub(crate) struct BreadcrumbSegmentMetrics {
+    pub(crate) widths: Vec<Pixels>,
+    pub(crate) ellipsis_width: Pixels,
+    pub(crate) separator_width: Pixels,
+}
+
+impl BreadcrumbSegmentMetrics {
+    fn natural_width(&self) -> Pixels {
+        let separators = self.separator_width * self.widths.len().saturating_sub(1) as f32;
+        self.widths
+            .iter()
+            .fold(Pixels::ZERO, |total, width| total + *width)
+            + separators
+    }
 }
 
 /// Measured with the bold dirty-file style, which is wider than the base weight.
@@ -405,9 +421,18 @@ struct BreadcrumbsRow {
     file_outlives_symbols: bool,
     /// An excerpt header row: its ellipsis must render as a plain marker, since it can never expand.
     multibuffer_header: bool,
-    /// Total painted child width, observable by tests: taffy never sees children painted past the row's bounds.
     #[cfg(test)]
-    painted_extent: Option<Rc<std::cell::Cell<Pixels>>>,
+    probe: Option<Rc<BreadcrumbRowProbe>>,
+}
+
+/// Layout facts the painted scene keeps from a test: children past the row's bounds, and clamps.
+#[cfg(test)]
+#[derive(Default)]
+struct BreadcrumbRowProbe {
+    painted_extent: std::cell::Cell<Pixels>,
+    last_segment_max_width: std::cell::Cell<Option<Pixels>>,
+    dropped_runs: std::cell::Cell<usize>,
+    bounds_width: std::cell::Cell<Pixels>,
 }
 
 const BREADCRUMB_SEGMENT_GROUP: &str = "breadcrumb-segment";
@@ -429,8 +454,8 @@ impl BreadcrumbsRow {
             .text_system()
             .shape_line("⋯".into(), font_size, &[ellipsis_run], None)
             .width();
-        let ellipsis_width =
-            ellipsis_label_width + BREADCRUMB_LABEL_PADDING * 2. + arrow_width + gap * 2.;
+        // Ceiled like taffy rounds every painted box: a plan under what it paints clips the tail.
+        let ellipsis_width = (ellipsis_label_width + BREADCRUMB_LABEL_PADDING * 2.).ceil();
 
         let widths = self
             .segments
@@ -447,14 +472,29 @@ impl BreadcrumbsRow {
                 } else {
                     Pixels::ZERO
                 };
-                icon_width + label_width + BREADCRUMB_LABEL_PADDING * 2. + arrow_width + gap * 2.
+                (icon_width
+                    + label_width
+                    + BREADCRUMB_LABEL_PADDING * 2.
+                    + self.segment_padding(segment))
+                .ceil()
             })
             .collect();
 
         BreadcrumbSegmentMetrics {
             widths,
             ellipsis_width,
+            separator_width: (arrow_width + gap * 2.).ceil(),
         }
+    }
+
+    /// What the picker's trigger wraps an interactive segment in; zero for a plain label.
+    fn segment_padding(&self, segment: &PreparedBreadcrumbSegment) -> Pixels {
+        if segment.hard_cap_ellipsis || segment.target.is_none() || self.editor.is_none() {
+            return Pixels::ZERO;
+        }
+        BREADCRUMB_PICKER_RENDERERS
+            .get()
+            .map_or(Pixels::ZERO, |renderers| renderers.segment_padding)
     }
 
     /// Positions in the final rendered sequence, not the raw segment index.
@@ -528,8 +568,11 @@ impl BreadcrumbsRow {
             } else {
                 Pixels::ZERO
             };
-            let label_width =
-                (max_width - BREADCRUMB_LABEL_PADDING * 2. - icon_width).max(Pixels::ZERO);
+            let label_width = (max_width
+                - BREADCRUMB_LABEL_PADDING * 2.
+                - icon_width
+                - self.segment_padding(segment))
+            .max(Pixels::ZERO);
             div()
                 .max_w(label_width)
                 .truncate()
@@ -770,6 +813,27 @@ fn dismiss_orphaned_breadcrumb_popover(
     }
 }
 
+/// The trail's last segment, the one collapsing never drops: the deepest symbol at the
+/// cursor, or the file segment when the buffer contributes none. Reads the same
+/// `outline_symbols_at_cursor` that [`render_breadcrumb_text`] turns into symbol segments.
+pub(crate) fn breadcrumb_leaf_navigation(
+    editor: &Editor,
+    cx: &App,
+) -> Option<BreadcrumbSymbolNavigation> {
+    let buffer = editor.buffer().read(cx).as_singleton()?;
+    let buffer_id = buffer.read(cx).remote_id();
+    let active_item = editor
+        .outline_symbols_at_cursor
+        .as_ref()
+        .filter(|(id, _)| *id == buffer_id)
+        .and_then(|(_, ancestors)| ancestors.last().cloned());
+    Some(BreadcrumbSymbolNavigation {
+        buffer_id,
+        active_item,
+        navigated: false,
+    })
+}
+
 struct BreadcrumbsRowPrepaintState {
     children: Vec<gpui::AnyElement>,
 }
@@ -802,14 +866,10 @@ impl gpui::Element for BreadcrumbsRow {
         _cx: &mut App,
     ) -> (gpui::LayoutId, Self::RequestLayoutState) {
         let metrics = self.measure(window);
-        let natural_width = metrics
-            .widths
-            .iter()
-            .fold(Pixels::ZERO, |total, width| total + *width);
+        let natural_width = metrics.natural_width();
         let line_height = window.text_style().line_height_in_pixels(window.rem_size());
 
-        let widths = metrics.widths.clone();
-        let ellipsis_width = metrics.ellipsis_width;
+        let measured = metrics.clone();
         let kinds: Vec<BreadcrumbSegmentKind> = self.segments.iter().map(|s| s.kind).collect();
         let anchored_index = self.anchored_segment_index();
         let expanded = self.expanded;
@@ -836,22 +896,21 @@ impl gpui::Element for BreadcrumbsRow {
                         .unwrap_or(match available_space.width {
                             AvailableSpace::Definite(available_width) => {
                                 let plan = plan_breadcrumb_layout(
-                                    &widths,
+                                    &measured,
                                     &kinds,
-                                    ellipsis_width,
                                     available_width,
                                     anchored_index,
                                     file_outlives_symbols,
                                 );
                                 // Even the minimal plan can overflow; prepaint then truncates the last label.
-                                breadcrumb_layout_plan_width(&widths, &plan, ellipsis_width)
-                                    .min(available_width)
+                                breadcrumb_layout_plan_width(&measured, &plan).min(available_width)
                             }
-                            AvailableSpace::MinContent => widths
+                            AvailableSpace::MinContent => measured
+                                .widths
                                 .last()
                                 .copied()
-                                .unwrap_or(ellipsis_width)
-                                .max(ellipsis_width),
+                                .unwrap_or(measured.ellipsis_width)
+                                .max(measured.ellipsis_width),
                             AvailableSpace::MaxContent => natural_width,
                         })
                 };
@@ -881,9 +940,8 @@ impl gpui::Element for BreadcrumbsRow {
             }
         } else {
             plan_breadcrumb_layout(
-                &metrics.widths,
+                metrics,
                 &kinds,
-                metrics.ellipsis_width,
                 bounds.size.width,
                 anchored_index,
                 self.file_outlives_symbols,
@@ -923,15 +981,20 @@ impl gpui::Element for BreadcrumbsRow {
 
         let last_position = sequence.len().saturating_sub(1);
         // Nothing left to drop and still too wide: the last label must ellipsize itself.
-        let truncate_last = !self.expanded
-            && breadcrumb_layout_plan_width(&metrics.widths, &plan, metrics.ellipsis_width)
-                > bounds.size.width;
+        let truncate_last =
+            !self.expanded && breadcrumb_layout_plan_width(metrics, &plan) > bounds.size.width;
         let gap = window.rem_size() * 0.25;
         let mut x = bounds.origin.x;
         let mut children = Vec::with_capacity(sequence.len());
         for (position, item) in sequence.into_iter().enumerate() {
             let max_width = (truncate_last && position == last_position)
                 .then(|| (bounds.origin.x + bounds.size.width - x).max(Pixels::ZERO));
+            #[cfg(test)]
+            if position == last_position
+                && let Some(probe) = &self.probe
+            {
+                probe.last_segment_max_width.set(max_width);
+            }
             let mut element = match item {
                 FinalItem::Segment(index) => {
                     self.render_segment(index, position, last_position, max_width, window, cx)
@@ -951,8 +1014,12 @@ impl gpui::Element for BreadcrumbsRow {
         }
 
         #[cfg(test)]
-        if let Some(painted_extent) = &self.painted_extent {
-            painted_extent.set((x - gap - bounds.origin.x).max(Pixels::ZERO));
+        if let Some(probe) = &self.probe {
+            probe
+                .painted_extent
+                .set((x - gap - bounds.origin.x).max(Pixels::ZERO));
+            probe.dropped_runs.set(plan.ellipses.len());
+            probe.bounds_width.set(bounds.size.width);
         }
 
         if let Some(editor) = self.editor.as_ref().and_then(WeakEntity::upgrade)
@@ -1243,7 +1310,7 @@ pub fn render_breadcrumb_text(
         file_outlives_symbols: tab_bar_hidden,
         multibuffer_header,
         #[cfg(test)]
-        painted_extent: None,
+        probe: None,
     };
 
     let breadcrumbs_stack = if multibuffer_header {
@@ -1884,7 +1951,9 @@ mod tests {
         expanded: bool,
         cx: &mut gpui::TestAppContext,
     ) -> (Pixels, Pixels) {
-        draw_breadcrumb_row_in_container(labels, expanded, px(200.), None, cx)
+        let (scroll_range, probe) =
+            draw_breadcrumb_row_in_container(labels, expanded, px(200.), None, false, cx);
+        (scroll_range, probe.painted_extent.get())
     }
 
     fn draw_breadcrumb_row_in_container(
@@ -1892,26 +1961,28 @@ mod tests {
         expanded: bool,
         container_width: Pixels,
         anchored_index: Option<usize>,
+        last_segment_icon: bool,
         cx: &mut gpui::TestAppContext,
-    ) -> (Pixels, Pixels) {
+    ) -> (Pixels, Rc<BreadcrumbRowProbe>) {
         crate::editor_tests::init_test(cx, |_| {});
         let scroll_handle = gpui::ScrollHandle::new();
-        let painted_extent = Rc::new(std::cell::Cell::new(Pixels::ZERO));
+        let probe = Rc::new(BreadcrumbRowProbe::default());
         let window = cx.add_window({
             let scroll_handle = scroll_handle.clone();
-            let painted_extent = painted_extent.clone();
+            let probe = probe.clone();
             move |_, _| ScrollProbe {
                 labels,
                 expanded,
                 container_width,
                 anchored_index,
+                last_segment_icon,
                 scroll_handle,
-                painted_extent,
+                probe,
             }
         });
         cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
             .unwrap();
-        (scroll_handle.max_offset().x, painted_extent.get())
+        (scroll_handle.max_offset().x, probe)
     }
 
     fn breadcrumb_row_scroll_range(expanded: bool, cx: &mut gpui::TestAppContext) -> Pixels {
@@ -1926,18 +1997,24 @@ mod tests {
         expanded: bool,
         container_width: Pixels,
         anchored_index: Option<usize>,
+        last_segment_icon: bool,
         scroll_handle: gpui::ScrollHandle,
-        painted_extent: Rc<std::cell::Cell<Pixels>>,
+        probe: Rc<BreadcrumbRowProbe>,
     }
 
     impl Render for ScrollProbe {
         fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let last_index = self.labels.len().saturating_sub(1);
             let segments = self
                 .labels
                 .iter()
                 .enumerate()
                 .map(|(index, label)| PreparedBreadcrumbSegment {
-                    kind: BreadcrumbSegmentKind::Middle,
+                    kind: if self.last_segment_icon && index == last_index {
+                        BreadcrumbSegmentKind::File
+                    } else {
+                        BreadcrumbSegmentKind::Middle
+                    },
                     label: HighlightedText {
                         text: label.clone(),
                         highlights: Vec::new(),
@@ -1950,7 +2027,8 @@ mod tests {
                         }
                     }),
                     dirty_filename_style: false,
-                    icon: None,
+                    icon: (self.last_segment_icon && index == last_index)
+                        .then(|| SharedString::from("icons/file_icons/file.svg")),
                     icon_color: Color::Muted,
                     label_color: Color::Muted,
                     hard_cap_ellipsis: false,
@@ -1962,7 +2040,7 @@ mod tests {
                 expanded: self.expanded,
                 file_outlives_symbols: false,
                 multibuffer_header: false,
-                painted_extent: Some(self.painted_extent.clone()),
+                probe: Some(self.probe.clone()),
             };
             // Mirrors the real chain, clipping box and nested rows included.
             h_flex().w(self.container_width).overflow_x_hidden().child(
@@ -2031,21 +2109,65 @@ mod tests {
         let middle =
             SharedString::from("an-anchored-middle-segment-that-eats-nearly-the-whole-row");
 
-        let (_, middle_extent) =
-            draw_breadcrumb_row_in_container(vec![middle.clone()], true, px(200.), None, cx);
+        let (_, probe) =
+            draw_breadcrumb_row_in_container(vec![middle.clone()], true, px(200.), None, false, cx);
         // Leaves the last segment far less room than its natural width.
-        let container = middle_extent + px(30.);
-        let (_, painted_extent) = draw_breadcrumb_row_in_container(
+        let container = probe.painted_extent.get() + px(30.);
+        let (_, probe) = draw_breadcrumb_row_in_container(
             vec![middle, SharedString::from("file-name")],
             false,
             container,
             Some(0),
+            false,
             cx,
         );
+        let painted_extent = probe.painted_extent.get();
         assert!(
             painted_extent <= container,
             "the truncated last label must stay inside the row, got {painted_extent:?} in {container:?}"
         );
+    }
+
+    #[gpui::test]
+    fn test_a_row_that_fits_keeps_every_segment_and_clamps_none(cx: &mut gpui::TestAppContext) {
+        let labels: Vec<SharedString> = [
+            "ihavenever",
+            "src",
+            "main",
+            "kotlin",
+            "com",
+            "kelstar",
+            "ihne",
+            "model",
+            "Entities.kt",
+        ]
+        .into_iter()
+        .map(SharedString::from)
+        .collect();
+
+        let (_, natural) =
+            draw_breadcrumb_row_in_container(labels.clone(), true, px(4000.), None, true, cx);
+        let natural_extent = natural.painted_extent.get();
+        assert_eq!(
+            natural.bounds_width.get(),
+            natural_extent,
+            "the row must reserve what it paints, or it collapses a trail that would have fit"
+        );
+
+        let (scroll_range, probe) =
+            draw_breadcrumb_row_in_container(labels, false, natural_extent, None, true, cx);
+        assert_eq!(scroll_range, px(0.));
+        assert_eq!(
+            probe.dropped_runs.get(),
+            0,
+            "a container the width of the trail must keep every segment"
+        );
+        assert_eq!(
+            probe.last_segment_max_width.get(),
+            None,
+            "nothing overflows, so the last segment must not be clamped"
+        );
+        assert_eq!(probe.painted_extent.get(), natural_extent);
     }
 
     struct EllipsisFallbackProbe {
@@ -2072,7 +2194,7 @@ mod tests {
                 expanded: false,
                 file_outlives_symbols: false,
                 multibuffer_header: false,
-                painted_extent: None,
+                probe: None,
             };
             // The bar-level fallback from `render_breadcrumb_text`, reduced to its clipboard write.
             div()

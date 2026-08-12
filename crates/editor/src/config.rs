@@ -148,10 +148,25 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         if self.breadcrumbs_visibility != breadcrumbs_visibility {
+            let was_visible = self.breadcrumbs_visible();
             self.breadcrumbs_visibility = breadcrumbs_visibility;
+            self.close_breadcrumbs_when_hidden(was_visible, cx);
             cx.emit(EditorEvent::BreadcrumbsChanged);
             cx.notify();
         }
+    }
+
+    /// A hidden bar never lays out again, so its orphan cleanup can no longer close the session.
+    pub(crate) fn close_breadcrumbs_when_hidden(
+        &mut self,
+        was_visible: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if !was_visible || self.breadcrumbs_visible() {
+            return;
+        }
+        self.breadcrumb_state.hide_popovers(cx);
+        self.breadcrumb_state.close();
     }
 
     pub fn toggle_breadcrumb(

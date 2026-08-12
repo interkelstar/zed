@@ -377,6 +377,179 @@ fn test_breadcrumb_navigation_state_transitions(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_open_breadcrumb_dropdown_anchors_the_deepest_symbol(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    cx.update(|cx| {
+        let default_key_bindings = settings::KeymapFile::load_asset_allow_partial_failure(
+            "keymaps/default-linux.json",
+            cx,
+        )
+        .unwrap();
+        cx.bind_keys(default_key_bindings);
+    });
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/root"),
+        json!({
+            "src": { "main.rs": "mod outer {\n    fn inner() {}\n}\n" },
+        }),
+    )
+    .await;
+    let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(path!("/root/src/main.rs"), cx)
+        })
+        .await
+        .unwrap();
+    let buffer_id = buffer.update(cx, |buffer, cx| {
+        buffer.set_language(Some(rust_lang()), cx);
+        buffer.remote_id()
+    });
+    let multibuffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+
+    let (editor, cx) = cx
+        .add_window_view(|window, cx| build_editor_with_project(project, multibuffer, window, cx));
+    editor.update_in(cx, |editor, window, cx| {
+        editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+            selections.select_ranges([Point::new(1, 8)..Point::new(1, 8)])
+        });
+    });
+    cx.run_until_parked();
+    cx.focus(&editor);
+    cx.simulate_keystrokes("ctrl-alt-shift-p");
+
+    editor.update(cx, |editor, _| {
+        let (_, trail) = editor
+            .outline_symbols_at_cursor
+            .as_ref()
+            .expect("the cursor sits inside two nested symbols");
+        assert_eq!(
+            trail
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["mod outer", "fn inner"]
+        );
+        let navigation = editor
+            .breadcrumb_symbol_navigation()
+            .expect("the shipped binding must open the leaf segment's dropdown");
+        assert_eq!(navigation.buffer_id, buffer_id);
+        let active_item = navigation
+            .active_item
+            .as_ref()
+            .expect("the leaf is the deepest symbol, not the file");
+        assert_eq!(active_item.range, trail.last().unwrap().range);
+        assert!(
+            !navigation.navigated,
+            "the bar must keep showing the cursor's own trail"
+        );
+        assert!(
+            editor.breadcrumb_navigation().is_none(),
+            "anchoring a directory would leave the file's own symbols unreachable"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_open_breadcrumb_dropdown_anchors_the_file_segment_without_symbols(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx, |_| {});
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/root"),
+        json!({
+            "src": { "notes.txt": "plain text" },
+        }),
+    )
+    .await;
+    let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(path!("/root/src/notes.txt"), cx)
+        })
+        .await
+        .unwrap();
+    let buffer_id = buffer.read_with(cx, |buffer, _| buffer.remote_id());
+    let multibuffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+
+    let (editor, cx) = cx
+        .add_window_view(|window, cx| build_editor_with_project(project, multibuffer, window, cx));
+    editor.update_in(cx, |editor, window, cx| {
+        editor.open_breadcrumb_dropdown(&OpenBreadcrumbDropdown, window, cx);
+    });
+
+    editor.update(cx, |editor, _| {
+        let navigation = editor
+            .breadcrumb_symbol_navigation()
+            .expect("a file with no symbols still has a file segment to anchor");
+        assert_eq!(navigation.buffer_id, buffer_id);
+        assert!(
+            navigation.active_item.is_none(),
+            "the file segment is the leaf, and its dropdown opens on the empty state"
+        );
+        assert!(
+            editor.breadcrumb_navigation().is_none(),
+            "the trail's directories stay one left drill away, not the anchor"
+        );
+    });
+}
+
+#[gpui::test]
+fn test_open_breadcrumb_dropdown_anchors_a_buffer_outside_any_worktree(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let buffer = cx.new(|cx| language::Buffer::local("fn main() {}", cx));
+    let buffer_id = buffer.read_with(cx, |buffer, _| buffer.remote_id());
+    let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+    let editor = cx.add_window(|window, cx| build_editor(buffer, window, cx));
+
+    _ = editor.update(cx, |editor, window, cx| {
+        editor.open_breadcrumb_dropdown(&OpenBreadcrumbDropdown, window, cx);
+        let navigation = editor
+            .breadcrumb_symbol_navigation()
+            .expect("a buffer outside any worktree still has a file segment to anchor");
+        assert_eq!(navigation.buffer_id, buffer_id);
+        assert!(navigation.active_item.is_none());
+        assert!(editor.breadcrumb_navigation().is_none());
+    });
+}
+
+#[gpui::test]
+fn test_open_breadcrumb_dropdown_without_an_anchor_is_a_no_op(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let multibuffer_editor = cx.add_window(|window, cx| {
+        let buffer = MultiBuffer::build_multi([("a\nb\n", vec![Point::row_range(0..1)])], cx);
+        build_editor(buffer, window, cx)
+    });
+    _ = multibuffer_editor.update(cx, |editor, window, cx| {
+        editor.open_breadcrumb_dropdown(&OpenBreadcrumbDropdown, window, cx);
+        assert!(editor.breadcrumb_navigation().is_none());
+        assert!(
+            editor.breadcrumb_symbol_navigation().is_none(),
+            "a multibuffer shows its breadcrumbs on excerpt headers, not in the bar"
+        );
+    });
+
+    let editor = cx.add_window(|window, cx| {
+        let buffer = MultiBuffer::build_simple("hello", cx);
+        build_editor(buffer, window, cx)
+    });
+    _ = editor.update(cx, |editor, window, cx| {
+        editor.toggle_breadcrumb(&ToggleBreadcrumb, window, cx);
+        editor.open_breadcrumb_dropdown(&OpenBreadcrumbDropdown, window, cx);
+        assert!(
+            editor.breadcrumb_symbol_navigation().is_none(),
+            "a hidden bar renders no segment to deploy under"
+        );
+    });
+}
+
+#[gpui::test]
 fn test_stale_breadcrumb_dismissal_does_not_clobber_newer_navigation(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 
@@ -1446,6 +1619,70 @@ fn test_toggle_breadcrumb_does_not_change_settings(cx: &mut TestAppContext) {
         assert_eq!(
             editor.breadcrumb_location(cx),
             ToolbarItemLocation::PrimaryLeft
+        );
+    });
+}
+
+#[gpui::test]
+fn test_hiding_breadcrumbs_closes_an_open_dropdown(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let buffer = cx.new(|cx| language::Buffer::local("fn main() {}", cx));
+    let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+    let editor = cx.add_window(|window, cx| build_editor(buffer, window, cx));
+    let worktree_id = project::WorktreeId::from_usize(0);
+
+    _ = editor.update(cx, |editor, window, cx| {
+        editor.open_breadcrumb_navigation(worktree_id, rel_path("src").into_arc(), cx);
+        editor.expand_breadcrumb_trail(cx);
+
+        editor.toggle_breadcrumb(&ToggleBreadcrumb, window, cx);
+        assert!(!editor.breadcrumbs_visible());
+        assert!(
+            editor.breadcrumb_navigation().is_none(),
+            "hiding the bar must retire the session it can no longer lay out"
+        );
+        assert!(!editor.breadcrumb_expanded());
+
+        editor.toggle_breadcrumb(&ToggleBreadcrumb, window, cx);
+        assert!(
+            editor.breadcrumb_navigation().is_none(),
+            "showing the bar again must not resurrect the session"
+        );
+
+        editor.toggle_breadcrumb(&ToggleBreadcrumb, window, cx);
+        assert!(editor.breadcrumb_navigation().is_none());
+        assert!(!editor.breadcrumb_expanded());
+    });
+}
+
+#[gpui::test]
+fn test_turning_the_breadcrumbs_setting_off_closes_an_open_dropdown(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    update_test_editor_settings(cx, &|settings| {
+        settings.toolbar.get_or_insert_default().breadcrumbs = Some(true);
+    });
+
+    let buffer = cx.new(|cx| language::Buffer::local("fn main() {}", cx));
+    let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+    let editor = cx.add_window(|window, cx| build_editor(buffer, window, cx));
+    let worktree_id = project::WorktreeId::from_usize(0);
+
+    _ = editor.update(cx, |editor, _, cx| {
+        editor.open_breadcrumb_navigation(worktree_id, rel_path("src").into_arc(), cx);
+        assert!(editor.breadcrumb_navigation().is_some());
+    });
+
+    update_test_editor_settings(cx, &|settings| {
+        settings.toolbar.get_or_insert_default().breadcrumbs = Some(false);
+    });
+    cx.run_until_parked();
+
+    _ = editor.update(cx, |editor, _, _| {
+        assert!(!editor.breadcrumbs_visible());
+        assert!(
+            editor.breadcrumb_navigation().is_none(),
+            "the settings route must close the session the action's route does"
         );
     });
 }

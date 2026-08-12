@@ -4,6 +4,7 @@ mod mouse;
 
 pub(crate) use breadcrumbs::BreadcrumbState;
 pub(crate) use breadcrumbs::bar_file_icon_color;
+pub(crate) use breadcrumbs::breadcrumb_leaf_navigation;
 #[cfg(test)]
 pub(crate) use breadcrumbs::breadcrumb_path_segments;
 pub(crate) use breadcrumbs::outline_parents;
@@ -493,6 +494,7 @@ impl EditorElement {
         register_action(editor, window, Editor::toggle_soft_wrap);
         register_action(editor, window, Editor::toggle_tab_bar);
         register_action(editor, window, Editor::toggle_breadcrumb);
+        register_action(editor, window, Editor::open_breadcrumb_dropdown);
         register_action(editor, window, Editor::toggle_line_numbers);
         register_action(editor, window, Editor::toggle_relative_line_numbers);
         register_action(editor, window, Editor::toggle_indent_guides);

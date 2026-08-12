@@ -117,6 +117,9 @@ pub(crate) fn update_picker_matches<D: BreadcrumbPickerDelegate>(
     })
 }
 
+/// What [`segment_trigger`] adds around a label, horizontally: `ButtonSize::None` pads a pixel a side.
+pub(crate) const SEGMENT_TRIGGER_PADDING: Pixels = px(2.);
+
 pub(crate) fn segment_trigger(id: &'static str, index: usize, label: AnyElement) -> ButtonLike {
     ButtonLike::new((id, index))
         .style(ButtonStyle::Transparent)
@@ -194,6 +197,7 @@ pub fn init(_cx: &mut App) {
             symbol: symbol::render_breadcrumb_symbol_segment,
             popover_handle: default_popover_handle,
             symbol_popover_handle: default_symbol_popover_handle,
+            segment_padding: SEGMENT_TRIGGER_PADDING,
         })
         .ok();
 }
@@ -386,6 +390,57 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A trigger grown past `SEGMENT_TRIGGER_PADDING` paints the trail wider than the row asked for.
+    #[gpui::test]
+    fn test_segment_trigger_padding_matches_the_registered_width(cx: &mut gpui::TestAppContext) {
+        struct TriggerProbe {
+            wrapped: bool,
+            scroll_handle: gpui::ScrollHandle,
+        }
+
+        impl Render for TriggerProbe {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                // Unshrinkable like the trigger, so only its padding shows up in the difference.
+                let label = gpui::div()
+                    .w(px(120.))
+                    .h(px(10.))
+                    .flex_none()
+                    .into_any_element();
+                let content = if self.wrapped {
+                    crate::segment_trigger("probe", 0, label).into_any_element()
+                } else {
+                    label
+                };
+                h_flex()
+                    .id("probe")
+                    .w(px(40.))
+                    .track_scroll(&self.scroll_handle)
+                    .overflow_x_scroll()
+                    .child(content)
+            }
+        }
+
+        fn content_width(wrapped: bool, cx: &mut gpui::TestAppContext) -> Pixels {
+            crate::test_support::init_test(cx);
+            let scroll_handle = gpui::ScrollHandle::new();
+            let window = cx.add_window({
+                let scroll_handle = scroll_handle.clone();
+                move |_, _| TriggerProbe {
+                    wrapped,
+                    scroll_handle,
+                }
+            });
+            cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+                .unwrap();
+            scroll_handle.max_offset().x + px(40.)
+        }
+
+        assert_eq!(
+            content_width(true, cx) - content_width(false, cx),
+            SEGMENT_TRIGGER_PADDING
+        );
+    }
 
     fn candidates(count: usize) -> Vec<StringMatchCandidate> {
         (0..count)

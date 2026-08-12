@@ -143,6 +143,7 @@
       "ctrl-shift-alt-backspace": "editor::GoToNextChange",
       "alt-enter": "editor::OpenSelectionsInMultibuffer",
       "ctrl-alt-f": "text_finder::Toggle",
+      "ctrl-alt-shift-p": "editor::OpenBreadcrumbDropdown",
     },
   },
   {

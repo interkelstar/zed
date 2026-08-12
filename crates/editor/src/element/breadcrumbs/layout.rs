@@ -102,25 +102,25 @@ pub(crate) struct BreadcrumbLayoutPlan {
     pub(crate) ellipses: Vec<Range<usize>>,
 }
 
-fn total_breadcrumb_layout_width(
-    widths: &[Pixels],
-    dropped: &[bool],
-    ellipsis_width: Pixels,
-) -> Pixels {
+fn total_breadcrumb_layout_width(metrics: &BreadcrumbSegmentMetrics, dropped: &[bool]) -> Pixels {
     let mut total = Pixels::ZERO;
+    let mut items = 0usize;
     let mut in_dropped_run = false;
     for (index, &is_dropped) in dropped.iter().enumerate() {
         if is_dropped {
             if !in_dropped_run {
-                total += ellipsis_width;
+                total += metrics.ellipsis_width;
+                items += 1;
                 in_dropped_run = true;
             }
         } else {
-            total += widths[index];
+            total += metrics.widths[index];
+            items += 1;
             in_dropped_run = false;
         }
     }
-    total
+    // The trailing item paints no separator.
+    total + metrics.separator_width * items.saturating_sub(1) as f32
 }
 
 fn breadcrumb_layout_plan_from_dropped(dropped: &[bool]) -> BreadcrumbLayoutPlan {
@@ -145,15 +145,14 @@ fn breadcrumb_layout_plan_from_dropped(dropped: &[bool]) -> BreadcrumbLayoutPlan
 
 /// Drops segments cheapest first (`Middle`, `Root`, then `File`/`Symbol` in the order `file_outlives_symbols` picks); the last one and `anchored_index` never drop.
 pub(crate) fn plan_breadcrumb_layout(
-    widths: &[Pixels],
+    metrics: &BreadcrumbSegmentMetrics,
     kinds: &[BreadcrumbSegmentKind],
-    ellipsis_width: Pixels,
     available_width: Pixels,
     anchored_index: Option<usize>,
     file_outlives_symbols: bool,
 ) -> BreadcrumbLayoutPlan {
-    debug_assert_eq!(widths.len(), kinds.len());
-    let segment_count = widths.len();
+    debug_assert_eq!(metrics.widths.len(), kinds.len());
+    let segment_count = metrics.widths.len();
     if segment_count == 0 {
         return BreadcrumbLayoutPlan {
             visible: Vec::new(),
@@ -162,7 +161,7 @@ pub(crate) fn plan_breadcrumb_layout(
     }
 
     let mut dropped = vec![false; segment_count];
-    if total_breadcrumb_layout_width(widths, &dropped, ellipsis_width) <= available_width {
+    if total_breadcrumb_layout_width(metrics, &dropped) <= available_width {
         return breadcrumb_layout_plan_from_dropped(&dropped);
     }
 
@@ -192,7 +191,7 @@ pub(crate) fn plan_breadcrumb_layout(
 
     for index in drop_order {
         dropped[index] = true;
-        if total_breadcrumb_layout_width(widths, &dropped, ellipsis_width) <= available_width {
+        if total_breadcrumb_layout_width(metrics, &dropped) <= available_width {
             break;
         }
     }
@@ -201,17 +200,16 @@ pub(crate) fn plan_breadcrumb_layout(
 }
 
 pub(crate) fn breadcrumb_layout_plan_width(
-    widths: &[Pixels],
+    metrics: &BreadcrumbSegmentMetrics,
     plan: &BreadcrumbLayoutPlan,
-    ellipsis_width: Pixels,
 ) -> Pixels {
-    let mut dropped = vec![false; widths.len()];
+    let mut dropped = vec![false; metrics.widths.len()];
     for range in &plan.ellipses {
         for index in range.clone() {
             dropped[index] = true;
         }
     }
-    total_breadcrumb_layout_width(widths, &dropped, ellipsis_width)
+    total_breadcrumb_layout_width(metrics, &dropped)
 }
 
 #[cfg(test)]
@@ -345,6 +343,15 @@ mod tests {
         assert_eq!(cap_index, None);
     }
 
+    /// Separator-free, so each case's threshold is the sum of the widths it names.
+    fn metrics(widths: Vec<Pixels>, ellipsis_width: Pixels) -> BreadcrumbSegmentMetrics {
+        BreadcrumbSegmentMetrics {
+            widths,
+            ellipsis_width,
+            separator_width: Pixels::ZERO,
+        }
+    }
+
     fn sample_breadcrumb_widths_and_kinds() -> (Vec<Pixels>, Vec<BreadcrumbSegmentKind>) {
         use BreadcrumbSegmentKind::*;
         let widths = vec![
@@ -362,6 +369,33 @@ mod tests {
     }
 
     #[test]
+    fn test_plan_breadcrumb_layout_counts_separators_between_items_only() {
+        use BreadcrumbSegmentKind::*;
+        let metrics = BreadcrumbSegmentMetrics {
+            widths: vec![px(40.), px(40.), px(40.)],
+            ellipsis_width: px(20.),
+            separator_width: px(20.),
+        };
+        let kinds = vec![Root, Middle, File];
+
+        let plan = plan_breadcrumb_layout(&metrics, &kinds, px(160.), None, false);
+        assert_eq!(
+            plan.visible,
+            vec![0, 1, 2],
+            "three segments and the two separators between them fit in 160px"
+        );
+        assert_eq!(breadcrumb_layout_plan_width(&metrics, &plan), px(160.));
+
+        let plan = plan_breadcrumb_layout(&metrics, &kinds, px(159.), None, false);
+        assert_eq!(plan.visible, vec![0, 2], "a pixel short drops the middle");
+        assert_eq!(
+            breadcrumb_layout_plan_width(&metrics, &plan),
+            px(140.),
+            "the ellipsis takes the dropped segment's place, so two separators remain"
+        );
+    }
+
+    #[test]
     fn test_plan_breadcrumb_layout_drops_middle_before_root_before_file_before_outer_symbols() {
         let (widths, kinds) = sample_breadcrumb_widths_and_kinds();
         let total: Pixels = widths.iter().fold(Pixels::ZERO, |sum, w| sum + *w);
@@ -376,7 +410,13 @@ mod tests {
             (px(1.), vec![7], vec![0..7]),
         ];
         for (available, visible, ellipses) in cases {
-            let plan = plan_breadcrumb_layout(&widths, &kinds, px(20.), available, None, false);
+            let plan = plan_breadcrumb_layout(
+                &metrics(widths.clone(), px(20.)),
+                &kinds,
+                available,
+                None,
+                false,
+            );
             assert_eq!(plan.visible, visible, "available width {available:?}");
             assert_eq!(plan.ellipses, ellipses, "available width {available:?}");
         }
@@ -387,7 +427,7 @@ mod tests {
     fn test_plan_breadcrumb_layout_keeps_the_file_segment_over_symbols_when_tab_bar_is_hidden() {
         let (widths, kinds) = sample_breadcrumb_widths_and_kinds();
 
-        let plan = plan_breadcrumb_layout(&widths, &kinds, px(20.), px(240.), None, true);
+        let plan = plan_breadcrumb_layout(&metrics(widths, px(20.)), &kinds, px(240.), None, true);
         assert_eq!(
             plan.visible,
             vec![5, 7],
@@ -399,9 +439,8 @@ mod tests {
     #[test]
     fn test_plan_breadcrumb_layout_boundary_inputs() {
         let plan = plan_breadcrumb_layout(
-            &[px(500.)],
+            &metrics(vec![px(500.)], px(20.)),
             &[BreadcrumbSegmentKind::File],
-            px(20.),
             px(1.),
             None,
             false,
@@ -409,9 +448,23 @@ mod tests {
         assert_eq!(plan.visible, vec![0], "a single segment never collapses");
         assert!(plan.ellipses.is_empty());
 
-        let plan = plan_breadcrumb_layout(&[], &[], px(20.), px(500.), None, false);
+        let plan =
+            plan_breadcrumb_layout(&metrics(Vec::new(), px(20.)), &[], px(500.), None, false);
         assert!(plan.visible.is_empty());
         assert!(plan.ellipses.is_empty());
+    }
+
+    /// What `breadcrumb_leaf_navigation` relies on: the keyboard-opened dropdown's segment is on screen at any width.
+    #[test]
+    fn test_plan_breadcrumb_layout_keeps_the_anchored_leaf_at_any_width() {
+        let (widths, kinds) = sample_breadcrumb_widths_and_kinds();
+        let leaf = kinds.len() - 1;
+
+        let plan =
+            plan_breadcrumb_layout(&metrics(widths, px(20.)), &kinds, px(1.), Some(leaf), false);
+
+        assert_eq!(plan.visible, vec![leaf]);
+        assert_eq!(plan.ellipses, vec![0..leaf]);
     }
 
     #[test]
@@ -420,7 +473,8 @@ mod tests {
         let widths = vec![px(50.), px(40.), px(40.), px(40.), px(60.)];
         let kinds = vec![Root, Middle, Middle, Middle, File];
 
-        let plan = plan_breadcrumb_layout(&widths, &kinds, px(20.), px(140.), Some(2), false);
+        let plan =
+            plan_breadcrumb_layout(&metrics(widths, px(20.)), &kinds, px(140.), Some(2), false);
 
         assert_eq!(
             plan.visible,
