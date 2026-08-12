@@ -406,7 +406,7 @@ mod tests {
             (px(340.), vec![5, 6, 7], vec![0..5]),
             (px(230.), vec![6, 7], vec![0..6]),
             (px(140.), vec![7], vec![0..7]),
-            // Degenerate width: the last segment always survives.
+            // Degenerate width: the last segment always survives, which is what `breadcrumb_leaf_navigation` opens.
             (px(1.), vec![7], vec![0..7]),
         ];
         for (available, visible, ellipses) in cases {
@@ -452,19 +452,6 @@ mod tests {
             plan_breadcrumb_layout(&metrics(Vec::new(), px(20.)), &[], px(500.), None, false);
         assert!(plan.visible.is_empty());
         assert!(plan.ellipses.is_empty());
-    }
-
-    /// What `breadcrumb_leaf_navigation` relies on: the keyboard-opened dropdown's segment is on screen at any width.
-    #[test]
-    fn test_plan_breadcrumb_layout_keeps_the_anchored_leaf_at_any_width() {
-        let (widths, kinds) = sample_breadcrumb_widths_and_kinds();
-        let leaf = kinds.len() - 1;
-
-        let plan =
-            plan_breadcrumb_layout(&metrics(widths, px(20.)), &kinds, px(1.), Some(leaf), false);
-
-        assert_eq!(plan.visible, vec![leaf]);
-        assert_eq!(plan.ellipses, vec![0..leaf]);
     }
 
     #[test]
