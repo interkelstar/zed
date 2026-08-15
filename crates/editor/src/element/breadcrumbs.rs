@@ -60,7 +60,7 @@ pub struct BreadcrumbPickerRenderers {
     ) -> gpui::AnyElement,
     pub popover_handle: fn() -> Rc<dyn ErasedBreadcrumbPopoverHandle>,
     pub symbol_popover_handle: fn() -> Rc<dyn ErasedBreadcrumbPopoverHandle>,
-    /// Horizontal padding the trigger wraps a segment in; the row measures with it or paints past its own bounds.
+    /// Total horizontal trigger padding, split evenly per side; the row measures with it or paints past its own bounds.
     pub segment_padding: Pixels,
 }
 
@@ -443,7 +443,12 @@ const BREADCRUMB_ICON_SIZE: IconSize = IconSize::Small;
 
 /// Taffy sizes every painted box on the device grid; a logical ceiling over-reserves at fractional scales.
 fn ceil_to_device_pixel(width: Pixels, scale_factor: f32) -> Pixels {
-    px(width.scale(scale_factor).ceil().as_f32() / scale_factor)
+    px(gpui::ceil_to_device_pixel(width.as_f32(), scale_factor) / scale_factor)
+}
+
+/// Taffy snaps styled lengths to the nearest device pixel with ties toward zero; measuring must match.
+fn round_to_device_pixel(width: Pixels, scale_factor: f32) -> Pixels {
+    px(gpui::round_to_device_pixel(width.as_f32(), scale_factor) / scale_factor)
 }
 
 impl BreadcrumbsRow {
@@ -454,6 +459,8 @@ impl BreadcrumbsRow {
         let scale_factor = window.scale_factor();
 
         let arrow_width = IconSize::XSmall.rems().to_pixels(window.rem_size());
+        let gap_box = round_to_device_pixel(gap, scale_factor);
+        let padding_box = round_to_device_pixel(BREADCRUMB_LABEL_PADDING, scale_factor);
 
         let ellipsis_run = text_style.to_run("⋯".len());
         // `TextLayout` rounds a shaped line up to a whole logical pixel before taffy sizes its box.
@@ -462,10 +469,8 @@ impl BreadcrumbsRow {
             .shape_line("⋯".into(), font_size, &[ellipsis_run], None)
             .width()
             .ceil();
-        let ellipsis_width = ceil_to_device_pixel(
-            ellipsis_label_width + BREADCRUMB_LABEL_PADDING * 2.,
-            scale_factor,
-        );
+        let ellipsis_width =
+            ceil_to_device_pixel(ellipsis_label_width, scale_factor) + padding_box * 2.;
 
         let widths = self
             .segments
@@ -479,24 +484,25 @@ impl BreadcrumbsRow {
                     .width()
                     .ceil();
                 let icon_width = if segment.icon.is_some() {
-                    BREADCRUMB_ICON_SIZE.rems().to_pixels(window.rem_size()) + gap
+                    round_to_device_pixel(
+                        BREADCRUMB_ICON_SIZE.rems().to_pixels(window.rem_size()),
+                        scale_factor,
+                    ) + gap_box
                 } else {
                     Pixels::ZERO
                 };
-                ceil_to_device_pixel(
-                    icon_width
-                        + label_width
-                        + BREADCRUMB_LABEL_PADDING * 2.
-                        + self.segment_padding(segment),
-                    scale_factor,
-                )
+                // One ceiling over the raw sum under-reserves when several boxes round up.
+                ceil_to_device_pixel(label_width, scale_factor)
+                    + icon_width
+                    + padding_box * 2.
+                    + round_to_device_pixel(self.segment_padding(segment) / 2., scale_factor) * 2.
             })
             .collect();
 
         BreadcrumbSegmentMetrics {
             widths,
             ellipsis_width,
-            separator_width: ceil_to_device_pixel(arrow_width + gap * 2., scale_factor),
+            separator_width: round_to_device_pixel(arrow_width, scale_factor) + gap_box * 2.,
         }
     }
 
@@ -575,17 +581,21 @@ impl BreadcrumbsRow {
                 .into_any()
         };
         let text = if let Some(max_width) = max_width {
-            let gap = window.rem_size() * 0.25;
+            let scale_factor = window.scale_factor();
+            let gap_box = round_to_device_pixel(window.rem_size() * 0.25, scale_factor);
             let icon_width = if segment.icon.is_some() {
-                BREADCRUMB_ICON_SIZE.rems().to_pixels(window.rem_size()) + gap
+                round_to_device_pixel(
+                    BREADCRUMB_ICON_SIZE.rems().to_pixels(window.rem_size()),
+                    scale_factor,
+                ) + gap_box
             } else {
                 Pixels::ZERO
             };
             let label_width = (max_width
-                - BREADCRUMB_LABEL_PADDING * 2.
+                - round_to_device_pixel(BREADCRUMB_LABEL_PADDING, scale_factor) * 2.
                 - icon_width
-                - self.segment_padding(segment))
-            .max(Pixels::ZERO);
+                - round_to_device_pixel(self.segment_padding(segment) / 2., scale_factor) * 2.)
+                .max(Pixels::ZERO);
             div()
                 .max_w(label_width)
                 .truncate()
@@ -996,7 +1006,8 @@ impl gpui::Element for BreadcrumbsRow {
         // Nothing left to drop and still too wide: the last label must ellipsize itself.
         let truncate_last =
             !self.expanded && breadcrumb_layout_plan_width(metrics, &plan) > bounds.size.width;
-        let gap = window.rem_size() * 0.25;
+        // Snapped like taffy's in-segment gaps, so children start on the device grid.
+        let gap = round_to_device_pixel(window.rem_size() * 0.25, window.scale_factor());
         let mut x = bounds.origin.x;
         let mut children = Vec::with_capacity(sequence.len());
         for (position, item) in sequence.into_iter().enumerate() {
@@ -1985,6 +1996,7 @@ mod tests {
             anchored_index,
             last_segment_icon,
             None,
+            None,
             cx,
         )
     }
@@ -1996,6 +2008,7 @@ mod tests {
         anchored_index: Option<usize>,
         last_segment_icon: bool,
         editor: Option<WeakEntity<Editor>>,
+        rem_size: Option<Pixels>,
         cx: &mut gpui::TestAppContext,
     ) -> (Pixels, Rc<BreadcrumbRowProbe>) {
         let scroll_handle = gpui::ScrollHandle::new();
@@ -2014,8 +2027,13 @@ mod tests {
                 probe,
             }
         });
-        cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
-            .unwrap();
+        cx.update_window(window.into(), |_, window, cx| {
+            if let Some(rem_size) = rem_size {
+                window.set_rem_size(rem_size);
+            }
+            window.draw(cx).clear(cx)
+        })
+        .unwrap();
         (scroll_handle.max_offset().x, probe)
     }
 
@@ -2170,6 +2188,15 @@ mod tests {
         assert_eq!(ceil_to_device_pixel(px(46.7), 1.5), px(71. / 1.5));
         assert!(ceil_to_device_pixel(px(46.7), 1.5) > px(46.7));
         assert_eq!(ceil_to_device_pixel(px(46.), 1.5), px(46.));
+
+        assert_eq!(round_to_device_pixel(px(4.28125), 2.), px(4.5));
+        assert_eq!(
+            round_to_device_pixel(px(4.25), 2.),
+            px(4.),
+            "ties go toward zero"
+        );
+        assert_eq!(round_to_device_pixel(px(12.84375), 2.), px(13.));
+        assert_eq!(round_to_device_pixel(px(14.), 1.25), px(17. / 1.25));
     }
 
     fn sample_trail_labels() -> Vec<SharedString> {
@@ -2302,6 +2329,7 @@ mod tests {
             None,
             true,
             Some(editor.clone()),
+            None,
             cx,
         );
         let natural_extent = natural.painted_extent.get();
@@ -2318,6 +2346,7 @@ mod tests {
             None,
             true,
             Some(editor),
+            None,
             cx,
         );
         assert_eq!(
@@ -2326,6 +2355,59 @@ mod tests {
             "a container the width of the interactive trail must keep every segment"
         );
         assert_eq!(collapsed.painted_extent.get(), natural_extent);
+    }
+
+    /// rem 17.125 puts the gap, chevron and icon boxes off the device grid even at the pinned scale 2.
+    #[gpui::test]
+    fn test_a_fractional_rem_trail_reserves_what_it_paints(cx: &mut gpui::TestAppContext) {
+        crate::editor_tests::init_test(cx, |_| {});
+        register_probe_renderers();
+        let rem_size = Some(px(17.125));
+
+        let buffer = cx.new(|cx| language::Buffer::local("fn main() {}", cx));
+        let buffer = cx.new(|cx| multi_buffer::MultiBuffer::singleton(buffer, cx));
+        let editor_window =
+            cx.add_window(|window, cx| crate::test::build_editor(buffer, window, cx));
+        let editor = editor_window.root(cx).unwrap().downgrade();
+
+        let (_, natural) = draw_breadcrumb_row_probe(
+            sample_trail_labels(),
+            true,
+            px(4000.),
+            None,
+            true,
+            Some(editor.clone()),
+            rem_size,
+            cx,
+        );
+        let natural_extent = natural.painted_extent.get();
+        assert_eq!(
+            natural.bounds_width.get(),
+            natural_extent,
+            "the row must reserve each box the way taffy rounds it, or fractional boxes paint past the reserve"
+        );
+
+        let (_, collapsed) = draw_breadcrumb_row_probe(
+            sample_trail_labels(),
+            false,
+            natural_extent,
+            None,
+            true,
+            Some(editor),
+            rem_size,
+            cx,
+        );
+        assert_eq!(
+            collapsed.dropped_runs.get(),
+            0,
+            "an exact-fit container must keep every segment"
+        );
+        assert!(
+            collapsed.painted_extent.get() <= collapsed.bounds_width.get(),
+            "the last trigger box must not paint past the row at exact fit, got {:?} in {:?}",
+            collapsed.painted_extent.get(),
+            collapsed.bounds_width.get(),
+        );
     }
 
     struct EllipsisFallbackProbe {

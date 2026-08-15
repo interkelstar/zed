@@ -136,8 +136,9 @@ pub(crate) fn round_half_toward_zero_f64(value: f64) -> f64 {
     (value.abs() - 0.5).ceil().copysign(value)
 }
 
+/// Rounds a logical value to whole device pixels, ties toward zero, matching layout snapping.
 #[inline]
-pub(crate) fn round_to_device_pixel(logical: f32, scale_factor: f32) -> f32 {
+pub fn round_to_device_pixel(logical: f32, scale_factor: f32) -> f32 {
     round_half_toward_zero(logical * scale_factor)
 }
 
@@ -155,8 +156,9 @@ pub(crate) fn floor_to_device_pixel(logical: f32, scale_factor: f32) -> f32 {
     (logical * scale_factor).floor()
 }
 
+/// Ceils a logical value to whole device pixels, matching how measured text is snapped.
 #[inline]
-pub(crate) fn ceil_to_device_pixel(logical: f32, scale_factor: f32) -> f32 {
+pub fn ceil_to_device_pixel(logical: f32, scale_factor: f32) -> f32 {
     (logical * scale_factor).ceil()
 }
 
