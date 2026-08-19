@@ -118,6 +118,7 @@ pub struct BreadcrumbDirectoryDelegate {
     has_dir_entries: bool,
     has_file_entries: bool,
     core: BreadcrumbPickerCore,
+    pending_selection_key: Option<Arc<RelPath>>,
     /// Set while `expand_current_path`'s task is in flight, so an unscanned directory doesn't read as empty.
     loading: bool,
     _expand_task: gpui::Task<()>,
@@ -146,6 +147,7 @@ impl BreadcrumbDirectoryDelegate {
                 has_dir_entries: false,
                 has_file_entries: false,
                 core: BreadcrumbPickerCore::default(),
+                pending_selection_key: None,
                 loading: false,
                 _expand_task: gpui::Task::ready(()),
             };
@@ -172,6 +174,7 @@ impl BreadcrumbDirectoryDelegate {
     }
 
     fn reload_entries(&mut self, cx: &App) {
+        crate::record_pending_selection(self);
         let (Some(project), Some(worktree)) = (self.project(cx), self.worktree(cx)) else {
             self.entries = Vec::new();
             self.has_dir_entries = false;
@@ -276,6 +279,8 @@ impl BreadcrumbDirectoryDelegate {
 }
 
 impl BreadcrumbPickerDelegate for BreadcrumbDirectoryDelegate {
+    type SelectionKey = Arc<RelPath>;
+
     fn core(&self) -> &BreadcrumbPickerCore {
         &self.core
     }
@@ -290,6 +295,26 @@ impl BreadcrumbPickerDelegate for BreadcrumbDirectoryDelegate {
                 .get(candidate_id)
                 .is_some_and(|entry| active_path.starts_with(&entry.path))
         })
+    }
+
+    fn selection_key(&self, candidate_id: usize) -> Option<Arc<RelPath>> {
+        self.entries
+            .get(candidate_id)
+            .map(|entry| entry.path.clone())
+    }
+
+    fn matches_selection_key(&self, candidate_id: usize, selection_key: &Arc<RelPath>) -> bool {
+        self.entries
+            .get(candidate_id)
+            .is_some_and(|entry| entry.path == *selection_key)
+    }
+
+    fn pending_selection_key(&self) -> &Option<Arc<RelPath>> {
+        &self.pending_selection_key
+    }
+
+    fn pending_selection_key_mut(&mut self) -> &mut Option<Arc<RelPath>> {
+        &mut self.pending_selection_key
     }
 }
 
@@ -1446,6 +1471,199 @@ mod tests {
                 !picker.delegate.core.matches.is_empty(),
                 "a refresh under a typed query must keep the prior matches until the new \
                  fuzzy pass lands instead of flashing \"No matches\""
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_a_new_query_lands_on_its_best_match(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let mut t = directory_test(
+            json!({ "alpha": { "two.txt": "", "one_two.txt": "" } }),
+            "alpha",
+            None,
+            cx,
+        )
+        .await;
+        let cx = &mut t.cx;
+        cx.run_until_parked();
+
+        t.picker.update_in(cx, |picker, window, cx| {
+            picker.set_query("two", window, cx);
+        });
+        cx.run_until_parked();
+
+        let remembered_path = t.picker.update_in(cx, |picker, window, cx| {
+            picker.delegate.set_selected_index(1, window, cx);
+            picker
+                .delegate
+                .entry_at(1)
+                .expect("both rows match the query")
+                .path
+                .clone()
+        });
+
+        t.picker.update_in(cx, |picker, _window, cx| {
+            picker.delegate.reload_entries(cx);
+        });
+
+        t.picker.update_in(cx, |picker, window, cx| {
+            picker.set_query("wo", window, cx);
+        });
+        cx.run_until_parked();
+
+        t.picker.read_with(cx, |picker, _| {
+            let remembered_index = picker
+                .delegate
+                .core
+                .matches
+                .iter()
+                .position(|entry_match| {
+                    picker.delegate.entries[entry_match.candidate_id].path == remembered_path
+                })
+                .expect("the previously selected row still matches");
+            assert_ne!(
+                remembered_index, 0,
+                "the previously selected row must not also be the best match, or this test \
+                 asserts nothing"
+            );
+            assert_eq!(
+                picker.delegate.core.selected_index, 0,
+                "a newly typed query lands on its best match rather than on a remembered row"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_a_reload_under_a_query_keeps_the_selected_row(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let mut t = directory_test(
+            json!({ "alpha": { "one_beta.txt": "", "one_gamma.txt": "" } }),
+            "alpha",
+            None,
+            cx,
+        )
+        .await;
+        let cx = &mut t.cx;
+        cx.run_until_parked();
+
+        t.picker.update_in(cx, |picker, window, cx| {
+            window.focus(&picker.focus_handle(cx), cx);
+            picker.set_query("one", window, cx);
+        });
+        cx.run_until_parked();
+
+        cx.dispatch_action(menu::SelectNext);
+
+        let (selected_path, index_before) = t.picker.read_with(cx, |picker, _| {
+            (
+                picker
+                    .delegate
+                    .entry_at(picker.delegate.core.selected_index)
+                    .expect("a row is selected")
+                    .path
+                    .clone(),
+                picker.delegate.core.selected_index,
+            )
+        });
+        assert_eq!(index_before, 1, "the arrow key moved off the top match");
+
+        // Scores above the selected row, so keeping the old index would land elsewhere.
+        t.fs.insert_file(path!("/root/alpha/one.txt"), Default::default())
+            .await;
+        cx.run_until_parked();
+
+        t.picker.update_in(cx, |picker, window, cx| {
+            picker.delegate.reload_entries(cx);
+            picker.refresh(window, cx);
+        });
+        cx.run_until_parked();
+
+        t.picker.read_with(cx, |picker, _| {
+            assert_eq!(
+                picker.delegate.core.matches.len(),
+                3,
+                "the inserted file matches the query too"
+            );
+            assert_ne!(
+                picker.delegate.core.selected_index, index_before,
+                "the row shifted down, so restoring by position would be the wrong answer"
+            );
+            assert_eq!(
+                picker
+                    .delegate
+                    .entry_at(picker.delegate.core.selected_index)
+                    .map(|entry| entry.path.clone()),
+                Some(selected_path),
+                "a background reload keeps the row the user selected"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_a_reload_with_an_empty_query_keeps_the_selected_row(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let mut t = directory_test(
+            json!({ "alpha": { "a.txt": "", "b.txt": "", "c.txt": "", "d.txt": "" } }),
+            "alpha",
+            Some(rel_path("alpha/a.txt").into_arc()),
+            cx,
+        )
+        .await;
+        let cx = &mut t.cx;
+        cx.run_until_parked();
+
+        t.picker.update_in(cx, |picker, window, cx| {
+            window.focus(&picker.focus_handle(cx), cx);
+        });
+        cx.run_until_parked();
+
+        t.picker.read_with(cx, |picker, _| {
+            assert_eq!(
+                picker.delegate.core.selected_index, 0,
+                "the active file's row opens preselected"
+            );
+        });
+
+        cx.dispatch_action(menu::SelectNext);
+        cx.dispatch_action(menu::SelectNext);
+
+        t.picker.read_with(cx, |picker, _| {
+            assert_eq!(
+                picker
+                    .delegate
+                    .entry_at(picker.delegate.core.selected_index)
+                    .map(|entry| entry.name.as_ref()),
+                Some("c.txt"),
+            );
+        });
+
+        t.fs.insert_file(path!("/root/alpha/bb.txt"), Default::default())
+            .await;
+        cx.run_until_parked();
+
+        t.picker.update_in(cx, |picker, window, cx| {
+            picker.delegate.reload_entries(cx);
+            picker.refresh(window, cx);
+        });
+        cx.run_until_parked();
+
+        t.picker.read_with(cx, |picker, _| {
+            assert_eq!(
+                picker.delegate.core.selected_index, 3,
+                "the inserted row pushed the selection down"
+            );
+            assert_eq!(
+                picker
+                    .delegate
+                    .entry_at(picker.delegate.core.selected_index)
+                    .map(|entry| entry.name.as_ref()),
+                Some("c.txt"),
+                "an empty-query reload keeps the arrowed row instead of jumping back to the \
+                 active file"
             );
         });
     }

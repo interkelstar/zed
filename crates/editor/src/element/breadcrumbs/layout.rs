@@ -36,63 +36,113 @@ pub(crate) fn align_symbol_segments(
     }
 }
 
+/// A threshold, not a ceiling: a longer run is cut to half plus half around an ellipsis, leaving 65, or 69 when a protected anchor splits the cut in two.
 const MAX_BREADCRUMB_SEGMENTS_HARD_CAP: usize = 64;
 
+/// Segments kept on either side of the anchored one, so an open popover's trigger keeps its neighbours. Cosmetic: zero would be correct too.
+const ANCHORED_SEGMENT_CONTEXT_SEGMENTS: usize = 1;
+
+pub(crate) struct CappedBreadcrumbSegments {
+    pub(crate) segments: Vec<HighlightedText>,
+    pub(crate) symbol_segments: Vec<Option<BreadcrumbSegmentTarget>>,
+    pub(crate) kinds: Vec<BreadcrumbSegmentKind>,
+    pub(crate) file_segment_index: usize,
+    pub(crate) ellipsis_indices: Vec<usize>,
+}
+
+pub(crate) fn segment_run_bounds(
+    kinds: &[BreadcrumbSegmentKind],
+    kind: BreadcrumbSegmentKind,
+) -> Option<Range<usize>> {
+    let start = kinds.iter().position(|candidate| *candidate == kind)?;
+    let end = kinds.iter().rposition(|candidate| *candidate == kind)? + 1;
+    Some(start..end)
+}
+
+pub(crate) fn remap_index_after_splice(index: usize, spliced: &Range<usize>) -> usize {
+    debug_assert!(spliced.len() >= 2);
+    if index >= spliced.end {
+        index - (spliced.len() - 1)
+    } else if index >= spliced.start {
+        spliced.start
+    } else {
+        index
+    }
+}
+
 /// The cap is display-only, so an expanded row bypasses it: expansion must reveal every segment.
-pub(crate) fn hard_cap_breadcrumb_middle_segments(
+pub(crate) fn hard_cap_breadcrumb_segment_runs(
     mut segments: Vec<HighlightedText>,
     mut symbol_segments: Vec<Option<BreadcrumbSegmentTarget>>,
     mut kinds: Vec<BreadcrumbSegmentKind>,
     mut file_segment_index: usize,
+    mut anchored_index: Option<usize>,
     expanded: bool,
-) -> (
-    Vec<HighlightedText>,
-    Vec<Option<BreadcrumbSegmentTarget>>,
-    Vec<BreadcrumbSegmentKind>,
-    usize,
-    Option<usize>,
-) {
-    let middle_start = kinds
-        .iter()
-        .position(|kind| *kind == BreadcrumbSegmentKind::Middle);
-    let middle_end = kinds
-        .iter()
-        .rposition(|kind| *kind == BreadcrumbSegmentKind::Middle)
-        .map(|index| index + 1);
-    let (Some(middle_start), Some(middle_end)) = (middle_start, middle_end) else {
-        return (segments, symbol_segments, kinds, file_segment_index, None);
-    };
-    if expanded || middle_end - middle_start <= MAX_BREADCRUMB_SEGMENTS_HARD_CAP {
-        return (segments, symbol_segments, kinds, file_segment_index, None);
+) -> CappedBreadcrumbSegments {
+    let mut ellipsis_indices = Vec::new();
+    if expanded {
+        return CappedBreadcrumbSegments {
+            segments,
+            symbol_segments,
+            kinds,
+            file_segment_index,
+            ellipsis_indices,
+        };
     }
 
-    let half = MAX_BREADCRUMB_SEGMENTS_HARD_CAP / 2;
-    let splice_start = middle_start + half;
-    let splice_end = middle_end - half;
+    for kind in [BreadcrumbSegmentKind::Middle, BreadcrumbSegmentKind::Symbol] {
+        let Some(run) = segment_run_bounds(&kinds, kind) else {
+            continue;
+        };
+        if run.len() <= MAX_BREADCRUMB_SEGMENTS_HARD_CAP {
+            continue;
+        }
 
-    segments.splice(
-        splice_start..splice_end,
-        Some(HighlightedText {
-            text: "⋯".into(),
-            highlights: vec![],
-        }),
-    );
-    symbol_segments.splice(splice_start..splice_end, Some(None));
-    kinds.splice(
-        splice_start..splice_end,
-        Some(BreadcrumbSegmentKind::Middle),
-    );
+        let half = MAX_BREADCRUMB_SEGMENTS_HARD_CAP / 2;
+        let cut = run.start + half..run.end - half;
+        // Cutting the anchor away leaves no segment flagged active, so nothing protects the popover.
+        let cuts = match anchored_index.filter(|index| cut.contains(index)) {
+            Some(anchored) => {
+                let kept_start = anchored
+                    .saturating_sub(ANCHORED_SEGMENT_CONTEXT_SEGMENTS)
+                    .max(cut.start);
+                let kept_end = (anchored + ANCHORED_SEGMENT_CONTEXT_SEGMENTS + 1).min(cut.end);
+                // Right to left, so the left cut's bounds survive the right one's splice.
+                vec![kept_end..cut.end, cut.start..kept_start]
+            }
+            None => vec![cut],
+        };
 
-    // `File` always follows every `Middle` segment, so this splice can only shift its index left.
-    file_segment_index -= (splice_end - splice_start) - 1;
+        for cut in cuts {
+            if cut.len() < 2 {
+                continue;
+            }
+            segments.splice(
+                cut.clone(),
+                Some(HighlightedText {
+                    text: "⋯".into(),
+                    highlights: vec![],
+                }),
+            );
+            symbol_segments.splice(cut.clone(), Some(None));
+            kinds.splice(cut.clone(), Some(kind));
 
-    (
+            file_segment_index = remap_index_after_splice(file_segment_index, &cut);
+            anchored_index = anchored_index.map(|index| remap_index_after_splice(index, &cut));
+            for index in &mut ellipsis_indices {
+                *index = remap_index_after_splice(*index, &cut);
+            }
+            ellipsis_indices.push(cut.start);
+        }
+    }
+
+    CappedBreadcrumbSegments {
         segments,
         symbol_segments,
         kinds,
         file_segment_index,
-        Some(splice_start),
-    )
+        ellipsis_indices,
+    }
 }
 
 /// `visible` and `ellipses` together partition `0..segment_count`.
@@ -265,15 +315,27 @@ mod tests {
         assert_eq!(kinds, vec![BreadcrumbSegmentKind::File]);
     }
 
-    /// Without `align_symbol_segments`, a short `symbol_segments` panics: splices below assume `segments.len()`.
-    #[test]
-    fn test_hard_cap_breadcrumb_middle_segments_does_not_panic_on_divergent_symbol_segments() {
-        let segments: Vec<HighlightedText> = (0..100)
-            .map(|i| HighlightedText {
-                text: format!("segment-{i}").into(),
+    fn numbered_segments(count: usize) -> Vec<HighlightedText> {
+        (0..count)
+            .map(|index| HighlightedText {
+                text: format!("segment-{index}").into(),
                 highlights: vec![],
             })
-            .collect();
+            .collect()
+    }
+
+    fn anchored_target() -> Option<BreadcrumbSegmentTarget> {
+        Some(BreadcrumbSegmentTarget::Symbol {
+            buffer_id: BufferId::new(1).unwrap(),
+            item: None,
+            is_active_segment: true,
+        })
+    }
+
+    /// Without `align_symbol_segments`, a short `symbol_segments` panics: splices below assume `segments.len()`.
+    #[test]
+    fn test_hard_cap_breadcrumb_segment_runs_does_not_panic_on_divergent_symbol_segments() {
+        let segments = numbered_segments(100);
         let symbol_segments = vec![Some(BreadcrumbSegmentTarget::Symbol {
             buffer_id: BufferId::new(1).unwrap(),
             item: None,
@@ -284,63 +346,160 @@ mod tests {
 
         let kinds = classify_breadcrumb_segment_kinds(segments.len(), 99, true);
 
-        let (capped_segments, capped_symbol_segments, capped_kinds, file_segment_index, cap_index) =
-            hard_cap_breadcrumb_middle_segments(
-                segments.clone(),
-                symbol_segments.clone(),
-                kinds.clone(),
-                99,
-                false,
-            );
+        let capped = hard_cap_breadcrumb_segment_runs(
+            segments.clone(),
+            symbol_segments.clone(),
+            kinds.clone(),
+            99,
+            None,
+            false,
+        );
 
         // 67 = root (1) + capped middle (32 prefix + 1 "⋯" + 32 suffix) + file (1).
-        assert_eq!(capped_segments.len(), 67);
-        assert_eq!(capped_symbol_segments.len(), capped_segments.len());
-        assert_eq!(capped_kinds.len(), capped_segments.len());
-        assert_eq!(file_segment_index, 66);
+        assert_eq!(capped.segments.len(), 67);
+        assert_eq!(capped.symbol_segments.len(), capped.segments.len());
+        assert_eq!(capped.kinds.len(), capped.segments.len());
+        assert_eq!(capped.file_segment_index, 66);
         assert_eq!(
-            capped_kinds[file_segment_index],
+            capped.kinds[capped.file_segment_index],
             BreadcrumbSegmentKind::File
         );
         assert_eq!(
-            cap_index,
-            Some(33),
+            capped.ellipsis_indices,
+            vec![33],
             "the pseudo-segment sits after the root and the 32 kept prefix segments"
         );
-        assert_eq!(capped_segments[33].text.as_ref(), "⋯");
+        assert_eq!(capped.segments[33].text.as_ref(), "⋯");
 
-        let (segments, symbol_segments, kinds, file_segment_index, cap_index) =
-            hard_cap_breadcrumb_middle_segments(segments, symbol_segments, kinds, 99, true);
+        let expanded =
+            hard_cap_breadcrumb_segment_runs(segments, symbol_segments, kinds, 99, None, true);
         assert_eq!(
-            segments.len(),
+            expanded.segments.len(),
             100,
             "an expanded row bypasses the cap so expansion reveals every segment"
         );
-        assert_eq!(symbol_segments.len(), 100);
-        assert_eq!(kinds.len(), 100);
-        assert_eq!(file_segment_index, 99);
-        assert_eq!(cap_index, None);
+        assert_eq!(expanded.symbol_segments.len(), 100);
+        assert_eq!(expanded.kinds.len(), 100);
+        assert_eq!(expanded.file_segment_index, 99);
+        assert!(expanded.ellipsis_indices.is_empty());
     }
 
     #[test]
-    fn test_hard_cap_breadcrumb_middle_segments_leaves_ordinary_input_untouched() {
-        let segments: Vec<HighlightedText> = (0..6)
-            .map(|i| HighlightedText {
-                text: format!("segment-{i}").into(),
-                highlights: vec![],
-            })
-            .collect();
+    fn test_hard_cap_breadcrumb_segment_runs_leaves_ordinary_input_untouched() {
+        let segments = numbered_segments(6);
         let symbol_segments = vec![None; segments.len()];
         let kinds = classify_breadcrumb_segment_kinds(segments.len(), 3, true);
 
-        let (segments, symbol_segments, kinds, file_segment_index, cap_index) =
-            hard_cap_breadcrumb_middle_segments(segments, symbol_segments, kinds, 3, false);
+        let capped =
+            hard_cap_breadcrumb_segment_runs(segments, symbol_segments, kinds, 3, None, false);
 
-        assert_eq!(segments.len(), 6);
-        assert_eq!(symbol_segments.len(), 6);
-        assert_eq!(kinds.len(), 6);
-        assert_eq!(file_segment_index, 3);
-        assert_eq!(cap_index, None);
+        assert_eq!(capped.segments.len(), 6);
+        assert_eq!(capped.symbol_segments.len(), 6);
+        assert_eq!(capped.kinds.len(), 6);
+        assert_eq!(capped.file_segment_index, 3);
+        assert!(capped.ellipsis_indices.is_empty());
+    }
+
+    #[test]
+    fn test_hard_cap_breadcrumb_segment_runs_caps_a_symbol_run_without_any_middle_segments() {
+        let segments = numbered_segments(201);
+        let symbol_segments = vec![None; segments.len()];
+        let kinds = classify_breadcrumb_segment_kinds(segments.len(), 0, false);
+        assert!(
+            !kinds.contains(&BreadcrumbSegmentKind::Middle),
+            "the fixture must exercise the symbol run, not the middle one"
+        );
+
+        let capped =
+            hard_cap_breadcrumb_segment_runs(segments, symbol_segments, kinds, 0, None, false);
+
+        assert_eq!(
+            capped.segments.len(),
+            66,
+            "file (1) + capped symbols (32 prefix + 1 \"⋯\" + 32 suffix)"
+        );
+        assert_eq!(capped.symbol_segments.len(), 66);
+        assert_eq!(capped.kinds.len(), 66);
+        assert_eq!(capped.file_segment_index, 0);
+        assert_eq!(capped.ellipsis_indices, vec![33]);
+        assert_eq!(capped.segments[33].text.as_ref(), "⋯");
+    }
+
+    #[test]
+    fn test_hard_cap_breadcrumb_segment_runs_keeps_the_anchored_segment_in_either_run() {
+        let cases = [(200usize, 100usize, false), (0, 100, true)];
+        for (file_segment_index, anchored_index, symbol_run) in cases {
+            let segments = numbered_segments(201);
+            let mut symbol_segments = vec![None; segments.len()];
+            symbol_segments[anchored_index] = anchored_target();
+            let kinds =
+                classify_breadcrumb_segment_kinds(segments.len(), file_segment_index, false);
+            assert_eq!(
+                kinds[anchored_index],
+                if symbol_run {
+                    BreadcrumbSegmentKind::Symbol
+                } else {
+                    BreadcrumbSegmentKind::Middle
+                }
+            );
+            let anchored_label = segments[anchored_index].text.clone();
+
+            let capped = hard_cap_breadcrumb_segment_runs(
+                segments,
+                symbol_segments,
+                kinds,
+                file_segment_index,
+                Some(anchored_index),
+                false,
+            );
+
+            assert!(
+                capped.segments.len() < 201,
+                "the cap must still fire around the protected segment"
+            );
+            let surviving = capped
+                .symbol_segments
+                .iter()
+                .position(is_anchored_breadcrumb_target)
+                .expect("dropping the anchor leaves no segment flagged active at all");
+            assert_eq!(
+                capped.segments[surviving].text, anchored_label,
+                "the protected segment must be the one the popover is anchored to"
+            );
+            assert_eq!(
+                capped.kinds[capped.file_segment_index],
+                BreadcrumbSegmentKind::File,
+                "the file index must survive a splice on either side of it"
+            );
+            assert_eq!(
+                capped.ellipsis_indices.len(),
+                2,
+                "protecting a segment mid-run splits the cut in two"
+            );
+            for index in &capped.ellipsis_indices {
+                assert_eq!(capped.segments[*index].text.as_ref(), "⋯");
+            }
+        }
+    }
+
+    #[test]
+    fn test_remap_index_after_splice() {
+        let spliced = 4..9;
+        assert_eq!(remap_index_after_splice(3, &spliced), 3);
+        assert_eq!(remap_index_after_splice(4, &spliced), 4);
+        assert_eq!(remap_index_after_splice(8, &spliced), 4);
+        assert_eq!(remap_index_after_splice(9, &spliced), 5);
+        assert_eq!(remap_index_after_splice(12, &spliced), 8);
+    }
+
+    #[test]
+    fn test_segment_run_bounds() {
+        use BreadcrumbSegmentKind::*;
+        let kinds = vec![Root, Middle, Middle, File, Symbol, Symbol];
+        assert_eq!(segment_run_bounds(&kinds, Middle), Some(1..3));
+        assert_eq!(segment_run_bounds(&kinds, Symbol), Some(4..6));
+        assert_eq!(segment_run_bounds(&kinds, Root), Some(0..1));
+        assert_eq!(segment_run_bounds(&[Root, File], Symbol), None);
     }
 
     /// Separator-free, so each case's threshold is the sum of the widths it names.

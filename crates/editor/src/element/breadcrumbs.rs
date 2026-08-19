@@ -16,8 +16,8 @@ mod path;
 
 pub(crate) use layout::BreadcrumbSegmentKind;
 use layout::{
-    BreadcrumbLayoutPlan, align_symbol_segments, classify_breadcrumb_segment_kinds,
-    hard_cap_breadcrumb_middle_segments,
+    BreadcrumbLayoutPlan, CappedBreadcrumbSegments, align_symbol_segments,
+    classify_breadcrumb_segment_kinds, hard_cap_breadcrumb_segment_runs,
 };
 use layout::{breadcrumb_layout_plan_width, plan_breadcrumb_layout};
 pub(crate) use outline::outline_parents;
@@ -431,6 +431,10 @@ struct BreadcrumbsRow {
 struct BreadcrumbRowProbe {
     painted_extent: std::cell::Cell<Pixels>,
     last_segment_max_width: std::cell::Cell<Option<Pixels>>,
+    anchored_segment_max_width: std::cell::Cell<Option<Pixels>>,
+    tail_collapsed_to_ellipsis: std::cell::Cell<bool>,
+    ellipsis_width: std::cell::Cell<Pixels>,
+    separator_width: std::cell::Cell<Pixels>,
     dropped_runs: std::cell::Cell<usize>,
     bounds_width: std::cell::Cell<Pixels>,
 }
@@ -756,19 +760,23 @@ impl BreadcrumbsRow {
 
     /// The segment a popover is currently open under, if any: `plan_breadcrumb_layout` must never collapse it.
     fn anchored_segment_index(&self) -> Option<usize> {
-        self.segments.iter().position(|segment| {
-            matches!(
-                segment.target,
-                Some(BreadcrumbSegmentTarget::Directory {
-                    is_active_segment: true,
-                    ..
-                }) | Some(BreadcrumbSegmentTarget::Symbol {
-                    is_active_segment: true,
-                    ..
-                })
-            )
-        })
+        self.segments
+            .iter()
+            .position(|segment| is_anchored_breadcrumb_target(&segment.target))
     }
+}
+
+pub(crate) fn is_anchored_breadcrumb_target(target: &Option<BreadcrumbSegmentTarget>) -> bool {
+    matches!(
+        target,
+        Some(BreadcrumbSegmentTarget::Directory {
+            is_active_segment: true,
+            ..
+        }) | Some(BreadcrumbSegmentTarget::Symbol {
+            is_active_segment: true,
+            ..
+        })
+    )
 }
 
 fn wrap_segment(element: gpui::AnyElement) -> gpui::AnyElement {
@@ -804,36 +812,6 @@ fn resolve_breadcrumb_segment_copy_path(
         _ => None,
     };
     breadcrumb_segment_copy_path(target, worktree_abs_path, file_abs_path, symbol_line)
-}
-
-/// Called when the layout drops the anchored segment: otherwise the popover stays deployed with no trigger left to dismiss it.
-fn dismiss_orphaned_breadcrumb_popover(
-    editor: &Entity<Editor>,
-    target: &BreadcrumbSegmentTarget,
-    cx: &mut App,
-) {
-    match target {
-        BreadcrumbSegmentTarget::Directory {
-            worktree_id, path, ..
-        } => {
-            if let Some(handle) = editor.read(cx).breadcrumb_popover_handle() {
-                handle.hide(cx);
-            }
-            editor.update(cx, |editor, cx| {
-                editor.clear_breadcrumb_navigation(*worktree_id, path, cx);
-            });
-        }
-        BreadcrumbSegmentTarget::Symbol {
-            buffer_id, item, ..
-        } => {
-            if let Some(handle) = editor.read(cx).breadcrumb_symbol_popover_handle() {
-                handle.hide(cx);
-            }
-            editor.update(cx, |editor, cx| {
-                editor.clear_breadcrumb_symbol_navigation(*buffer_id, item.as_ref(), cx);
-            });
-        }
-    }
 }
 
 /// The trail's last segment, the one collapsing never drops: the deepest symbol at the
@@ -971,18 +949,8 @@ impl gpui::Element for BreadcrumbsRow {
             )
         };
 
-        if let Some(anchored_index) = anchored_index
-            && !plan.visible.contains(&anchored_index)
-            && let Some(target) = self
-                .segments
-                .get(anchored_index)
-                .and_then(|segment| segment.target.clone())
-            && let Some(editor) = self.editor.as_ref().and_then(WeakEntity::upgrade)
-            // Reanchoring drops and re-shows the popover itself; dismissing mid-flight fights it.
-            && !editor.read(cx).breadcrumb_reanchoring()
-        {
-            dismiss_orphaned_breadcrumb_popover(&editor, &target, cx);
-        }
+        // An open popover hangs off its trigger's element, so no plan may collapse that segment.
+        debug_assert!(anchored_index.is_none_or(|index| plan.visible.contains(&index)));
 
         enum FinalItem {
             Segment(usize),
@@ -1003,27 +971,51 @@ impl gpui::Element for BreadcrumbsRow {
         }
 
         let last_position = sequence.len().saturating_sub(1);
-        // Nothing left to drop and still too wide: the last label must ellipsize itself.
-        let truncate_last =
+        // Nothing left to drop and still too wide: the surviving labels must ellipsize themselves.
+        let truncate_overflow =
             !self.expanded && breadcrumb_layout_plan_width(metrics, &plan) > bounds.size.width;
         // Snapped like taffy's in-segment gaps, so children start on the device grid.
         let gap = round_to_device_pixel(window.rem_size() * 0.25, window.scale_factor());
         let mut x = bounds.origin.x;
         let mut children = Vec::with_capacity(sequence.len());
         for (position, item) in sequence.into_iter().enumerate() {
-            let max_width = (truncate_last && position == last_position)
-                .then(|| (bounds.origin.x + bounds.size.width - x).max(Pixels::ZERO));
+            let is_anchored =
+                matches!(&item, FinalItem::Segment(index) if Some(*index) == anchored_index);
+            let remaining = (bounds.origin.x + bounds.size.width - x).max(Pixels::ZERO);
+            let max_width = if !truncate_overflow {
+                None
+            } else if position == last_position {
+                Some(remaining)
+            } else if is_anchored {
+                // Exempt from dropping, so uncapped it pushes `x` past the row and zeroes the tail.
+                let following = last_position - position;
+                // Each of them costs a glyph and the separator in front of it, the anchor's included.
+                let reserved =
+                    (metrics.ellipsis_width + metrics.separator_width) * following as f32;
+                // Collapsing the anchor to nothing would strand the popover in the corner.
+                Some((remaining - reserved).max(metrics.ellipsis_width))
+            } else {
+                None
+            };
+            // Too narrow even for "⋯": a clamped label paints nothing, the ellipsis still expands.
+            let collapse_to_ellipsis = position == last_position
+                && !is_anchored
+                && max_width.is_some_and(|width| width < metrics.ellipsis_width);
             #[cfg(test)]
-            if position == last_position
-                && let Some(probe) = &self.probe
-            {
-                probe.last_segment_max_width.set(max_width);
+            if let Some(probe) = &self.probe {
+                if position == last_position {
+                    probe.last_segment_max_width.set(max_width);
+                    probe.tail_collapsed_to_ellipsis.set(collapse_to_ellipsis);
+                }
+                if is_anchored {
+                    probe.anchored_segment_max_width.set(max_width);
+                }
             }
             let mut element = match item {
-                FinalItem::Segment(index) => {
+                FinalItem::Segment(index) if !collapse_to_ellipsis => {
                     self.render_segment(index, position, last_position, max_width, window, cx)
                 }
-                FinalItem::Ellipsis => self.render_ellipsis(position, last_position, cx),
+                _ => self.render_ellipsis(position, last_position, cx),
             };
             let available_space = size(
                 AvailableSpace::MaxContent,
@@ -1044,6 +1036,8 @@ impl gpui::Element for BreadcrumbsRow {
                 .set((x - gap - bounds.origin.x).max(Pixels::ZERO));
             probe.dropped_runs.set(plan.ellipses.len());
             probe.bounds_width.set(bounds.size.width);
+            probe.ellipsis_width.set(metrics.ellipsis_width);
+            probe.separator_width.set(metrics.separator_width);
         }
 
         if let Some(editor) = self.editor.as_ref().and_then(WeakEntity::upgrade)
@@ -1269,14 +1263,23 @@ pub fn render_breadcrumb_text(
     let symbol_segments = align_symbol_segments(&segments, symbol_segments);
     let kinds =
         classify_breadcrumb_segment_kinds(segments.len(), file_segment_index, has_root_segment);
-    let (segments, symbol_segments, kinds, file_segment_index, hard_cap_index) =
-        hard_cap_breadcrumb_middle_segments(
-            segments,
-            symbol_segments,
-            kinds,
-            file_segment_index,
-            expanded,
-        );
+    let anchored_index = symbol_segments
+        .iter()
+        .position(is_anchored_breadcrumb_target);
+    let CappedBreadcrumbSegments {
+        segments,
+        symbol_segments,
+        kinds,
+        file_segment_index,
+        ellipsis_indices,
+    } = hard_cap_breadcrumb_segment_runs(
+        segments,
+        symbol_segments,
+        kinds,
+        file_segment_index,
+        anchored_index,
+        expanded,
+    );
 
     // At most one file icon on screen: the tab-bar-hidden prefix already renders one.
     let file_icon =
@@ -1322,7 +1325,7 @@ pub fn render_breadcrumb_text(
                 } else {
                     Color::Muted
                 },
-                hard_cap_ellipsis: Some(index) == hard_cap_index,
+                hard_cap_ellipsis: ellipsis_indices.contains(&index),
             }
         })
         .collect();
@@ -1569,47 +1572,6 @@ mod tests {
             "color must fall through to the base run's"
         );
         assert_eq!(highlight.font_weight, Some(FontWeight::BOLD));
-    }
-
-    /// `editor` cannot depend on `breadcrumb_picker` for a real popover handle, so this covers
-    /// only the navigation-state half of `dismiss_orphaned_breadcrumb_popover`.
-    #[gpui::test]
-    fn test_dismiss_orphaned_breadcrumb_popover_clears_directory_navigation(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        crate::editor_tests::init_test(cx, |_| {});
-
-        let buffer = cx.new(|cx| language::Buffer::local("fn main() {}", cx));
-        let buffer = cx.new(|cx| multi_buffer::MultiBuffer::singleton(buffer, cx));
-        let editor_window =
-            cx.add_window(|window, cx| crate::test::build_editor(buffer, window, cx));
-        let editor = editor_window.root(cx).unwrap();
-        let worktree_id = WorktreeId::from_usize(0);
-        let path = RelPath::empty().into_arc();
-
-        editor.update(cx, |editor, cx| {
-            editor.open_breadcrumb_navigation(worktree_id, path.clone(), cx);
-        });
-        editor.read_with(cx, |editor, _| {
-            assert!(editor.breadcrumb_navigation().is_some());
-        });
-
-        let target = BreadcrumbSegmentTarget::Directory {
-            worktree_id,
-            path: path.clone(),
-            active_path: None,
-            is_active_segment: true,
-        };
-        cx.update(|cx| {
-            dismiss_orphaned_breadcrumb_popover(&editor, &target, cx);
-        });
-
-        editor.read_with(cx, |editor, _| {
-            assert!(
-                editor.breadcrumb_navigation().is_none(),
-                "a segment the layout could not keep must drop its navigation session"
-            );
-        });
     }
 
     #[gpui::test]
@@ -2181,6 +2143,129 @@ mod tests {
         );
     }
 
+    #[gpui::test]
+    fn test_an_anchored_segment_shrinks_instead_of_eating_the_last_label(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let anchor =
+            SharedString::from("an-anchored-middle-segment-far-wider-than-the-row-it-lives-in");
+
+        let (_, natural) = draw_breadcrumb_row_in_container(
+            vec![anchor.clone()],
+            true,
+            px(4000.),
+            Some(0),
+            false,
+            cx,
+        );
+        let anchor_natural = natural.painted_extent.get();
+        let container = anchor_natural / 2.;
+
+        let (_, probe) = draw_breadcrumb_row_in_container(
+            vec![anchor, SharedString::from("file-name")],
+            false,
+            container,
+            Some(0),
+            false,
+            cx,
+        );
+        let ellipsis_width = probe.ellipsis_width.get();
+        let anchored_max_width = probe
+            .anchored_segment_max_width
+            .get()
+            .expect("the anchored segment must be given a ceiling when the row overflows");
+        assert!(
+            anchored_max_width < anchor_natural,
+            "the anchored segment must shrink, got {anchored_max_width:?} of {anchor_natural:?}"
+        );
+        assert_eq!(
+            probe.last_segment_max_width.get(),
+            Some(ellipsis_width),
+            "the tail keeps exactly one ellipsis of room and the anchor takes the rest, so a reserve one separator too generous fails here"
+        );
+        assert!(
+            probe.painted_extent.get() <= container,
+            "painted {:?} in {container:?}",
+            probe.painted_extent.get()
+        );
+    }
+
+    #[gpui::test]
+    fn test_a_tail_with_no_room_left_paints_an_ellipsis(cx: &mut gpui::TestAppContext) {
+        let anchor = SharedString::from("an-anchored-segment-wider-than-the-whole-row");
+
+        let mut painted_extents = Vec::new();
+        for container in [px(24.), px(40.)] {
+            let (_, probe) = draw_breadcrumb_row_in_container(
+                vec![anchor.clone(), SharedString::from("file-name")],
+                false,
+                container,
+                Some(0),
+                false,
+                cx,
+            );
+
+            let ellipsis_width = probe.ellipsis_width.get();
+            assert!(
+                probe
+                    .last_segment_max_width
+                    .get()
+                    .is_some_and(|width| width < ellipsis_width),
+                "sanity: the anchor's floor must leave the tail less than a glyph, got {:?}",
+                probe.last_segment_max_width.get()
+            );
+            assert!(
+                probe.tail_collapsed_to_ellipsis.get(),
+                "the tail must fall back to the expandable ellipsis instead of a blank box"
+            );
+            assert_eq!(
+                probe.anchored_segment_max_width.get(),
+                Some(ellipsis_width),
+                "the anchor must stop at its floor, or the popover hangs off a box of bare padding"
+            );
+            // The floor is a label budget, so the anchor's box outgrows it by the separator it also paints.
+            let minimum_row = ellipsis_width * 2. + probe.separator_width.get();
+            assert!(
+                probe.painted_extent.get() <= minimum_row,
+                "a strip under {minimum_row:?} cannot hold trigger plus tail and clips one, but the row must not paint past its own minimum: {:?} in {container:?}",
+                probe.painted_extent.get()
+            );
+            painted_extents.push(probe.painted_extent.get());
+        }
+        assert_eq!(
+            painted_extents[0], painted_extents[1],
+            "the row is already at its minimum, so a wider strip cannot change what it paints"
+        );
+    }
+
+    #[gpui::test]
+    fn test_an_anchored_last_segment_is_never_collapsed(cx: &mut gpui::TestAppContext) {
+        let (_, probe) = draw_breadcrumb_row_in_container(
+            vec![
+                SharedString::from("a-leading-directory-segment"),
+                SharedString::from("an-anchored-last-segment"),
+            ],
+            false,
+            px(40.),
+            Some(1),
+            false,
+            cx,
+        );
+
+        assert!(
+            probe
+                .last_segment_max_width
+                .get()
+                .is_some_and(|width| width < probe.ellipsis_width.get()),
+            "sanity: the tail must be under a glyph, or the guard is not exercised, got {:?}",
+            probe.last_segment_max_width.get()
+        );
+        assert!(
+            !probe.tail_collapsed_to_ellipsis.get(),
+            "the popover's trigger must survive as a segment however narrow the strip is"
+        );
+    }
+
     /// The test platform pins every window to scale 2, so the fractional grid is only reachable here.
     #[test]
     fn test_ceil_to_device_pixel_reserves_on_the_device_grid() {
@@ -2219,9 +2304,16 @@ mod tests {
     #[gpui::test]
     fn test_a_row_that_fits_keeps_every_segment_and_clamps_none(cx: &mut gpui::TestAppContext) {
         let labels = sample_trail_labels();
+        let anchored_index = Some(1);
 
-        let (_, natural) =
-            draw_breadcrumb_row_in_container(labels.clone(), true, px(4000.), None, true, cx);
+        let (_, natural) = draw_breadcrumb_row_in_container(
+            labels.clone(),
+            true,
+            px(4000.),
+            anchored_index,
+            true,
+            cx,
+        );
         let natural_extent = natural.painted_extent.get();
         assert_eq!(
             natural.bounds_width.get(),
@@ -2229,8 +2321,14 @@ mod tests {
             "the row must reserve what it paints, or it collapses a trail that would have fit"
         );
 
-        let (scroll_range, probe) =
-            draw_breadcrumb_row_in_container(labels, false, natural_extent, None, true, cx);
+        let (scroll_range, probe) = draw_breadcrumb_row_in_container(
+            labels,
+            false,
+            natural_extent,
+            anchored_index,
+            true,
+            cx,
+        );
         assert_eq!(scroll_range, px(0.));
         assert_eq!(
             probe.dropped_runs.get(),
@@ -2241,6 +2339,11 @@ mod tests {
             probe.last_segment_max_width.get(),
             None,
             "nothing overflows, so the last segment must not be clamped"
+        );
+        assert_eq!(
+            probe.anchored_segment_max_width.get(),
+            None,
+            "nothing overflows, so the anchored segment must not be handed a budget either"
         );
         assert_eq!(probe.painted_extent.get(), natural_extent);
     }

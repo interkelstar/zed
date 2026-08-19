@@ -24,6 +24,7 @@ pub struct BreadcrumbSymbolDelegate {
     target: Option<OutlineItem<Anchor>>,
     items: Vec<OutlineItem<Anchor>>,
     core: BreadcrumbPickerCore,
+    pending_selection_key: Option<Range<Anchor>>,
     parent_dir: Option<(WorktreeId, Arc<RelPath>)>,
     /// The outline had not answered yet when the popover opened; cleared once `watch_outline_ready`'s task lands.
     loading: bool,
@@ -50,6 +51,7 @@ impl BreadcrumbSymbolDelegate {
                 target: target.clone(),
                 items: Vec::new(),
                 core: BreadcrumbPickerCore::default(),
+                pending_selection_key: None,
                 parent_dir,
                 loading,
                 _loading_task: Task::ready(()),
@@ -70,6 +72,7 @@ impl BreadcrumbSymbolDelegate {
 
     /// Rebuilds `candidates` for new `items`, then rebuilds the empty-query display from them.
     fn reset_items(&mut self, items: Vec<OutlineItem<Anchor>>) {
+        crate::record_pending_selection(self);
         self.core.candidates = items
             .iter()
             .enumerate()
@@ -139,6 +142,8 @@ impl BreadcrumbSymbolDelegate {
 }
 
 impl BreadcrumbPickerDelegate for BreadcrumbSymbolDelegate {
+    type SelectionKey = Range<Anchor>;
+
     fn core(&self) -> &BreadcrumbPickerCore {
         &self.core
     }
@@ -153,6 +158,24 @@ impl BreadcrumbPickerDelegate for BreadcrumbSymbolDelegate {
                 .get(candidate_id)
                 .is_some_and(|item| &item.range == range)
         })
+    }
+
+    fn selection_key(&self, candidate_id: usize) -> Option<Range<Anchor>> {
+        self.items.get(candidate_id).map(|item| item.range.clone())
+    }
+
+    fn matches_selection_key(&self, candidate_id: usize, selection_key: &Range<Anchor>) -> bool {
+        self.items
+            .get(candidate_id)
+            .is_some_and(|item| &item.range == selection_key)
+    }
+
+    fn pending_selection_key(&self) -> &Option<Range<Anchor>> {
+        &self.pending_selection_key
+    }
+
+    fn pending_selection_key_mut(&mut self) -> &mut Option<Range<Anchor>> {
+        &mut self.pending_selection_key
     }
 }
 
@@ -604,6 +627,76 @@ mod tests {
             assert!(
                 Rc::ptr_eq(&candidates_before, &picker.delegate.core.candidates),
                 "successive keystrokes must reuse the same candidate list, not rebuild it"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_a_late_outline_keeps_the_selected_symbol(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let mut t = symbol_test(Some("fn gamma"), cx);
+        let cx = &mut t.cx;
+
+        t.picker.update_in(cx, |picker, window, cx| {
+            window.focus(&picker.focus_handle(cx), cx);
+            picker.set_query("a", window, cx);
+        });
+        cx.run_until_parked();
+
+        let selected_range = t.picker.update_in(cx, |picker, window, cx| {
+            let index = picker
+                .delegate
+                .core
+                .matches
+                .iter()
+                .position(|entry_match| {
+                    picker.delegate.items[entry_match.candidate_id]
+                        .text
+                        .as_ref()
+                        == "fn gamma"
+                })
+                .expect("the query lists the sibling method");
+            picker.delegate.set_selected_index(index, window, cx);
+            picker.delegate.items[picker.delegate.core.matches[index].candidate_id]
+                .range
+                .clone()
+        });
+
+        // The arriving outline adds a symbol that sorts ahead of the selected one.
+        let extra_item = t.editor.read_with(cx, |editor, cx| {
+            outline_item_named(editor, t.buffer_id, "struct Alpha", cx)
+        });
+        let updated_items = t.picker.read_with(cx, |picker, _| {
+            let mut items = vec![extra_item];
+            items.extend(picker.delegate.items.iter().cloned());
+            items
+        });
+
+        t.picker.update_in(cx, |picker, window, cx| {
+            picker.delegate.reset_items(updated_items);
+            picker.refresh(window, cx);
+        });
+        cx.run_until_parked();
+
+        t.picker.read_with(cx, |picker, _| {
+            assert_eq!(
+                picker.delegate.core.matches.len(),
+                3,
+                "the added symbol matches the query too"
+            );
+            assert_ne!(
+                picker.delegate.item_at(0).map(|item| item.text.as_ref()),
+                Some("fn gamma"),
+                "the selected symbol must not also be the best match, or this test asserts nothing"
+            );
+            assert_eq!(
+                picker
+                    .delegate
+                    .item_at(picker.delegate.core.selected_index)
+                    .map(|item| item.range.clone()),
+                Some(selected_range),
+                "a late outline keeps the symbol the user selected"
             );
         });
     }

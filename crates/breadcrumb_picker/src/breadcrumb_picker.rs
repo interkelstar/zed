@@ -51,10 +51,42 @@ impl Default for BreadcrumbPickerCore {
 }
 
 pub(crate) trait BreadcrumbPickerDelegate: PickerDelegate {
+    type SelectionKey;
+
     fn core(&self) -> &BreadcrumbPickerCore;
     fn core_mut(&mut self) -> &mut BreadcrumbPickerCore;
     /// Whether the candidate is the entry the popover's own segment represents.
     fn is_current_candidate(&self, candidate_id: usize) -> bool;
+    fn selection_key(&self, candidate_id: usize) -> Option<Self::SelectionKey>;
+    fn matches_selection_key(
+        &self,
+        candidate_id: usize,
+        selection_key: &Self::SelectionKey,
+    ) -> bool;
+    fn pending_selection_key(&self) -> &Option<Self::SelectionKey>;
+    fn pending_selection_key_mut(&mut self) -> &mut Option<Self::SelectionKey>;
+}
+
+/// Remembers the selected row by identity; must run before the listing the key reads is swapped.
+pub(crate) fn record_pending_selection(delegate: &mut impl BreadcrumbPickerDelegate) {
+    let core = delegate.core();
+    let selected_candidate_id = core
+        .matches
+        .get(core.selected_index)
+        .map(|entry_match| entry_match.candidate_id);
+    let selection_key =
+        selected_candidate_id.and_then(|candidate_id| delegate.selection_key(candidate_id));
+    *delegate.pending_selection_key_mut() = selection_key;
+}
+
+fn pending_selection_index<D: BreadcrumbPickerDelegate>(
+    delegate: &D,
+    matches: &[StringMatch],
+) -> Option<usize> {
+    let selection_key = delegate.pending_selection_key().as_ref()?;
+    matches.iter().position(|entry_match| {
+        delegate.matches_selection_key(entry_match.candidate_id, selection_key)
+    })
 }
 
 /// Caps `matches` like a typed filter, preselecting the current entry and keeping it displayed even past the cap.
@@ -71,9 +103,12 @@ pub(crate) fn apply_empty_query_matches(delegate: &mut impl BreadcrumbPickerDele
         keep_candidate_id,
         MAX_BREADCRUMB_MENU_ENTRIES,
     );
-    let selected_index = matches
-        .iter()
-        .position(|entry_match| delegate.is_current_candidate(entry_match.candidate_id))
+    let selected_index = pending_selection_index(delegate, &matches)
+        .or_else(|| {
+            matches
+                .iter()
+                .position(|entry_match| delegate.is_current_candidate(entry_match.candidate_id))
+        })
         .unwrap_or(0);
     let core = delegate.core_mut();
     core.matches = matches;
@@ -85,6 +120,10 @@ pub(crate) fn update_picker_matches<D: BreadcrumbPickerDelegate>(
     query: String,
     cx: &mut Context<Picker<D>>,
 ) -> Task<()> {
+    // A newly typed query must land on its best match, not on the row a rebuild wanted back.
+    if delegate.core().query != query {
+        *delegate.pending_selection_key_mut() = None;
+    }
     delegate.core_mut().query = query.clone();
 
     if query.is_empty() {
@@ -108,9 +147,11 @@ pub(crate) fn update_picker_matches<D: BreadcrumbPickerDelegate>(
         .await;
         picker
             .update(cx, |picker, cx| {
+                let selected_index =
+                    pending_selection_index(&picker.delegate, &matches).unwrap_or(0);
                 let core = picker.delegate.core_mut();
                 core.matches = matches;
-                core.selected_index = 0;
+                core.selected_index = selected_index;
                 cx.notify();
             })
             .ok();
